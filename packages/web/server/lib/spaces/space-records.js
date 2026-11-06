@@ -26,12 +26,28 @@ const MAX_DOMAINS = 200;
 /** One name of an allowlist. */
 export const domainSchema = z.string().regex(DOMAIN_PATTERN);
 
+// `writes` is what the user chose beside the destinations: `ask` holds every POST, PUT, PATCH and
+// DELETE for an approval, `allow` lets them out. A record written before the choice exists keeps
+// asking, which is the safer reading of an "open internet" space.
 export const networkSchema = z.object({
   mode: z.enum(NETWORK_MODES),
   domains: z.array(domainSchema).max(MAX_DOMAINS).default([]),
+  writes: z.enum(['ask', 'allow']).default('ask'),
 });
 
 const historySchema = z.enum(['pending', 'sent', 'already_complete', 'host_shallow', 'failed']);
+
+// The methods the user approved for a destination. GET, HEAD and OPTIONS need no approval, and
+// the rest of the list is closed: a method outside these four cannot be approved.
+export const WRITABLE_METHODS = Object.freeze(['DELETE', 'PATCH', 'POST', 'PUT']);
+const MAX_WRITE_DESTINATIONS = 200;
+
+const writeAccessEntrySchema = z.object({
+  host: domainSchema,
+  methods: z.array(z.enum(WRITABLE_METHODS)).min(1).max(WRITABLE_METHODS.length),
+}).strict();
+
+export const writeAccessSchema = z.array(writeAccessEntrySchema).max(MAX_WRITE_DESTINATIONS).default([]);
 
 const GRANT_ID_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
 /** A provider id as the host's catalog names it, which is also the grant id of a model or login grant. */
@@ -126,6 +142,10 @@ const recordSchema = z.object({
   history: historySchema.default('pending'),
   /** The grants the user gave, said again to the gatekeeper after every start. */
   grants: z.array(grantSchema).max(MAX_GRANTS).default([]),
+  /** The methods the user approved, per destination, said again after every start. */
+  writeAccess: writeAccessSchema,
+  /** The methods the user denied there. Refused at once, without a prompt, until the user clears them. */
+  deniedWrites: writeAccessSchema,
   /** The setup commands' last run, or null before any. */
   setup: setupSchema.nullable().default(null),
 });
@@ -165,6 +185,47 @@ export function createSpaceRecords({ dataDir, logger = console }) {
     return { ...raw, setup: null };
   };
 
+  /**
+   * A write approval or denial the host cannot read, from a later version among the reasons, is
+   * forgotten with a warning. Getting one wrong only means the user decides once more; it must
+   * not take the network and the grants of the record with it. The same for a `writes` choice this
+   * host does not know: the space then asks, which is the safer reading.
+   */
+  const withReadableWrites = (spaceId, raw) => {
+    if (!(raw instanceof Object)) return raw;
+    let next = raw;
+    for (const field of ['writeAccess', 'deniedWrites']) {
+      if (next[field] === undefined || writeAccessSchema.safeParse(next[field]).success) continue;
+      logger.warn?.(`[spaces] the record of space ${spaceId} holds ${field} this host cannot read; it is left out`);
+      next = { ...next, [field]: [] };
+    }
+    if (next.network instanceof Object && next.network.writes !== undefined && next.network.writes !== 'ask' && next.network.writes !== 'allow') {
+      logger.warn?.(`[spaces] the record of space ${spaceId} holds a network write choice this host cannot read; the space asks`);
+      next = { ...next, network: { ...next.network, writes: 'ask' } };
+    }
+    return next;
+  };
+
+  /**
+   * A record from before one-answer-per-method may list a method as both approved and denied.
+   * The approval won then too, so the shadowed denial is not a rule: leave it out. Other methods
+   * for the same destination stay denied. This is a read-time normalization, not a file migration.
+   */
+  const withOneWriteAnswer = (raw) => {
+    if (!(raw instanceof Object) || !Array.isArray(raw.writeAccess) || !Array.isArray(raw.deniedWrites)) return raw;
+    if (raw.writeAccess.length === 0 || raw.deniedWrites.length === 0) return raw;
+    const approvals = new Map(raw.writeAccess.map((entry) => [entry.host, new Set(entry.methods)]));
+    let changed = false;
+    const deniedWrites = [];
+    for (const entry of raw.deniedWrites) {
+      const approved = approvals.get(entry.host);
+      const methods = approved ? entry.methods.filter((method) => !approved.has(method)) : [...entry.methods];
+      if (methods.length !== entry.methods.length) changed = true;
+      if (methods.length > 0) deniedWrites.push({ host: entry.host, methods });
+    }
+    return changed ? { ...raw, deniedWrites } : raw;
+  };
+
   const read = (spaceId) => {
     const file = fileOf(spaceId);
     let text;
@@ -176,7 +237,7 @@ export function createSpaceRecords({ dataDir, logger = console }) {
       return { status: 'unreadable', record: null };
     }
     try {
-      const raw = withReadableSetup(spaceId, withReadableGrants(spaceId, JSON.parse(text)));
+      const raw = withOneWriteAnswer(withReadableWrites(spaceId, withReadableSetup(spaceId, withReadableGrants(spaceId, JSON.parse(text)))));
       // A display name must not make the network choice or grants unreadable.
       if (raw instanceof Object && raw.taskTitle != null && !spaceTaskTitleSchema.safeParse(raw.taskTitle).success) {
         logger.warn?.(`[spaces] the record of space ${spaceId} holds a task title this host cannot read; it is left out`);

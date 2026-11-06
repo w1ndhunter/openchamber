@@ -86,6 +86,11 @@ export type EventPipelineInput = {
   onSpaceTaskTitle?: (spaceId: string, taskTitle: SpaceTaskTitle | null) => void
   /** Called when the setup commands of an isolated space moved on: began, the next one, or ended. */
   onSpaceSetup?: (spaceId: string) => void
+  /**
+   * Called when a write inside an isolated space is waiting for the user: the gatekeeper holds it
+   * and answers it when the user decides, so the prompt has to appear on its own.
+   */
+  onSpaceApproval?: (request: SpaceApprovalRequest) => void
   /** Called when the host follows an isolated space's permission modes again, after a gap or at first. */
   onSpacePermissionStream?: (spaceId: string) => void
   /**
@@ -233,6 +238,24 @@ const openchamberSpaceSetupSchema = z.object({
   properties: z.object({ spaceId: z.string().regex(/^[0-9a-f]{12}$/) }),
 })
 
+// A write inside a space is waiting for the user. The host forwards what the gatekeeper holds;
+// `expiresAt` is when it will be refused without an answer, so a prompt can close itself.
+const openchamberSpaceApprovalSchema = z.object({
+  type: z.literal("openchamber:space-approval"),
+  properties: z.object({
+    spaceId: z.string().regex(/^[0-9a-f]{12}$/),
+    requestId: z.number().int().positive(),
+    host: z.string(),
+    port: z.number(),
+    method: z.string(),
+    // The destination and the path the space wrote, so the prompt can show what is being approved.
+    url: z.string().optional(),
+    expiresAt: z.string(),
+  }),
+})
+
+export type SpaceApprovalRequest = z.infer<typeof openchamberSpaceApprovalSchema>["properties"]
+
 // `spaceId` marks a policy the host forwarded from that isolated space, which keeps its own.
 const openchamberAutoAcceptSchema = z.object({
   type: z.literal("openchamber:permission-auto-accept.updated"),
@@ -373,6 +396,7 @@ type ClassifiedStreamPayload =
   | { kind: "space-progress"; properties: SpaceProgress }
   | { kind: "space-task-title"; properties: z.infer<typeof openchamberSpaceTaskTitleSchema>["properties"] }
   | { kind: "space-setup"; spaceId: string }
+  | { kind: "space-approval"; properties: SpaceApprovalRequest }
   | { kind: "space-permission-stream"; spaceId: string }
   | { kind: "events"; events: Array<{ directory: string; event: SyncEvent }> }
 
@@ -405,6 +429,10 @@ export function classifyStreamPayload(payload: unknown, frameDirectory: string |
     case "openchamber:space-setup": {
       const parsed = openchamberSpaceSetupSchema.safeParse(payload)
       return parsed.success ? { kind: "space-setup", spaceId: parsed.data.properties.spaceId } : NO_EVENTS
+    }
+    case "openchamber:space-approval": {
+      const parsed = openchamberSpaceApprovalSchema.safeParse(payload)
+      return parsed.success ? { kind: "space-approval", properties: parsed.data.properties } : NO_EVENTS
     }
     case "openchamber:space-permission-stream": {
       const parsed = openchamberSpacePermissionStreamSchema.safeParse(payload)
@@ -514,6 +542,7 @@ export function createEventPipeline(input: EventPipelineInput): EventPipeline {
     onSpaceProgress,
     onSpaceTaskTitle,
     onSpaceSetup,
+    onSpaceApproval,
     onSpacePermissionStream,
     onStreamActivity,
     routeDirectory,
@@ -777,6 +806,10 @@ export function createEventPipeline(input: EventPipelineInput): EventPipeline {
     }
     if (classified.kind === "space-setup") {
       onSpaceSetup?.(classified.spaceId)
+      return
+    }
+    if (classified.kind === "space-approval") {
+      onSpaceApproval?.(classified.properties)
       return
     }
     if (classified.kind === "space-permission-stream") {

@@ -74,7 +74,7 @@ export function hardenedContainerEntry({
   return {
     Id: newContainerId(),
     Name: `/${name}`,
-    State: { Running: running, Status: running ? 'running' : 'created' },
+    State: { Running: running, Status: running ? 'running' : 'created', StartedAt: running ? '2020-01-01T00:00:00.000Z' : '0001-01-01T00:00:00Z' },
     Config: { User: '1000:1000', Labels: labels, Env: env, Image: image },
     HostConfig: {
       ReadonlyRootfs: true,
@@ -347,10 +347,11 @@ export function createFakeDocker({
       }
       return state.delete(containerKey(name)) ? ok(name) : failed(NOT_FOUND_TEXT.container(name));
     }
-    if (first === 'stop' || first === 'start') {
+    if (first === 'stop' || first === 'start' || first === 'restart') {
       const resource = state.get(containerKey(second));
       if (!resource) return failed(NOT_FOUND_TEXT.container(second));
-      resource.entry.State.Running = first === 'start';
+      resource.entry.State.Running = first !== 'stop';
+      resource.entry.State.StartedAt = first === 'stop' ? '0001-01-01T00:00:00Z' : new Date().toISOString();
       // A tmpfs is empty again after a stop, so the gatekeeper's program is gone with it.
       if (first === 'stop') programs.delete(resource.name);
       return ok(second);

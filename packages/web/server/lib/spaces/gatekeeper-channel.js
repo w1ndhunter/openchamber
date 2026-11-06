@@ -60,6 +60,8 @@ const WRITE_PROGRAM_SCRIPT = [
 // A policy is three small lists. These caps are what the host is willing to read back.
 const MAX_POLICY_BODY_CHARACTERS = 256 * 1024;
 const MAX_POLICY_ENTRIES = 1_000;
+// The gatekeeper holds at most eight waiting writes; more than that is not a host's answer.
+const MAX_PENDING_FROM_INSIDE = 8;
 
 const pause = (milliseconds) => new Promise((resolve) => { setTimeout(resolve, milliseconds); });
 
@@ -172,7 +174,69 @@ export function createGatekeeperChannel({ exec, wait = pause, now = Date.now }) 
    * The network mode and the allowlist, live. A gatekeeper that was just started allows nothing
    * until this call, so a space never reaches further than the host last said it may.
    */
-  const setNetwork = (spaceId, { mode, domains = [] }) => command(spaceId, '/network', { mode, domains }, 'change the network of this space');
+  const setNetwork = (spaceId, { mode, domains = [], writes = 'ask' }) => command(spaceId, '/network', { mode, domains, writes }, 'change the network of this space');
+
+  /**
+   * The methods the user approved, per destination. The whole list goes every time, so a
+   * destination the user did not approve cannot survive from an earlier call.
+   */
+  const setWrites = (spaceId, entries) => command(spaceId, '/writes', { entries }, 'change the approved methods of this space');
+
+  /** The methods the user denied, per destination; the whole list again, as with `/writes`. */
+  const setDenials = (spaceId, entries) => command(spaceId, '/denials', { entries }, 'change the denied methods of this space');
+
+  // Long enough to save the host a request every second, short enough that a gatekeeper that
+  // died is noticed while the space still looks running.
+  const APPROVAL_WAIT_MS = 25_000;
+
+  /**
+   * Waits for a write the user has to decide about. The gatekeeper answers at once when it holds
+   * one the host has not seen, and otherwise when the wait ends. `since` is the highest id the
+   * host has heard of; ids restart with the gatekeeper's process, so a host that restarts begins
+   * at zero and hears about everything still waiting.
+   */
+  const waitForApprovals = async (spaceId, { since = 0, waitMs = APPROVAL_WAIT_MS } = {}) => {
+    const from = Number.isSafeInteger(since) && since > 0 ? since : 0;
+    const wait = Number.isSafeInteger(waitMs) && waitMs > 0 ? waitMs : APPROVAL_WAIT_MS;
+    const answer = await request(spaceId, {
+      path: `/pending?since=${from}&wait=${wait}`,
+      timeoutSeconds: Math.ceil(wait / 1000) + 10,
+    });
+    if (answer.status !== 200) throw unreadableAnswer(`answered ${answer.status} for its waiting writes`);
+    let parsed;
+    try {
+      parsed = JSON.parse(answer.body);
+    } catch {
+      throw unreadableAnswer('answered with waiting writes that are not JSON');
+    }
+    if (!(parsed instanceof Object) || Array.isArray(parsed) || !Array.isArray(parsed.requests)) {
+      throw unreadableAnswer('answered with waiting writes that hold no list');
+    }
+    const requests = parsed.requests.slice(0, MAX_PENDING_FROM_INSIDE).map((entry) => {
+      const record = entry instanceof Object && !Array.isArray(entry) ? entry : {};
+      return {
+        id: Number.isSafeInteger(record.id) && record.id > 0 ? record.id : 0,
+        host: text(record.host),
+        port: Number.isSafeInteger(record.port) ? record.port : 0,
+        method: text(record.method),
+        url: text(record.url),
+        expiresAt: text(record.expiresAt),
+      };
+    }).filter((entry) => entry.id > 0 && entry.host !== '');
+    const seen = Number.isSafeInteger(parsed.since) && parsed.since > from ? parsed.since : from;
+    return { requests, since: seen };
+  };
+
+  /**
+   * The host's answer for one waiting write: `allowed` sends it on, anything else refuses it.
+   * A wait that is already gone answers 404, which is not an error: the user came too late.
+   */
+  const decideApproval = async (spaceId, { id, allowed }) => {
+    const answer = await request(spaceId, { method: 'POST', path: '/approvals', body: JSON.stringify({ id, allow: allowed === true }) });
+    if (answer.status === 200) return { settled: true };
+    if (answer.status === 404) return { settled: false };
+    throw new SpaceError('gatekeeper_refused', `The network filter refused the answer for a waiting write: ${tail(answer.body) || `status ${answer.status}`}`, { status: answer.status });
+  };
 
   /**
    * One grant: a "uses without seeing" credential, whose secret is in the body and so out of every
@@ -206,10 +270,19 @@ export function createGatekeeperChannel({ exec, wait = pause, now = Date.now }) 
       throw unreadableAnswer('answered with a policy that holds no lists');
     }
     const names = (list) => list.slice(0, MAX_POLICY_ENTRIES).map(text).filter((entry) => entry !== '');
+    const writeList = (value) => (Array.isArray(value)
+      ? value.slice(0, MAX_POLICY_ENTRIES).map((entry) => {
+        const record = entry instanceof Object && !Array.isArray(entry) ? entry : {};
+        const methods = Array.isArray(record.methods) ? record.methods.map(text).filter((method) => method !== '') : [];
+        return { host: text(record.host), methods };
+      }).filter((entry) => entry.host !== '')
+      : []);
     return {
       mode: parsed.mode === 'open' ? 'open' : 'allowlist',
       domains: names(parsed.domains),
       grants: names(parsed.grants),
+      writes: writeList(parsed.writes),
+      denials: writeList(parsed.denials),
     };
   };
 
@@ -244,6 +317,8 @@ export function createGatekeeperChannel({ exec, wait = pause, now = Date.now }) 
           listener: text(record.listener),
           host: text(record.host),
           port: Number.isSafeInteger(record.port) ? record.port : 0,
+          // The method of a decrypted request; empty for a CONNECT decision and for a gatekeeper before it.
+          method: text(record.method),
           decision: text(record.decision),
         };
       }),
@@ -253,5 +328,5 @@ export function createGatekeeperChannel({ exec, wait = pause, now = Date.now }) 
     };
   };
 
-  return { writeProgram, waitUntilReady, setNetwork, addGrant, readPolicy, readJournal };
+  return { writeProgram, waitUntilReady, setNetwork, setWrites, setDenials, waitForApprovals, decideApproval, addGrant, readPolicy, readJournal };
 }

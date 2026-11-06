@@ -73,9 +73,36 @@ describe('gatekeeper channel: control requests', () => {
       'request = "POST"',
       'header = "Expect:"',
       'header = "Content-Type: application/json"',
-      'data-raw = "{\\"mode\\":\\"allowlist\\",\\"domains\\":[\\"api.anthropic.com\\"]}"',
+      'data-raw = "{\\"mode\\":\\"allowlist\\",\\"domains\\":[\\"api.anthropic.com\\"],\\"writes\\":\\"ask\\"}"',
       '',
     ]);
+  });
+
+  it('sends the whole approved method list to the writes endpoint', async () => {
+    const { channel, calls } = channelWith(ok(http(200, '{"ok":true}')));
+    await channel.setWrites(ID, [{ host: 'api.github.com', methods: ['POST'] }]);
+    expect(calls[0].options.stdin).toContain('url = "http://127.0.0.1:9099/writes"');
+    const data = calls[0].options.stdin.split('\n').find((line) => line.startsWith('data-raw = '));
+    expect(JSON.parse(JSON.parse(data.slice('data-raw = '.length)))).toEqual({ entries: [{ host: 'api.github.com', methods: ['POST'] }] });
+  });
+
+  it('waits for a write the user has to decide about, and reads only its known fields', async () => {
+    const body = { since: 4, requests: [{ id: 4, host: 'api.github.com', port: 443, method: 'POST', url: 'https://api.github.com/repos?x=1', expiresAt: '2026-11-06T10:00:00.000Z', body: 'x' }, null, { id: 0, host: 'no-id.example.com' }] };
+    const { channel, calls } = channelWith(ok(http(200, JSON.stringify(body))));
+    expect(await channel.waitForApprovals(ID, { since: 3, waitMs: 2_000 })).toEqual({
+      requests: [{ id: 4, host: 'api.github.com', port: 443, method: 'POST', url: 'https://api.github.com/repos?x=1', expiresAt: '2026-11-06T10:00:00.000Z' }],
+      since: 4,
+    });
+    expect(calls[0].options.stdin).toContain('url = "http://127.0.0.1:9099/pending?since=3&wait=2000"');
+  });
+
+  it('answers a waiting write, and takes a wait that is already gone as settled false', async () => {
+    const { channel, calls } = channelWith(ok(http(200, '{"ok":true}')), ok(http(404, '{"error":"gone"}')));
+    expect(await channel.decideApproval(ID, { id: 4, allowed: true })).toEqual({ settled: true });
+    expect(calls[0].options.stdin).toContain('url = "http://127.0.0.1:9099/approvals"');
+    const data = calls[0].options.stdin.split('\n').find((line) => line.startsWith('data-raw = '));
+    expect(JSON.parse(JSON.parse(data.slice('data-raw = '.length)))).toEqual({ id: 4, allow: true });
+    expect(await channel.decideApproval(ID, { id: 4, allowed: false })).toEqual({ settled: false });
   });
 
   it('keeps a grant\'s secret out of every argument list, on the host and inside', async () => {
@@ -105,9 +132,9 @@ describe('gatekeeper channel: control requests', () => {
 
   it('reads what the gatekeeper holds as data: mode, names and grant ids, capped, and never a secret', async () => {
     const { channel } = channelWith(ok(http(200, JSON.stringify({ mode: 'open', domains: ['a.example.com', 7, {}], grants: ['anthropic', ['x'], 'open-1'], secret: SECRET }))));
-    expect(await channel.readPolicy(ID)).toEqual({ mode: 'open', domains: ['a.example.com', '7'], grants: ['anthropic', 'open-1'] });
+    expect(await channel.readPolicy(ID)).toEqual({ mode: 'open', domains: ['a.example.com', '7'], grants: ['anthropic', 'open-1'], writes: [], denials: [] });
     const { channel: allowlist } = channelWith(ok(http(200, '{"mode":"anything","domains":[],"grants":[]}')));
-    expect(await allowlist.readPolicy(ID)).toEqual({ mode: 'allowlist', domains: [], grants: [] });
+    expect(await allowlist.readPolicy(ID)).toEqual({ mode: 'allowlist', domains: [], grants: [], writes: [], denials: [] });
     for (const body of ['not json', '[]', '{"grants":"anthropic"}', '{"grants":[]}']) {
       const { channel: broken } = channelWith(ok(http(200, body)));
       await expect(broken.readPolicy(ID)).rejects.toMatchObject({ code: 'gatekeeper_answer_unreadable' });
@@ -157,7 +184,7 @@ describe('gatekeeper channel: control requests', () => {
 });
 
 describe('gatekeeper channel: journal', () => {
-  const record = { at: '2026-09-20T10:00:00.000Z', listener: 'corridor', host: 'api.anthropic.com', port: 443, decision: 'allow' };
+  const record = { at: '2026-09-20T10:00:00.000Z', listener: 'corridor', host: 'api.anthropic.com', port: 443, method: 'POST', decision: 'deny:method' };
 
   it('reads the records, how many the ring buffer dropped, and since when the gatekeeper records', async () => {
     const { channel } = channelWith(ok(http(200, JSON.stringify({ records: [record], dropped: 12, since: '2026-09-20T09:00:00.000Z' }))));
@@ -169,12 +196,12 @@ describe('gatekeeper channel: journal', () => {
     expect(await channel.readJournal(ID)).toEqual({ records: [], dropped: 0, since: '' });
   });
 
-  it('keeps the five fields of a record and nothing else the gatekeeper sends', async () => {
+  it('keeps the six fields of a record and nothing else the gatekeeper sends', async () => {
     const hostile = { ...record, path: '/v1/messages?key=leak', body: 'a body', secret: SECRET, extra: { deep: true } };
     const { channel } = channelWith(ok(http(200, JSON.stringify({ records: [hostile], dropped: 0 }))));
 
     const journal = await channel.readJournal(ID);
-    expect(Object.keys(journal.records[0])).toEqual(['at', 'listener', 'host', 'port', 'decision']);
+    expect(Object.keys(journal.records[0])).toEqual(['at', 'listener', 'host', 'port', 'method', 'decision']);
     expect(JSON.stringify(journal)).not.toContain(SECRET);
   });
 
@@ -208,9 +235,9 @@ describe('gatekeeper channel: journal', () => {
     const { channel } = channelWith(ok(http(200, JSON.stringify({ records: [null, 'text', { port: 'many' }] }))));
     expect(await channel.readJournal(ID)).toEqual({
       records: [
-        { at: '', listener: '', host: '', port: 0, decision: '' },
-        { at: '', listener: '', host: '', port: 0, decision: '' },
-        { at: '', listener: '', host: '', port: 0, decision: '' },
+        { at: '', listener: '', host: '', port: 0, method: '', decision: '' },
+        { at: '', listener: '', host: '', port: 0, method: '', decision: '' },
+        { at: '', listener: '', host: '', port: 0, method: '', decision: '' },
       ],
       dropped: 0,
       since: '',

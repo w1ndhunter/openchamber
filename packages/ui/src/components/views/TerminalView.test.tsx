@@ -265,8 +265,8 @@ describe('TerminalView project action tab indicator', () => {
     const space: SpaceEntry = {
       id: 'a1b2c3d4e5f6', name: 'Fix login', placeId: 'docker', machine: null,
       projectDirectory: '/repo', projectFolder: { path: '/repo', found: null }, directory: '/spaces/a1b2c3d4e5f6/repo',
-      state: 'preparing', stoppedIdle: false, step: 'creating', failure: null, network: { mode: 'allowlist', domains: [] },
-      grants: [], access: null, needsAccess: [], accessFailures: [], damage: null, setup: null,
+      state: 'preparing', stoppedIdle: false, step: 'creating', failure: null, network: { mode: 'allowlist', domains: [], writes: 'ask' },
+      grants: [], writeAccess: [], deniedWrites: [], access: null, needsAccess: [], accessFailures: [], damage: null, setup: null,
     };
     // The draft stays on the project's folder while its chip names the space.
     sessionUiState.currentSessionId = null;

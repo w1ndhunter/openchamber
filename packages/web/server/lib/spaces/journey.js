@@ -48,7 +48,7 @@ import { permissionDefaultOf } from './space-permission-default.js';
 import { ROLE_GATEKEEPER, createSpaceId, hashProjectDirectory, spaceResourceName } from './labels.js';
 import { spaceProjectPath, spaceWindowUrl } from './layout.js';
 import { LOGIN_PROVIDERS, buildStartConfig, loginEndOf, loginEnded, loginGrantOf } from './space-opencode.js';
-import { domainSchema, grantSchema, networkSchema, providerIdSchema, secretSourceSchema } from './space-records.js';
+import { WRITABLE_METHODS, domainSchema, grantSchema, networkSchema, providerIdSchema, secretSourceSchema, writeAccessSchema } from './space-records.js';
 import { createSpaceToken } from './space-server.js';
 import { createSpaceSetup, setupCommandsSchema } from './space-setup.js';
 
@@ -60,7 +60,7 @@ const createRequestSchema = z.object({
   projectDirectory: z.string().min(1),
   name: z.string().trim().min(1),
   start: z.enum(['clean', 'uncommitted']).default('uncommitted'),
-  network: networkSchema.default({ mode: 'allowlist', domains: [] }),
+  network: networkSchema.default({ mode: 'allowlist', domains: [], writes: 'ask' }),
   // The project's worktree setup commands as the client resolved them, the shared ones only when
   // the user trusted them; they run once the code arrived (5d-4).
   setupCommands: setupCommandsSchema.default([]),
@@ -124,6 +124,44 @@ const HEADER_BY_PROVIDER = new Map([
 // in the journal: the allowlist's own rule for a name, read in any case.
 const openDomainRequestSchema = z.object({
   domain: z.string().trim().toLowerCase().pipe(domainSchema),
+}).strict();
+
+// A method the user approves for one destination, from a blocked attempt in the journal.
+const writeAccessRequestSchema = z.object({
+  host: z.string().trim().toLowerCase().pipe(domainSchema),
+  methods: z.array(z.enum(WRITABLE_METHODS)).min(1).max(WRITABLE_METHODS.length),
+}).strict();
+
+// A denial, and the empty list that clears one: the dialog takes the host back to asking.
+const deniedWritesRequestSchema = z.object({
+  host: z.string().trim().toLowerCase().pipe(domainSchema),
+  methods: z.array(z.enum(WRITABLE_METHODS)).max(WRITABLE_METHODS.length),
+}).strict();
+
+const sameWriteEntries = (left, right) => JSON.stringify(left) === JSON.stringify(right);
+
+/**
+ * `entries` without the listed methods for `host`, in the same order. A destination left with no
+ * method leaves the list: an empty entry is not a rule, and both lists need at least one method.
+ */
+const withoutMethods = (entries, host, methods) => {
+  const next = [];
+  for (const entry of entries) {
+    if (entry.host !== host) {
+      next.push({ host: entry.host, methods: [...entry.methods] });
+      continue;
+    }
+    const kept = methods.length === 0 ? [] : entry.methods.filter((method) => !methods.includes(method));
+    if (kept.length > 0) next.push({ host, methods: kept });
+  }
+  return next;
+};
+
+// The user's answer for one write that is waiting: the id the gatekeeper gave it, and whether it
+// goes out. Nothing else: the host never names the destination here, the gatekeeper already has it.
+const approvalDecisionSchema = z.object({
+  requestId: z.number().int().positive(),
+  allowed: z.boolean(),
 }).strict();
 
 const applyRequestSchema = z.discriminatedUnion('as', [
@@ -211,6 +249,8 @@ export function createSpaceJourney({
   let settingsTurn = Promise.resolve();
   // Stops of a gatekeeper left beside a stopped space, under way, by space id; a start waits for one.
   const strayStops = new Map();
+  // The host's watches for writes waiting on the user, by space id; a stop or a remove ends one.
+  const approvalWatches = new Map();
   // Login rows being written again after a start, by space id; a grant waits for one, see "Grants".
   const rowRepairs = new Map();
   // The project's setup commands inside a space, since 5d-4; each step is announced so the
@@ -392,7 +432,7 @@ export function createSpaceJourney({
       await manager.createSpace({ id: entry.id, placeId, projectDirectory, name, onStep: (step) => progress(entry, step), startConfig });
       created = true;
       // With the place, the name and the time, so the space is still listed while its place cannot be asked.
-      records.write(entry.id, { placeId, name: entry.name, created: entry.created, network, repository: projectDirectory });
+      records.write(entry.id, { placeId, name: entry.name, created: entry.created, network, repository: projectDirectory, writeAccess: [], deniedWrites: [] });
       progress(entry, 'setting_network');
       await gatekeeper.setNetwork(entry.id, network);
       progress(entry, 'bringing_code');
@@ -417,6 +457,8 @@ export function createSpaceJourney({
       }
       pending.delete(entry.id);
       progress(entry, 'ready');
+      // A write the space is already waiting on gets its prompt from here on.
+      watchApprovals(entry.id);
       onSpacesChanged();
       // In the background, while the agent can already start (journey step 2).
       if (setupCommands.length > 0) setup.start(entry.id, { projectPath: arrived.spacePath, commands: setupCommands });
@@ -692,15 +734,34 @@ export function createSpaceJourney({
     for (const space of spaces) {
       if (space.state !== 'running' || busy.has(space.id)) continue;
       const record = records.read(space.id).record;
-      const grants = (record?.grants ?? []).filter((grant) => grant.kind !== 'model' || grant.source.kind === 'env');
-      if (grants.length === 0) continue;
-      let held;
+      let policy;
       try {
-        held = new Set((await gatekeeper.readPolicy(space.id)).grants);
+        policy = await gatekeeper.readPolicy(space.id);
       } catch (error) {
         logger.warn?.(`[spaces] the gatekeeper of space ${space.id} did not say what it holds: ${error?.code ?? error?.message ?? error}`);
         continue;
       }
+      // The method approvals and denials are said again too: a host that died between the start
+      // and the `setWrites` leaves a gatekeeper that allows no write the user already approved,
+      // and one that asks again for a destination the user already refused.
+      const summary = (list) => list.map((entry) => `${entry.host}:${[...entry.methods].sort().join(',')}`).sort().join('|');
+      for (const [field, say] of [
+        ['writeAccess', gatekeeper.setWrites],
+        ['deniedWrites', gatekeeper.setDenials],
+      ]) {
+        const wanted = record?.[field] ?? [];
+        const held = field === 'writeAccess' ? policy.writes : policy.denials;
+        if (wanted.length === 0 || summary(held) === summary(wanted)) continue;
+        try {
+          await exclusive(space.id, () => say(space.id, wanted));
+          logger.info?.(`[spaces] said the ${field === 'writeAccess' ? 'approved' : 'denied'} methods of space ${space.id} again`);
+        } catch (error) {
+          logger.warn?.(`[spaces] the ${field === 'writeAccess' ? 'approved' : 'denied'} methods of space ${space.id} were not said again: ${error?.code ?? error?.message ?? error}`);
+        }
+      }
+      const grants = (record?.grants ?? []).filter((grant) => grant.kind !== 'model' || grant.source.kind === 'env');
+      if (grants.length === 0) continue;
+      const held = new Set(policy.grants);
       const lost = grants.filter((grant) => !held.has(grant.id));
       if (lost.length === 0) continue;
       try {
@@ -773,6 +834,8 @@ export function createSpaceJourney({
     // The client waits for the setup only when the host said it will run one; a host before 5d-4 never says so.
     setup: entry.setupTotal > 0 ? { state: 'queued', total: entry.setupTotal } : null,
     grants: [],
+    writeAccess: [],
+    deniedWrites: [],
     accessFailures: [],
     access: null,
     needsAccess: [],
@@ -826,6 +889,8 @@ export function createSpaceJourney({
           ? { code: 'space_code_never_arrived', message: 'OpenChamber closed before the code arrived. Delete the space and create it again.', details: null }
           : space.state === 'unreachable' ? placeFailureOf(space.placeId) : null,
         network: record?.network ?? null,
+        writeAccess: record?.writeAccess ?? [],
+        deniedWrites: record?.deniedWrites ?? [],
         history: record?.history ?? 'unknown',
         setup: setup.describe(space.id, record),
         grants: grants.map(describeGrant),
@@ -883,6 +948,104 @@ export function createSpaceJourney({
     return result;
   };
 
+  /** Ends the watch for a space's waiting writes; a stop, a remove or a restart ends one. */
+  const stopApprovalWatch = (spaceId) => {
+    const watch = approvalWatches.get(spaceId);
+    if (!watch) return;
+    approvalWatches.delete(spaceId);
+    watch.stopped = true;
+  };
+
+  /**
+   * Watches the gatekeeper for writes waiting on the user, for as long as the space runs. A write
+   * the user has not approved waits in the gatekeeper, so this is what makes a prompt appear
+   * without the user asking for the journal. The ids restart with the gatekeeper's process, so a
+   * watch begins at zero and a wait from before it is announced again.
+   */
+  const watchApprovals = (spaceId) => {
+    stopApprovalWatch(spaceId);
+    const watch = { stopped: false };
+    approvalWatches.set(spaceId, watch);
+    const loop = async () => {
+      let since = 0;
+      while (!watch.stopped) {
+        try {
+          const answer = await gatekeeper.waitForApprovals(spaceId, { since });
+          since = answer.since;
+          for (const waiting of answer.requests) {
+            if (watch.stopped) return;
+            announce(spaceId, {
+              type: 'openchamber:space-approval',
+              properties: {
+                spaceId,
+                requestId: waiting.id,
+                host: waiting.host,
+                port: waiting.port,
+                method: waiting.method,
+                url: waiting.url,
+                expiresAt: waiting.expiresAt,
+              },
+            });
+          }
+        } catch (error) {
+          if (watch.stopped) return;
+          // A gatekeeper that is gone or restarting is not an error of the space: the next look
+          // finds it or the space stops. Logged once per attempt would be noise, so it is not.
+          await pause(1_000);
+        }
+      }
+    };
+    loop().catch(() => {});
+  };
+
+  /** Watches every running space, for a host that starts while spaces already run. */
+  const watchApprovalsOfRunningSpaces = async () => {
+    let spaces;
+    try {
+      ({ spaces } = await listAll());
+    } catch (error) {
+      logger.warn?.(`[spaces] could not list the spaces to watch their waiting writes: ${error?.code ?? error?.message ?? error}`);
+      return;
+    }
+    for (const space of spaces) {
+      if (space.state === 'running') watchApprovals(space.id);
+    }
+  };
+
+  /**
+   * The user's answer for one write that is waiting: allowed sends it on, anything else refuses
+   * it. A wait that is already gone is not an error: it answers `settled: false`, because the
+   * prompt arrived after the gatekeeper's limit. The gatekeeper is answered without waiting for
+   * an apply in progress; the record is written inside the space's turn, because it is a
+   * read-modify-write that another grant or domain change must not race.
+   */
+  const decideWriteApproval = async (spaceId, request) => {
+    requireNotPending(spaceId);
+    const parsed = approvalDecisionSchema.safeParse(request ?? {});
+    if (!parsed.success) throw new SpaceError('invalid_approval', 'An answer names the waiting write and whether it is allowed.');
+    const space = await requireListed(spaceId);
+    if (space.state !== 'running') throw new SpaceError('space_not_running', 'A write waits for the user only in a running space.');
+    const answer = await gatekeeper.decideApproval(spaceId, { id: parsed.data.requestId, allowed: parsed.data.allowed });
+    // A denial stands for that destination: the gatekeeper holds it from now on, and the record
+    // keeps it for the next start. Read back rather than guessed here, so the destination is the
+    // one the gatekeeper actually refused and the host never names it in an answer.
+    if (parsed.data.allowed === false) await exclusive(spaceId, () => rememberDenials(spaceId));
+    return answer;
+  };
+
+  /** What the gatekeeper refuses without asking, written into the record; a failure only logs. */
+  const rememberDenials = async (spaceId) => {
+    try {
+      const policy = await gatekeeper.readPolicy(spaceId);
+      const denials = writeAccessSchema.parse(policy.denials);
+      if (records.update(spaceId, { deniedWrites: denials }).status !== 'ok') {
+        logger.warn?.(`[spaces] the denied methods of space ${spaceId} could not be remembered, so they close at the next start`);
+      }
+    } catch (error) {
+      logger.warn?.(`[spaces] the denied methods of space ${spaceId} were not read back: ${error?.code ?? error?.message ?? error}`);
+    }
+  };
+
   /**
    * Starts a stopped space. Its gatekeeper comes up allowing nothing, so the network the user
    * chose is said again from the record; without a readable record the space stays closed, and
@@ -899,6 +1062,9 @@ export function createSpaceJourney({
     let grants = { restored: [], needsAccess: [] };
     if (record) {
       await gatekeeper.setNetwork(spaceId, record.network);
+      // An approved method is said again too; an empty list is what a fresh gatekeeper already is.
+      if ((record.writeAccess ?? []).length > 0) await gatekeeper.setWrites(spaceId, record.writeAccess);
+      if ((record.deniedWrites ?? []).length > 0) await gatekeeper.setDenials(spaceId, record.deniedWrites);
       networkRestored = true;
       grants = await restoreGrants(spaceId, record.grants, record.repository);
       await rewriteProviderConfig(spaceId, record.grants, record.repository);
@@ -910,6 +1076,7 @@ export function createSpaceJourney({
       }
     }
     await deliverSettings(spaceId);
+    watchApprovals(spaceId);
     onSpacesChanged();
     return { ...(await requireListed(spaceId)), networkRestored, grantsRestored: grants.restored, needsAccess: grants.needsAccess };
   };
@@ -934,6 +1101,7 @@ export function createSpaceJourney({
       logger.warn?.(`[spaces] the server inside space ${spaceId} keeps its token: ${error?.code ?? error?.message ?? error}`);
     }
     await manager.stopSpace({ spaceId });
+    stopApprovalWatch(spaceId);
     return startUnlocked(spaceId);
   });
 
@@ -1056,13 +1224,110 @@ export function createSpaceJourney({
     const { network } = current.record;
     if (network.mode === 'open') throw new SpaceError('network_is_open', 'The network of this space is open, so there is no list to add a domain to.');
     if (network.domains.includes(domain)) return { network };
-    const next = networkSchema.safeParse({ mode: network.mode, domains: [...network.domains, domain] });
+    const next = networkSchema.safeParse({ mode: network.mode, domains: [...network.domains, domain], writes: network.writes });
     if (!next.success) throw new SpaceError('too_many_domains', 'This space already has as many opened domains as a list holds.');
     await gatekeeper.setNetwork(spaceId, next.data);
     if (records.update(spaceId, { network: next.data }).status !== 'ok') {
       throw new SpaceError('space_record_unreadable', 'The domain is open now and could not be remembered, so it closes at the next start. Remove the space and create it again.');
     }
     return { network: next.data };
+  });
+
+  /**
+   * Approves one or more methods for one destination, from a blocked attempt in the journal. The
+   * user's decision; the name may have come from the journal, which the agent wrote, and the
+   * name rule is what keeps it a name. The gatekeeper is told first, then the record, so a record
+   * that cannot be written leaves the approval valid only until the next start, which closes it:
+   * the same direction as an opened domain.
+   */
+  const approveWrites = (spaceId, request) => exclusive(spaceId, async () => {
+    requireNotPending(spaceId);
+    const parsed = writeAccessRequestSchema.safeParse(request ?? {});
+    if (!parsed.success) throw new SpaceError('invalid_write_access', `An approval names a host and one or more of ${WRITABLE_METHODS.join(', ')}.`);
+    const { host, methods } = parsed.data;
+    const space = await requireListed(spaceId);
+    if (space.state !== 'running') throw new SpaceError('space_not_running', 'A method is approved by the gatekeeper of a running space. Start the space, then approve.');
+    const current = records.read(spaceId);
+    if (current.status !== 'ok') throw new SpaceError('space_record_unreadable', 'The host\'s record of this space cannot be read, so an approved method could not be remembered. Remove the space and create it again.');
+    const entries = current.record.writeAccess.map((entry) => ({ host: entry.host, methods: [...entry.methods] }));
+    const known = entries.find((entry) => entry.host === host);
+    if (known) {
+      for (const method of methods) if (!known.methods.includes(method)) known.methods.push(method);
+      known.methods = WRITABLE_METHODS.filter((method) => known.methods.includes(method));
+    } else {
+      entries.push({ host, methods: WRITABLE_METHODS.filter((method) => methods.includes(method)) });
+    }
+    if (entries.length > 200) throw new SpaceError('too_many_write_access', 'This space has as many approved destinations as a record holds.');
+    const next = writeAccessSchema.parse(entries);
+    // The approval is the user's latest answer for those methods, so a denial of them is lifted:
+    // a method is never both allowed and denied, which would leave a Clear that changes nothing.
+    const denied = withoutMethods(current.record.deniedWrites, host, methods);
+    await gatekeeper.setWrites(spaceId, next);
+    if (!sameWriteEntries(denied, current.record.deniedWrites)) await gatekeeper.setDenials(spaceId, denied);
+    if (records.update(spaceId, { writeAccess: next, deniedWrites: denied }).status !== 'ok') {
+      throw new SpaceError('space_record_unreadable', 'The method is approved now and could not be remembered, so it closes at the next start. Remove the space and create it again.');
+    }
+    return { writeAccess: next };
+  });
+
+  /**
+   * A method the user denies, per destination, live: the gatekeeper refuses it at once from then
+   * on, and the record keeps it for every later start. An empty `methods` clears the destination,
+   * which is how the access dialog gives the prompt back.
+   */
+  const denyWrites = (spaceId, request) => exclusive(spaceId, async () => {
+    requireNotPending(spaceId);
+    const parsed = deniedWritesRequestSchema.safeParse(request ?? {});
+    if (!parsed.success) throw new SpaceError('invalid_write_access', `A denial names a host and up to one of ${WRITABLE_METHODS.join(', ')} to clear it.`);
+    const { host, methods } = parsed.data;
+    const space = await requireListed(spaceId);
+    const current = records.read(spaceId);
+    if (current.status !== 'ok') throw new SpaceError('space_record_unreadable', 'The host\'s record of this space cannot be read, so a denial could not be remembered. Remove the space and create it again.');
+    const entries = current.record.deniedWrites.filter((entry) => entry.host !== host);
+    if (methods.length > 0) entries.push({ host, methods: WRITABLE_METHODS.filter((method) => methods.includes(method)) });
+    if (entries.length > 200) throw new SpaceError('too_many_write_access', 'This space has as many denied destinations as a record holds.');
+    const next = writeAccessSchema.parse(entries);
+    // A stopped space may lose a denial, never gain one: an empty list, or the methods left after
+    // one is taken back, only shortens what this host already denies. The gatekeeper needs no new
+    // answer here: it is gone, and the next start gets the record.
+    const refusedBefore = current.record.deniedWrites.find((entry) => entry.host === host)?.methods ?? [];
+    const takesBack = methods.length === 0 || (refusedBefore.length > 0 && methods.every((method) => refusedBefore.includes(method)));
+    if (space.state !== 'running' && !takesBack) throw new SpaceError('space_not_running', 'A method is denied by the gatekeeper of a running space. Start the space, then deny.');
+    // The denial is the user's latest answer for those methods: an approval of them is taken
+    // back, so the two lists describe one state per method and neither shadows the other. An
+    // empty list only clears this destination's denial; its approvals are not that denial's.
+    const allowed = methods.length === 0 ? current.record.writeAccess : withoutMethods(current.record.writeAccess, host, methods);
+    if (space.state === 'running') {
+      await gatekeeper.setDenials(spaceId, next);
+      if (!sameWriteEntries(allowed, current.record.writeAccess)) await gatekeeper.setWrites(spaceId, allowed);
+    }
+    if (records.update(spaceId, { deniedWrites: next, writeAccess: allowed }).status !== 'ok') {
+      throw new SpaceError('space_record_unreadable', 'The method is denied now and could not be remembered, so it closes at the next start. Remove the space and create it again.');
+    }
+    return { deniedWrites: next };
+  });
+
+  /**
+   * Takes back approvals: the listed methods for one destination, or every method for it with an
+   * empty list. The next write then asks again. Only the approval goes; a standing denial is a
+   * separate answer and is left alone, and revoking never creates one.
+   */
+  const revokeWrites = (spaceId, request) => exclusive(spaceId, async () => {
+    requireNotPending(spaceId);
+    const parsed = deniedWritesRequestSchema.safeParse(request ?? {});
+    if (!parsed.success) throw new SpaceError('invalid_write_access', `A revocation names a host and up to one of ${WRITABLE_METHODS.join(', ')} to take back.`);
+    const { host, methods } = parsed.data;
+    const space = await requireListed(spaceId);
+    const current = records.read(spaceId);
+    if (current.status !== 'ok') throw new SpaceError('space_record_unreadable', 'The host\'s record of this space cannot be read, so an approval could not be taken back. Remove the space and create it again.');
+    const next = writeAccessSchema.parse(withoutMethods(current.record.writeAccess, host, methods));
+    // Taking an approval back is safe without a running gatekeeper: nothing becomes possible until
+    // the next start, and that start reads this record. Giving one still needs the live gatekeeper.
+    if (space.state === 'running') await gatekeeper.setWrites(spaceId, next);
+    if (records.update(spaceId, { writeAccess: next }).status !== 'ok') {
+      throw new SpaceError('space_record_unreadable', 'The method is not approved now and could not be remembered, so it comes back at the next start. Remove the space and create it again.');
+    }
+    return { writeAccess: next };
   });
 
   /**
@@ -1090,6 +1355,7 @@ export function createSpaceJourney({
 
   const stopSpace = (spaceId) => exclusive(spaceId, async () => {
     requireNotPending(spaceId);
+    stopApprovalWatch(spaceId);
     await manager.stopSpace({ spaceId });
     onSpacesChanged();
     return requireListed(spaceId);
@@ -1134,6 +1400,7 @@ export function createSpaceJourney({
    * and the answer is `chats_not_saved`, unless `allowUnsaved` says to save what can be and go on.
    */
   const removeUnlocked = async (spaceId, { allowUnsaved = false } = {}) => {
+    stopApprovalWatch(spaceId);
     const waiting = pending.get(spaceId);
     if (waiting) {
       if (waiting.state !== 'failed') throw new SpaceError('space_preparing', 'This space is still being made. Wait for it, then remove it.');
@@ -1166,6 +1433,7 @@ export function createSpaceJourney({
     const preparing = Array.from(pending.values()).filter((entry) => entry.state === 'preparing');
     if (preparing.length > 0) throw new SpaceError('space_preparing', `${preparing.length === 1 ? 'A space is' : `${preparing.length} spaces are`} still being made. Wait for that to finish first.`, { spaces: preparing.map((entry) => entry.id) });
     closing = true;
+    for (const spaceId of Array.from(approvalWatches.keys())) stopApprovalWatch(spaceId);
     let spaces;
     let unavailable;
     try {
@@ -1340,5 +1608,5 @@ export function createSpaceJourney({
     return { brought, applied, removal, kept };
   });
 
-  return { createSpace, listSpaces, setTaskTitle, startSpace, stopSpace, restartSpace, restartOpenCode, removeSpace, stopAllSpaces, reopen, isIdle, grantAccess, sayLogin, readHostLogins, readHostCustomProviders, openDomain, restoreLostGrants, readJournal, previewApply, applySpace, readIdleStopSetting, changeIdleStop, changePermissionDefault, runSetup, readSetup, readDisk, cleanUpDisk, pullImage };
+  return { createSpace, listSpaces, setTaskTitle, startSpace, stopSpace, restartSpace, restartOpenCode, removeSpace, stopAllSpaces, reopen, isIdle, grantAccess, sayLogin, readHostLogins, readHostCustomProviders, openDomain, approveWrites, denyWrites, revokeWrites, decideWriteApproval, watchApprovalsOfRunningSpaces, restoreLostGrants, readJournal, previewApply, applySpace, readIdleStopSetting, changeIdleStop, changePermissionDefault, runSetup, readSetup, readDisk, cleanUpDisk, pullImage };
 }

@@ -457,6 +457,8 @@ export function createSpacesHost({
       keepTimer?.unref?.();
       // A running space whose gatekeeper lost its grants, from a start cut short, gets them again.
       void journey.restoreLostGrants();
+      // And its writes that waited for the user before this host was here are announced again.
+      void journey.watchApprovalsOfRunningSpaces();
       return follow();
     },
     /** One look of the login keeper, now: what its timer does every minute, for the tests. */

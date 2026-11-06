@@ -100,7 +100,7 @@ const describeCall = (args) => {
 /** The calls that change something, in order, as short lines. */
 const changes = (fake) => fake.calls
   .map((call) => call.args)
-  .filter((args) => ['run', 'create', 'rm', 'pull', 'stop', 'start', 'exec', 'rename'].includes(args[0]) || ['create', 'rm', 'connect'].includes(args[1]))
+  .filter((args) => ['run', 'create', 'rm', 'pull', 'stop', 'start', 'restart', 'exec', 'rename'].includes(args[0]) || ['create', 'rm', 'connect'].includes(args[1]))
   .map(describeCall);
 
 /** What the gatekeeper costs at every start: its program is written into a tmpfs that a stop empties. */
@@ -246,9 +246,17 @@ describe('docker place: create', () => {
       '--env', 'OPENCHAMBER_SPACE_PERMISSION_DEFAULT_FILE=/home/space/.openchamber-space/permission-default.json',
       '--env', 'OPENCHAMBER_SPACE_TASK_TITLE_FILE=/home/space/.openchamber-space/task-title.json',
       '--env', 'OPENCHAMBER_SPACE_USER_TASK_TITLE_FILE=/home/space/.openchamber-space/user-task-title.json',
+      '--env', 'NODE_EXTRA_CA_CERTS=/tmp/openchamber-ca.pem',
+      '--env', 'SSL_CERT_FILE=/tmp/openchamber-ca.pem',
+      '--env', 'CURL_CA_BUNDLE=/tmp/openchamber-ca.pem',
+      '--env', 'GIT_SSL_CAINFO=/tmp/openchamber-ca.pem',
+      '--env', 'REQUESTS_CA_BUNDLE=/tmp/openchamber-ca.pem',
+      '--env', 'PIP_CERT=/tmp/openchamber-ca.pem',
+      '--env', 'npm_config_cafile=/tmp/openchamber-ca.pem',
+      '--env', 'OPENCHAMBER_SPACE_CA_URL=http://gatekeeper:8080/ca',
       SPACE_BASE_IMAGE,
       '/bin/sh', '-c',
-      'while [ ! -s /home/space/.openchamber-space/token ]; do /bin/sleep 0.2; done; OPENCHAMBER_UI_PASSWORD="$(/bin/cat /home/space/.openchamber-space/token)"; export OPENCHAMBER_UI_PASSWORD; exec openchamber serve --foreground --api-only --host 127.0.0.1 --port 27600',
+      'i=0; while [ "$i" -lt 5 ] && [ ! -s /tmp/openchamber-ca.pem ]; do /usr/bin/curl --fail --silent --show-error --max-time 5 --noproxy \'*\' -o /tmp/openchamber-ca.pem "http://gatekeeper:8080/ca" && break; i=$((i+1)); /bin/sleep 0.2; done; while [ ! -s /home/space/.openchamber-space/token ]; do /bin/sleep 0.2; done; OPENCHAMBER_UI_PASSWORD="$(/bin/cat /home/space/.openchamber-space/token)"; export OPENCHAMBER_UI_PASSWORD; exec openchamber serve --foreground --api-only --host 127.0.0.1 --port 27600',
     ]);
     expect(Object.keys(SPACE_ENVIRONMENT)).not.toContain('OPENCHAMBER_UI_PASSWORD');
     expect(SPACE_SERVER_COMMAND.join(' ')).not.toMatch(/\n/);
@@ -299,7 +307,7 @@ describe('docker place: create', () => {
       '/bin/sh', '-c',
       // The bind host is the file the host writes after the start, holding the gatekeeper's own
       // address on the space's network, never every interface: see "Known limits" of stage 2.
-      'while [ ! -s /tmp/openchamber-gatekeeper/gatekeeper.cjs ]; do /bin/sleep 0.2; done; exec /usr/local/bin/node /tmp/openchamber-gatekeeper/gatekeeper.cjs /tmp/openchamber-gatekeeper/bind 3128 8080 9099 300000 128 64 8',
+      'while [ ! -s /tmp/openchamber-gatekeeper/gatekeeper.cjs ]; do /bin/sleep 0.2; done; exec /usr/local/bin/node /tmp/openchamber-gatekeeper/gatekeeper.cjs /tmp/openchamber-gatekeeper/bind 3128 8080 9099 300000 128 64 8 300000 60000',
     ]);
     expect(create).toContain('openchamber.space.role=gatekeeper');
     expect(create).not.toContain('--mount');
@@ -988,8 +996,19 @@ describe('docker place: exec, stop, start, verify', () => {
     expect(await place.list()).toMatchObject([{ state: 'running', damaged: true, missing: [GATEKEEPER] }]);
     await place.start(ID);
 
-    expect(changes(fake)).toEqual([`start ${GATEKEEPER}`, ...GATEKEEPER_START_STEPS]);
+    expect(changes(fake)).toEqual([`start ${GATEKEEPER}`, ...GATEKEEPER_START_STEPS, `restart ${CONTAINER}`, 'exec curl']);
     expect(await place.list()).toMatchObject([{ state: 'running', damaged: false, missing: [] }]);
+  });
+
+  it('restarts a running space whose gatekeeper started after it, from a start that failed before the restart', async () => {
+    const seeds = spaceResources();
+    seeds.find((resource) => resource.name === CONTAINER).entry.State.StartedAt = '2026-01-01T00:00:00.000Z';
+    seeds.find((resource) => resource.name === GATEKEEPER).entry.State.StartedAt = '2026-01-02T00:00:00.000Z';
+    const fake = createFakeDocker({ resources: [toolsResource(), ...seeds] });
+
+    await makePlace(fake).start(ID);
+
+    expect(changes(fake)).toEqual([...GATEKEEPER_START_STEPS, `restart ${CONTAINER}`, 'exec curl']);
   });
 
   it('rejects a start whose server never becomes ready, and leaves the space as it is', async () => {

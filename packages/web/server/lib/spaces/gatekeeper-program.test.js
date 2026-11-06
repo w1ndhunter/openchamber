@@ -8,9 +8,11 @@ import { spawn, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import http from 'node:http';
 import net from 'node:net';
+import tls from 'node:tls';
 import os from 'node:os';
 import fs, { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { PassThrough, Readable } from 'node:stream';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -248,6 +250,36 @@ describe('gatekeeper program', () => {
     request.end();
   });
 
+  /**
+   * One request as the space's client makes it now: a CONNECT, the gatekeeper's certificate
+   * trusted through the authority the window serves, then HTTP on that TLS connection.
+   */
+  const secureRequest = (method, path, { host = 'example.com', hostHeader = host, servername = host, body = null, headers = {} } = {}) => new Promise((resolve) => {
+    const socket = track(net.connect({ host: '127.0.0.1', port: ports.corridor }));
+    const payload = body === null ? null : Buffer.from(body);
+    const extra = Object.entries(headers).map(([name, value]) => `${name}: ${value}\r\n`).join('');
+    let head = '';
+    const answer = (status, body = '') => resolve({ status, body });
+    socket.on('connect', () => socket.write(`CONNECT ${host}:443 HTTP/1.1\r\n\r\n`));
+    socket.on('error', () => answer('socket error'));
+    socket.on('data', function onHead(chunk) {
+      head += chunk;
+      if (!head.includes('\r\n\r\n')) return;
+      socket.removeListener('data', onHead);
+      control('GET', '/ca').then(({ body: ca }) => {
+        const secure = tls.connect({ socket, servername, ca }, () => {
+          secure.write(`${method} ${path} HTTP/1.1\r\nHost: ${hostHeader}\r\n${extra}Connection: close\r\nContent-Length: ${payload === null ? 0 : payload.length}\r\n\r\n`);
+          if (payload !== null) secure.write(payload);
+        });
+        let text = '';
+        secure.on('data', (chunk) => { text += chunk; });
+        secure.on('end', () => answer(text.split('\r\n')[0] ?? '', text));
+        secure.on('error', (error) => answer(`tls error ${error.message}`, text));
+      });
+    });
+    setTimeout(() => answer('no answer'), 20_000);
+  });
+
   beforeAll(async () => {
     // The upstream of a grant. It answers with what it received, minus the secret itself.
     upstream = http.createServer((request, response) => {
@@ -260,7 +292,9 @@ describe('gatekeeper program', () => {
 
     // The last argument is the window's deadline: 1.5 seconds here so a test can watch it
     // pass, 300000 in the container command, which the hardening test asserts.
-    ({ child, ports } = await startGatekeeper(['1500', String(CAPS.corridor), String(CAPS.window), String(CAPS.control)]));
+    // The tunnel's idle limit and the approval timeout come after the caps: a test that has to
+    // watch the approval timeout pass uses 1.5 seconds.
+    ({ child, ports } = await startGatekeeper(['1500', String(CAPS.corridor), String(CAPS.window), String(CAPS.control), '300000', '1500']));
   }, 40_000);
 
   afterAll(async () => {
@@ -276,6 +310,71 @@ describe('gatekeeper program', () => {
     await new Promise((resolve) => {
       const done = setTimeout(resolve, 5_000);
       upstream?.close(() => { clearTimeout(done); resolve(); });
+    });
+  });
+
+  describe('forwarded bodies', () => {
+    const { writeForwardedBody } = createRequire(import.meta.url)(PROGRAM);
+    // The request is a real stream and the outgoing request is one too, so this reads the bytes
+    // the upstream would read, in order, not a call list of the implementation.
+    const carried = (buffered, tail) => new Promise((resolve) => {
+      const outgoing = new PassThrough();
+      const chunks = [];
+      outgoing.on('data', (chunk) => chunks.push(chunk));
+      outgoing.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+      writeForwardedBody(outgoing, Readable.from(tail), buffered);
+    });
+
+    it('streams an unread request, writes a buffered body whole, and prefixes an oversized one', async () => {
+      expect(await carried(undefined, ['query ', '{ a }'])).toBe('query { a }');
+      // A fully read body has no tail left, so what follows is not part of the request.
+      expect(await carried({ body: Buffer.from('query { a }') }, ['not a body'])).toBe('query { a }');
+      expect(await carried({ body: Buffer.alloc(0) }, [])).toBe('');
+      // A body past the classification limit travels as read bytes plus the unread rest.
+      expect(await carried({ prefix: Buffer.from('{"query":"') }, ['{ viewer { login }', ' }"}'])).toBe('{"query":"{ viewer { login } }"}');
+      expect(await carried({ prefix: Buffer.alloc(0) }, ['whole', ' body'])).toBe('whole body');
+    });
+  });
+
+  describe('GraphQL bodies', () => {
+    const { classifyGraphqlBody } = createRequire(import.meta.url)(PROGRAM);
+    const envelope = (value) => Buffer.from(JSON.stringify(value));
+    const verdict = (query) => classifyGraphqlBody(envelope({ query }));
+
+    it('reads queries, shorthand, named operations, fragments, comments and block strings', () => {
+      expect(verdict('{ viewer { login } }')).toBe('read');
+      expect(verdict('query Viewer { viewer { login } }')).toBe('read');
+      expect(verdict('query Q($id: ID!) { node(id: $id) { ...F } } fragment F on Node { id }')).toBe('read');
+      expect(verdict('# mutation { evil }\nquery { viewer { login } }')).toBe('read');
+      expect(verdict('query { search(text: """mutation { evil }""") { id } }')).toBe('read');
+      // The word in a variable is not a document: only `query` is read.
+      expect(classifyGraphqlBody(envelope({ query: 'query { a }', variables: { mutation: 'evil' } }))).toBe('read');
+      expect(classifyGraphqlBody(Buffer.from(JSON.stringify([{ query: '{ a }' }, { query: 'query { b }' }])))).toBe('read');
+    });
+
+    it('sees a mutation or subscription in any document of a batch', () => {
+      expect(verdict('mutation { addStar(input: {}) { clientMutationId } }')).toBe('write');
+      expect(verdict('subscription { events { id } }')).toBe('write');
+      expect(verdict('query { a } mutation { evil }')).toBe('write');
+      expect(classifyGraphqlBody(Buffer.from(JSON.stringify([{ query: '{ a }' }, { query: 'mutation { evil }' }])))).toBe('write');
+    });
+
+    it('answers unknown for anything it cannot read, so the user is asked', () => {
+      expect(classifyGraphqlBody(Buffer.from('not json'))).toBe('unknown');
+      expect(classifyGraphqlBody(Buffer.from(''))).toBe('unknown');
+      expect(verdict('query { a')).toBe('unknown');
+      expect(verdict('fragment F on Node { id }')).toBe('unknown');
+      expect(verdict('')).toBe('unknown');
+      expect(classifyGraphqlBody(envelope({ variables: {} }))).toBe('unknown');
+      expect(classifyGraphqlBody(envelope({ query: 42 }))).toBe('unknown');
+      expect(classifyGraphqlBody(Buffer.from('[]'))).toBe('unknown');
+      expect(classifyGraphqlBody(Buffer.from('""'))).toBe('unknown');
+    });
+
+    it('reads a raw application/graphql document', () => {
+      expect(classifyGraphqlBody(Buffer.from('query { a }'), { raw: true })).toBe('read');
+      expect(classifyGraphqlBody(Buffer.from('mutation { a }'), { raw: true })).toBe('write');
+      expect(classifyGraphqlBody(Buffer.from('mutation'), { raw: true })).toBe('unknown');
     });
   });
 
@@ -441,6 +540,227 @@ describe('gatekeeper program', () => {
       expect(JSON.stringify(record)).not.toContain('token');
     });
 
+  });
+
+  describe('corridor, method approval', () => {
+    beforeAll(async () => {
+      expect((await control('POST', '/network', { mode: 'open', domains: [] })).status).toBe(200);
+      expect((await control('POST', '/writes', { entries: [] })).status).toBe(200);
+    });
+
+    const pendingNow = async (since = 0) => {
+      const answer = await control('GET', `/pending?since=${since}&wait=0`);
+      expect(answer.status).toBe(200);
+      return JSON.parse(answer.body).requests;
+    };
+    const waitForPending = async (count = 1) => {
+      for (let attempt = 0; attempt < 120; attempt += 1) {
+        const requests = await pendingNow();
+        if (requests.length >= count) return requests;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      throw new Error(`no write started waiting: ${JSON.stringify(await pendingNow())}`);
+    };
+    const answerPending = (id, allow) => control('POST', '/approvals', { id, allow });
+    const clearPending = async () => {
+      for (const request of await pendingNow()) await answerPending(request.id, false);
+    };
+
+    afterEach(async () => {
+      await clearPending();
+      // A refusal now stands for its destination; each test starts from asking again.
+      expect((await control('POST', '/denials', { entries: [] })).status).toBe(200);
+    });
+
+    it('carries a GET without any approval', async () => {
+      const at = await journalMark();
+      const answer = await secureRequest('GET', '/');
+      // The upstream may be unreachable in a sandboxed run; that is a 502 from this proxy, and
+      // still proves the request passed the method gate. Only a 403 would mean it did not.
+      expect(answer.status).not.toMatch(/403/);
+      expect((await recordsSince(at)).some((record) => record.decision === 'deny:method')).toBe(false);
+    });
+
+    it('holds a write until the user allows it, and sends it on after the answer', async () => {
+      const at = await journalMark();
+      const held = secureRequest('POST', '/');
+      const [waiting] = await waitForPending();
+      expect(waiting).toMatchObject({ host: 'example.com', port: 443, method: 'POST', url: 'https://example.com/' });
+      expect(Date.parse(waiting.expiresAt)).toBeGreaterThan(Date.now());
+
+      // Nothing has gone out and nothing has been decided: no allow, no refusal, yet. The
+      // corridor's own `allow` for the CONNECT carries no method and is not a decision about it.
+      expect((await recordsSince(at)).some((record) => record.method !== '' && (record.decision === 'allow' || record.decision === 'deny:method'))).toBe(false);
+      expect((await answerPending(waiting.id, true)).status).toBe(200);
+
+      const answer = await held;
+      expect(answer.status).not.toMatch(/403/);
+      expect((await recordsSince(at)).some((record) => record.decision === 'allow' && record.method === 'POST')).toBe(true);
+      // The same answer twice: the wait is gone.
+      expect((await answerPending(waiting.id, true)).status).toBe(404);
+    });
+
+    it('sends a write on without a wait when the network allows writes', async () => {
+      expect((await control('POST', '/network', { mode: 'open', domains: [], writes: 'allow' })).status).toBe(200);
+      try {
+        const at = await journalMark();
+        const answer = await secureRequest('POST', '/');
+        // Unreachable upstream is a 502 from this proxy and still proves the request passed; only a 403 would mean it waited.
+        expect(answer.status).not.toMatch(/403/);
+        expect(await pendingNow()).toEqual([]);
+        expect((await recordsSince(at)).some((record) => record.decision === 'allow' && record.method === 'POST')).toBe(true);
+      } finally {
+        expect((await control('POST', '/network', { mode: 'open', domains: [], writes: 'ask' })).status).toBe(200);
+      }
+    });
+
+    it('refuses a write the user denies, and reads nothing of its body', async () => {
+      const at = await journalMark();
+      const held = secureRequest('PUT', '/');
+      const [waiting] = await waitForPending();
+      expect(waiting).toMatchObject({ host: 'example.com', method: 'PUT' });
+      expect((await answerPending(waiting.id, false)).status).toBe(200);
+
+      expect((await held).status).toMatch(/403/);
+      expect((await recordsSince(at)).some((record) => record.decision === 'deny:method' && record.method === 'PUT')).toBe(true);
+    });
+
+    it('stands a denial for the destination, and asks again once it is cleared', async () => {
+      const at = await journalMark();
+      const held = secureRequest('POST', '/');
+      const [waiting] = await waitForPending();
+      expect((await answerPending(waiting.id, false)).status).toBe(200);
+      expect((await held).status).toMatch(/403/);
+
+      // The same write again: refused at once, and nothing starts waiting.
+      expect((await secureRequest('POST', '/')).status).toMatch(/403/);
+      expect(await pendingNow()).toEqual([]);
+      expect((await recordsSince(at)).filter((record) => record.decision === 'deny:method' && record.method === 'POST')).toHaveLength(2);
+      expect((await control('GET', '/policy').then((answer) => JSON.parse(answer.body))).denials).toEqual([{ host: 'example.com', methods: ['POST'] }]);
+
+      // Clearing it gives the prompt back.
+      expect((await control('POST', '/denials', { entries: [] })).status).toBe(200);
+      const again = secureRequest('POST', '/');
+      const [second] = await waitForPending();
+      expect((await answerPending(second.id, true)).status).toBe(200);
+      expect((await again).status).not.toMatch(/403/);
+    });
+
+    it('refuses a denial list that names a method nobody can deny', async () => {
+      expect((await control('POST', '/denials', { entries: [{ host: 'example.com', methods: ['CONNECT'] }] })).status).toBe(400);
+      expect((await control('POST', '/denials', { entries: [{ host: '10.0.0.1', methods: ['POST'] }] })).status).toBe(400);
+    });
+
+    it('releases a waiting write when the dialog approves the method for the destination', async () => {
+      const held = secureRequest('POST', '/');
+      const [waiting] = await waitForPending();
+      expect((await control('POST', '/writes', { entries: [{ host: 'example.com', methods: ['POST'] }] })).status).toBe(200);
+      expect((await held).status).not.toMatch(/403/);
+      expect(await pendingNow()).toEqual([]);
+      expect(waiting.id).toBeGreaterThan(0);
+      expect((await control('POST', '/writes', { entries: [] })).status).toBe(200);
+    });
+
+    // The corridor's targets here are real names, so the answer comes from out there or not at
+    // all; only a 403 would mean the method gate held the request.
+    it('sends a GraphQL document that only reads without asking', async () => {
+      const at = await journalMark();
+      const query = JSON.stringify({ query: 'query Viewer { viewer { login } }' });
+      const answer = await secureRequest('POST', '/graphql', { body: query, headers: { 'content-type': 'application/json' } });
+      expect(answer.status).not.toMatch(/403/);
+      expect(await pendingNow()).toEqual([]);
+      expect((await recordsSince(at)).some((record) => record.decision === 'deny:method')).toBe(false);
+    });
+
+    it('asks for a GraphQL mutation, and sends it on only after the user allows it', async () => {
+      const mutation = JSON.stringify({ query: 'mutation AddStar { addStar(input: {}) { clientMutationId } }' });
+      const held = secureRequest('POST', '/graphql', { body: mutation, headers: { 'content-type': 'application/json' } });
+      const [waiting] = await waitForPending();
+      expect(waiting.method).toBe('POST');
+      expect((await answerPending(waiting.id, true)).status).toBe(200);
+      expect((await held).status).not.toMatch(/403/);
+    });
+
+    it('keeps a denial for the write, and still lets that host\'s GraphQL reads through', async () => {
+      const mutation = JSON.stringify({ query: 'mutation { evil }' });
+      const held = secureRequest('POST', '/graphql', { body: mutation, headers: { 'content-type': 'application/json' } });
+      const [waiting] = await waitForPending();
+      expect((await answerPending(waiting.id, false)).status).toBe(200);
+      expect((await held).status).toMatch(/403/);
+
+      // The denial stands for the mutation; a query at the same destination is not that write.
+      const query = JSON.stringify({ query: 'query { viewer { login } }' });
+      const answer = await secureRequest('POST', '/graphql', { body: query, headers: { 'content-type': 'application/json' } });
+      expect(answer.status).not.toMatch(/403/);
+      expect(await pendingNow()).toEqual([]);
+    });
+
+    it('asks for a body it cannot read with certainty, and refuses it on a no', async () => {
+      const held = secureRequest('POST', '/graphql', { body: '{"extensions":{"persistedQuery":{"version":1}}}', headers: { 'content-type': 'application/json' } });
+      const [waiting] = await waitForPending();
+      expect((await answerPending(waiting.id, false)).status).toBe(200);
+      expect((await held).status).toMatch(/403/);
+      expect(await pendingNow()).toEqual([]);
+    });
+
+    it('carries the QUERY method, a safe request with a body', async () => {
+      const answer = await secureRequest('QUERY', '/search', { body: '{"q":"anything"}', headers: { 'content-type': 'application/json' } });
+      expect(answer.status).not.toMatch(/403/);
+      expect(await pendingNow()).toEqual([]);
+    });
+
+    it('refuses a write nobody answered within the limit, without denying the destination', async () => {
+      const at = await journalMark();
+      const held = secureRequest('POST', '/');
+      await waitForPending();
+      // The test child runs with a 1.5 second limit: an answer that never comes is its own refusal.
+      expect((await held).status).toMatch(/403/);
+      expect((await recordsSince(at)).some((record) => record.decision === 'deny:method' && record.method === 'POST')).toBe(true);
+      // A refusal nobody made is not a denial: the destination must still ask.
+      expect((await control('GET', '/policy').then((answer) => JSON.parse(answer.body))).denials).toEqual([]);
+      const again = secureRequest('POST', '/');
+      await waitForPending();
+      expect((await again).status).toMatch(/403/);
+    });
+
+    it('refuses the waits a newly set denial covers, without asking again', async () => {
+      const first = secureRequest('POST', '/');
+      await waitForPending();
+      expect((await control('POST', '/denials', { entries: [{ host: 'example.com', methods: ['POST'] }] })).status).toBe(200);
+      expect((await first).status).toMatch(/403/);
+      expect(await pendingNow()).toEqual([]);
+    });
+
+    it('refuses a Host that is not the name the tunnel was opened for', async () => {
+      const at = await journalMark();
+      const answer = await secureRequest('GET', '/', { hostHeader: 'other.example.com' });
+      expect(answer.status).toMatch(/403/);
+      expect((await recordsSince(at)).some((record) => record.decision === 'deny:host-mismatch')).toBe(true);
+    });
+
+    it('refuses a method a user cannot approve', async () => {
+      const answer = await control('POST', '/writes', { entries: [{ host: 'example.com', methods: ['CONNECT'] }] });
+      expect(answer.status).toBe(400);
+      expect(answer.body).toContain('CONNECT');
+    });
+
+    it('refuses a write past the number that may wait at once', async () => {
+      const held = [];
+      for (let index = 0; index < 8; index += 1) held.push(secureRequest('POST', '/'));
+      await waitForPending(8);
+      // The ninth is refused at once: a space cannot occupy the corridor with waits.
+      expect((await secureRequest('POST', '/')).status).toMatch(/403/);
+      const pending = await pendingNow();
+      expect(pending).toHaveLength(8);
+      for (const request of pending) expect((await answerPending(request.id, false)).status).toBe(200);
+      expect((await Promise.all(held)).every((answer) => /403/.test(answer.status))).toBe(true);
+    });
+
+    it('serves the certificate the space trusts on the window too', async () => {
+      const answer = await throughWindow('/ca');
+      expect(answer.status).toBe(200);
+      expect(answer.body).toContain('BEGIN CERTIFICATE');
+    });
   });
 
   describe('corridor, under abuse', () => {
@@ -642,7 +962,7 @@ describe('gatekeeper program', () => {
       const settle = () => new Promise((resolve) => { setTimeout(resolve, 200); });
 
       beforeAll(async () => {
-        ({ child: small, ports: smallPorts } = await startGatekeeper(['1500', '2', '2', '2']));
+        ({ child: small, ports: smallPorts } = await startGatekeeper(['1500', '2', '2', '2', '300000', '1500']));
         const ready = Date.now();
         while (Date.now() - ready < 20_000) {
           if ((await ask(smallPorts.control, '/health')).status === 200) return;
@@ -811,7 +1131,7 @@ describe('gatekeeper program', () => {
       await throughWindow('/model/anthropic/messages?key=leak-me', { authorization: 'Bearer sk-fake-inside' });
       const record = await decisionFor('127.0.0.1', at);
       expect(record).toMatchObject({ listener: 'window', host: '127.0.0.1', decision: 'allow' });
-      expect(Object.keys(record)).toEqual(['at', 'listener', 'host', 'port', 'decision']);
+      expect(Object.keys(record)).toEqual(['at', 'listener', 'host', 'port', 'method', 'decision']);
       expect(JSON.stringify(record)).not.toMatch(/messages|leak-me|Bearer/);
     });
 
@@ -918,6 +1238,7 @@ describe('gatekeeper program', () => {
   describe('control channel', () => {
     it.each([
       ['a mode that does not exist', '/network', { mode: 'everything', domains: [] }],
+      ['a write choice that does not exist', '/network', { mode: 'open', domains: [], writes: 'no' }],
       ['a wildcard on the allowlist', '/network', { mode: 'allowlist', domains: ['*.googleapis.com'] }],
       ['an address on the allowlist', '/network', { mode: 'allowlist', domains: ['10.0.0.1'] }],
       // The list and a target go through the same predicate, so the host cannot put an entry
@@ -1160,178 +1481,17 @@ describe('the rules of the gatekeeper program', () => {
   // The sockets are built the way the program builds them: the space-facing one as an
   // `http.Server` accepts it, half-open allowed, and the one out as `net.connect` makes it, which
   // the program now also asks for half-open.
-  describe('joinSockets', () => {
-    const open = [];
-
-    afterEach(async () => {
-      const items = open.splice(0);
-      for (const item of items) {
-        if (item.destroy) item.destroy();
-      }
-      for (const item of items) {
-        if (!item.destroy && item.close) await new Promise((resolve) => { item.close(resolve); });
-      }
+  describe('guardTunnelIdle', () => {
+    it('arms the idle limit on a tunnel and destroys the socket when it passes', () => {
+      const { guardTunnelIdle, TUNNEL_IDLE_MS } = createRequire(import.meta.url)(PROGRAM);
+      expect(TUNNEL_IDLE_MS).toBe(300_000);
+      let armed = null;
+      let destroyed = false;
+      guardTunnelIdle({ setTimeout: (milliseconds, callback) => { armed = { milliseconds, callback }; }, destroy: () => { destroyed = true; } });
+      expect(armed.milliseconds).toBe(300_000);
+      armed.callback();
+      expect(destroyed).toBe(true);
     });
-
-    /** A listening server and the two ends of one connection to it. */
-    const connectedPair = async ({ server: serverOptions = {}, dial = {} } = {}) => {
-      const server = net.createServer(serverOptions);
-      open.push(server);
-      await new Promise((resolve) => { server.listen(0, '127.0.0.1', resolve); });
-      const accepted = new Promise((resolve) => { server.once('connection', resolve); });
-      const dialled = net.connect({ host: '127.0.0.1', port: server.address().port, ...dial });
-      dialled.on('error', () => {});
-      await new Promise((resolve) => { dialled.once('connect', resolve); });
-      const received = await accepted;
-      received.on('error', () => {});
-      open.push(dialled, received);
-      return { dialled, received };
-    };
-
-    /**
-     * What the corridor holds after a CONNECT: `space` is the client's end, `origin` is the
-     * upstream's own end, and the two sockets between them are the ones it joins.
-     * `originKeepsReading` gives the stand-in upstream half-open, which a server that answers
-     * and then keeps reading has to ask for itself.
-     */
-    const tunnel = async ({ originKeepsReading = false } = {}) => {
-      // The stand-in space keeps half-open too, because a client that goes on writing after it
-      // has read a FIN has to ask for that itself. That is the client's own choice in
-      // production, and what is under test here is only what the corridor does between them.
-      const fromSpace = await connectedPair({ server: { allowHalfOpen: true }, dial: { allowHalfOpen: true } });
-      const toUpstream = await connectedPair({ server: { allowHalfOpen: originKeepsReading }, dial: { allowHalfOpen: true } });
-      let released = 0;
-      rules.joinSockets(fromSpace.received, toUpstream.dialled, () => { released += 1; });
-      return { space: fromSpace.dialled, origin: toUpstream.received, releases: () => released };
-    };
-
-    // The defect this was written for: the corridor destroyed both sockets when the upstream
-    // finished, and a destroy with unread bytes in the receive queue becomes a reset, which
-    // makes the kernel throw away the send queue with it. One direction alone does not show it,
-    // because the pipe's own backpressure keeps the buffer small. Both directions at once do.
-    it('carries a whole answer while the space is still uploading', async () => {
-      const { space, origin } = await tunnel();
-      const payload = crypto.randomBytes(4 * 1024 * 1024);
-      const expected = crypto.createHash('sha256').update(payload).digest('hex');
-
-      // The origin reads the upload, or backpressure stops it answering at all.
-      origin.resume();
-      // The space keeps writing while it reads, so the corridor's socket to it always has
-      // something unread.
-      const uploading = setInterval(() => {
-        if (!space.destroyed && space.writable) space.write(crypto.randomBytes(16 * 1024));
-      }, 5);
-      // And it reads slowly, so the corridor is still holding bytes when the origin finishes.
-      space.pause();
-      const chunks = [];
-      let received = 0;
-      const reading = setInterval(() => {
-        const chunk = space.read(16 * 1024);
-        if (chunk) {
-          chunks.push(chunk);
-          received += chunk.length;
-        }
-      }, 15);
-
-      origin.end(payload);
-      await new Promise((resolve) => {
-        const check = setInterval(() => {
-          if (received >= payload.length || space.destroyed) {
-            clearInterval(check);
-            resolve();
-          }
-        }, 20);
-        setTimeout(() => { clearInterval(check); resolve(); }, 60_000);
-      });
-      clearInterval(uploading);
-      clearInterval(reading);
-      // Whatever is left in the buffer after the last tick.
-      for (let chunk = space.read(); chunk; chunk = space.read()) chunks.push(chunk);
-
-      const bytes = Buffer.concat(chunks);
-      expect(bytes).toHaveLength(payload.length);
-      expect(crypto.createHash('sha256').update(bytes).digest('hex')).toBe(expected);
-    }, 90_000);
-
-    it('passes a half-close on as a half-close, from the client side', async () => {
-      // The origin keeps reading after the FIN, which is what a server that still owes an
-      // answer does; a default socket ends its own writable side the moment it reads one.
-      const { space, origin } = await tunnel({ originKeepsReading: true });
-      origin.resume();
-      const heard = new Promise((resolve) => { origin.once('end', resolve); });
-      space.end('a request that ends with a FIN');
-      await heard;
-
-      // The upstream heard the close and is still there. Destroying it here would take the
-      // answer with it, which is what the client's `end` used to do.
-      expect(origin.destroyed).toBe(false);
-
-      const answer = 'the answer, after the client half closed';
-      const arrived = new Promise((resolve) => {
-        const chunks = [];
-        space.on('data', (chunk) => {
-          chunks.push(chunk);
-          if (Buffer.concat(chunks).toString().includes(answer)) resolve(Buffer.concat(chunks).toString());
-        });
-        setTimeout(() => resolve(Buffer.concat(chunks).toString()), 3_000);
-      });
-      origin.write(answer);
-      expect(await arrived).toContain(answer);
-    }, 30_000);
-
-    // The other direction, which nothing covered until it was measured against the real program:
-    // the upstream answers, half-closes, and goes on reading what the space is still sending.
-    it('passes a half-close on from the upstream side, and still carries what the space sends', async () => {
-      const { space, origin } = await tunnel({ originKeepsReading: true });
-      space.resume();
-      const heard = new Promise((resolve) => { space.once('end', resolve); });
-      origin.end('the answer, and then a FIN');
-      await heard;
-
-      const later = 'what the space sent afterwards';
-      const arrived = new Promise((resolve) => {
-        const chunks = [];
-        origin.on('data', (chunk) => {
-          chunks.push(chunk);
-          if (Buffer.concat(chunks).toString().includes(later)) resolve(Buffer.concat(chunks).toString());
-        });
-        setTimeout(() => resolve(Buffer.concat(chunks).toString()), 3_000);
-      });
-      space.write(later);
-      expect(await arrived).toContain(later);
-    }, 30_000);
-
-    it('gives the place back when one side dies under load, without waiting for the idle timeout', async () => {
-      const { space, origin, releases } = await tunnel();
-      origin.resume();
-      // The origin pushes and the space reads nothing, so the corridor's socket out is paused by
-      // backpressure. A paused socket never notices its peer leaving: `pipe` carries a close but
-      // not a death, so without telling the peer to go the second close never came and the place
-      // stayed taken for the five minutes of the idle timeout. Rounds of that reach the cap.
-      space.pause();
-      const pushing = setInterval(() => {
-        if (!origin.destroyed && origin.writable) origin.write(crypto.randomBytes(256 * 1024));
-      }, 5);
-      await new Promise((resolve) => { setTimeout(resolve, 400); });
-      space.destroy();
-      await new Promise((resolve) => { setTimeout(resolve, 800); });
-      clearInterval(pushing);
-
-      expect(releases()).toBe(1);
-      expect(origin.destroyed).toBe(true);
-    }, 30_000);
-
-    it('keeps the place while a half-closed tunnel is still carrying', async () => {
-      // An origin that goes on after the FIN. With one that closes instead, the tunnel is over
-      // and the place comes back, which is the test above.
-      const { space, origin, releases } = await tunnel({ originKeepsReading: true });
-      origin.resume();
-      space.end('a request that ends with a FIN');
-      await new Promise((resolve) => { setTimeout(resolve, 500); });
-      // Half-closed is not gone: the answer may still be on its way.
-      expect(releases()).toBe(0);
-      expect(origin.destroyed).toBe(false);
-    }, 30_000);
   });
 
   describe('chooseAddress', () => {
@@ -1498,40 +1658,44 @@ describe('the gatekeeper program as a file', () => {
     expect(source).toContain('await listen(control, controlPort, CONTROL_HOST);');
   });
 
-  it('writes no refusal into a tunnel that is already carrying bytes', () => {
-    // An upstream reset halfway through a download would otherwise put `HTTP/1.1 502` in the
-    // middle of somebody's TLS stream. It cannot be reached from here, because a tunnel needs an
-    // address this machine may not tunnel to, so what is checked is that the guard is there and
-    // that it is armed where the tunnel becomes a tunnel.
-    expect(source).toContain('if (!carrying && !clientSocket.destroyed');
-    expect(source).toContain('carrying = true;');
-    expect(source.indexOf('carrying = true;')).toBeGreaterThan(source.indexOf("upstream.on('connect'"));
+  it('answers a tunnel it cannot carry before it carries anything, and never inside a response', () => {
+    // The corridor now terminates the space's TLS, so there is no raw tunnel to write `HTTP/1.1`
+    // into: every answer is an HTTP response on the decrypted connection, and only before its
+    // headers have gone out. A response that has started is destroyed instead.
+    expect(source).toContain('if (!response.headersSent) refuseDecrypted(response, 502, UNREACHABLE');
+    expect(source).toContain('else response.destroy();');
   });
 
   it('lets a 502 leave the same way a 403 does, drained rather than reset', () => {
     // The answer to an allowed host that could not be reached carries the one header that tells
     // the space "allowed, and the connection out failed" apart from "refused", which is the
-    // distinction the journal and this reason header exist for. Destroying the socket in the same
-    // tick would lose it exactly as it lost the 403 before this round: a close with unread bytes
-    // in the receive queue is a reset, and the reset takes the queued answer with it.
-    //
-    // It cannot be driven from here, for the same reason as the guard above: a 502 needs a name
-    // that resolves to an address this machine is allowed to tunnel to, and the unit suite
-    // resolves nothing. The drain itself is exercised for real by the 403 test, which fills the
-    // receive queue against this same `refuse`. What is checked here is that this branch hands
-    // the socket to `refuse` and does not pull it out from under it.
-    const branch = source.slice(source.indexOf("upstream.on('error'"), source.indexOf('upstream.setTimeout(CONNECT_TIMEOUT_MS'));
-    expect(branch).toContain("refuse(clientSocket, 502, 'Bad Gateway', UNREACHABLE);");
-    expect(branch).toContain('releasePlace();');
-    expect(branch).toContain('upstream.destroy();');
-    // `abort()` destroys the client socket, and it stays for the timeout, the carrying case and a
-    // client that left. It must not be what ends a socket that has just been given an answer.
-    expect(branch.slice(0, branch.indexOf('abort();'))).toContain('return;');
+    // distinction the journal and this reason header exist for. It is a real HTTP answer on the
+    // decrypted connection now, so the reset concern belongs to the HTTP server, not to a raw
+    // socket write.
+    const branch = source.slice(source.indexOf('outgoing.on(\'error\''), source.indexOf('response.on(\'close\''));
+    expect(branch).toContain('refuseDecrypted(response, 502, UNREACHABLE');
+    expect(branch).toContain('response.destroy()');
   });
 
   it('connects to the address it checked, and never resolves the name again', () => {
-    expect(source).toContain('net.connect({ host: resolved.address, port, allowHalfOpen: true })');
-    expect(source).toContain('lookup: fixedLookup(chosen.address, chosen.family)');
+    expect(source).toContain('lookup: fixedLookup(target.address, target.family)');
+    expect(source).toContain('servername: target.host');
+  });
+
+  it('does not turn a cancelled upload into a blank blocked row', () => {
+    // The reset is ordinary traffic; a write already has its `failed:<code>` record, and a second
+    // `deny:unreadable-request` with no host would appear in the user's blocked list.
+    expect(source).toContain("code !== 'ECONNRESET' && code !== 'EPIPE' && code !== 'ERR_STREAM_PREMATURE_CLOSE'");
+  });
+
+  it('arms the tunnel idle limit before it ends TLS, and keeps it on the decrypted server', () => {
+    // The place is taken when the 200 goes out, and the TLS handshake can take forever. The timer
+    // must be on the socket before the wrap, or sixty-four silent CONNECTs close the corridor.
+    expect(source.indexOf('guardTunnelIdle(clientSocket);')).toBeGreaterThan(source.indexOf('200 Connection Established'));
+    expect(source.indexOf('guardTunnelIdle(clientSocket);')).toBeLessThan(source.indexOf('new tls.TLSSocket'));
+    // The HTTP server resets the socket timeout to its own on every request; without this the
+    // limit would cover only the first request of a keep-alive connection.
+    expect(source).toContain('decrypted.timeout = TUNNEL_IDLE_MS;');
   });
 
   it('needs nothing but the standard library', () => {

@@ -41,8 +41,8 @@ export const spaceAccessNoticeOf = (entry: SpaceEntry | undefined): SpaceAccessN
   return providers.length > 0 ? { kind: 'needs_again', providers } : null;
 };
 
-/** Why the gatekeeper refused, in the words the dialog uses; only `not_on_list` can be opened. */
-export type BlockReason = 'not_on_list' | 'private_address' | 'unresolved' | 'address_not_name' | 'port' | 'always_refused' | 'too_many' | 'other';
+/** Why the gatekeeper refused, in the words the dialog uses; `not_on_list` can be opened, `method` can be approved. */
+export type BlockReason = 'not_on_list' | 'private_address' | 'unresolved' | 'address_not_name' | 'port' | 'always_refused' | 'method' | 'too_many' | 'other';
 
 const reasonOf = (decision: string): BlockReason | null => {
   if (!decision.startsWith('deny:')) return null;
@@ -53,29 +53,30 @@ const reasonOf = (decision: string): BlockReason | null => {
   if (reason === 'not-a-name') return 'address_not_name';
   if (reason === 'port') return 'port';
   if (reason === 'always-refused') return 'always_refused';
+  if (reason === 'method') return 'method';
   if (reason === 'too-many-tunnels' || reason === 'too-many-connections') return 'too_many';
   return 'other';
 };
 
-type BlockedAttempt = { host: string; port: number; reason: BlockReason; count: number; last: string };
+type BlockedAttempt = { host: string; port: number; method: string; reason: BlockReason; count: number; last: string };
 
 /**
- * The refused attempts of a journal, one per destination and reason, the latest first. What was
- * allowed, and what was allowed and could not be reached, is left out: the dialog is about what
- * the user can open. `host` is what the agent asked for, shown as it is.
+ * The refused attempts of a journal, one per destination, method and reason, the latest first.
+ * What was allowed, and what was allowed and could not be reached, is left out: the dialog is
+ * about what the user can open or approve. `host` is what the agent asked for, shown as it is.
  */
 export const blockedAttemptsOf = (records: readonly SpaceJournalRecord[]): BlockedAttempt[] => {
   const byKey = new Map<string, BlockedAttempt>();
   for (const record of records) {
     const reason = reasonOf(record.decision);
     if (!reason) continue;
-    const key = `${reason}\u0000${record.host}\u0000${reason === 'port' ? record.port : ''}`;
+    const key = `${reason}\u0000${record.host}\u0000${reason === 'port' ? record.port : ''}\u0000${reason === 'method' ? record.method : ''}`;
     const known = byKey.get(key);
     if (known) {
       known.count += 1;
       if (record.at > known.last) known.last = record.at;
     } else {
-      byKey.set(key, { host: record.host, port: record.port, reason, count: 1, last: record.at });
+      byKey.set(key, { host: record.host, port: record.port, method: record.method, reason, count: 1, last: record.at });
     }
   }
   return Array.from(byKey.values()).sort((a, b) => (a.last < b.last ? 1 : a.last > b.last ? -1 : 0));

@@ -123,6 +123,7 @@ import { useRightSlotStore } from '@/components/layout/rightSlot';
 import { buildPromptPreviewsByTurnId } from './lib/promptPreviews';
 import { resolveChatPromptReadOnly } from './chatPromptReadOnly';
 import { PermissionDock } from './PermissionDock';
+import { SpaceApprovalDock } from './SpaceApprovalDock';
 import { FormDock } from './FormDock';
 import { ensureSpaceArchives, useSpaceArchiveOf } from '@/lib/spaces/space-archives';
 import { useSpaceDirectoryStopped } from '@/lib/spaces/spaces-store';
@@ -2097,6 +2098,10 @@ export const ChatContainer: React.FC<ChatContainerProps> = ({
                         />
                         <FormDock
                             sessionId={currentSessionId}
+                            directory={effectiveSessionDirectory}
+                            hidden={sessionPermissions.length > 0}
+                        />
+                        <SpaceApprovalDock
                             directory={effectiveSessionDirectory}
                             hidden={sessionPermissions.length > 0}
                         />
