@@ -19,8 +19,10 @@ const entry = (change: Partial<SpaceEntry> = {}): SpaceEntry => ({
   stoppedIdle: false,
   step: null,
   failure: null,
-  network: { mode: 'allowlist', domains: [] },
+  network: { mode: 'allowlist', domains: [], writes: 'ask' },
   grants: [anthropic, openai],
+  writeAccess: [],
+  deniedWrites: [],
   access: 'granted',
   needsAccess: [],
   accessFailures: [],
@@ -60,17 +62,17 @@ describe('spaceAccessNoticeOf', () => {
   });
 
   test('warns about a missing model key whatever the network, since OpenCode\'s free models refuse a space', () => {
-    expect(spaceAccessNoticeOf(entry({ grants: [], access: null, network: { mode: 'open', domains: [] } }))).toEqual({ kind: 'no_model' });
-    expect(spaceAccessNoticeOf(entry({ grants: [registry], network: { mode: 'open', domains: [] } }))).toEqual({ kind: 'no_model' });
+    expect(spaceAccessNoticeOf(entry({ grants: [], access: null, network: { mode: 'open', domains: [], writes: 'ask' } }))).toEqual({ kind: 'no_model' });
+    expect(spaceAccessNoticeOf(entry({ grants: [registry], network: { mode: 'open', domains: [], writes: 'ask' } }))).toEqual({ kind: 'no_model' });
     expect(spaceAccessNoticeOf(entry({ grants: [], access: null, network: null }))).toEqual({ kind: 'no_model' });
-    expect(spaceAccessNoticeOf(entry({ grants: [], access: null, network: { mode: 'allowlist', domains: ['opencode.ai'] } }))).toEqual({ kind: 'no_model' });
+    expect(spaceAccessNoticeOf(entry({ grants: [], access: null, network: { mode: 'allowlist', domains: ['opencode.ai'], writes: 'ask' } }))).toEqual({ kind: 'no_model' });
     // A key, a login or a provider of the user's own is access with the open internet too.
     const custom = { kind: 'custom' as const, id: 'ollama-local', provider: 'ollama-local', url: 'http://gatekeeper:8080/model/ollama-local' };
     for (const grant of [anthropic, openaiLogin, custom]) {
-      expect(spaceAccessNoticeOf(entry({ grants: [grant], network: { mode: 'open', domains: [] } }))).toBeNull();
+      expect(spaceAccessNoticeOf(entry({ grants: [grant], network: { mode: 'open', domains: [], writes: 'ask' } }))).toBeNull();
     }
     // A key lost at a restart is still said, whatever the network.
-    expect(spaceAccessNoticeOf(entry({ access: 'needs_access', needsAccess: ['anthropic'], network: { mode: 'open', domains: [] } }))).toEqual({ kind: 'needs_again', providers: ['anthropic'] });
+    expect(spaceAccessNoticeOf(entry({ access: 'needs_access', needsAccess: ['anthropic'], network: { mode: 'open', domains: [], writes: 'ask' } }))).toEqual({ kind: 'needs_again', providers: ['anthropic'] });
   });
 
   test('says it could not check rather than "granted" when the gatekeeper did not answer', () => {
@@ -86,7 +88,7 @@ describe('spaceAccessNoticeOf', () => {
 });
 
 describe('blockedAttemptsOf', () => {
-  const record = (host: string, decision: string, at: string, port = 443, listener = 'corridor'): SpaceJournalRecord => ({ at, listener, host, port, decision });
+  const record = (host: string, decision: string, at: string, port = 443, listener = 'corridor', method = ''): SpaceJournalRecord => ({ at, listener, host, port, method, decision });
 
   test('one line per destination and reason, counted, the latest first, without what was allowed', () => {
     const attempts = blockedAttemptsOf([
@@ -99,22 +101,34 @@ describe('blockedAttemptsOf', () => {
       record('ssh.example.com', 'deny:port', '2026-09-27T10:04:00.000Z', 2222),
     ]);
     expect(attempts).toEqual([
-      { host: 'registry.npmjs.org', port: 443, reason: 'not_on_list', count: 2, last: '2026-09-27T10:05:00.000Z' },
-      { host: 'ssh.example.com', port: 2222, reason: 'port', count: 1, last: '2026-09-27T10:04:00.000Z' },
-      { host: 'ssh.example.com', port: 22, reason: 'port', count: 1, last: '2026-09-27T10:03:00.000Z' },
-      { host: 'internal.corp.example', port: 443, reason: 'private_address', count: 1, last: '2026-09-27T10:02:00.000Z' },
+      { host: 'registry.npmjs.org', port: 443, method: '', reason: 'not_on_list', count: 2, last: '2026-09-27T10:05:00.000Z' },
+      { host: 'ssh.example.com', port: 2222, method: '', reason: 'port', count: 1, last: '2026-09-27T10:04:00.000Z' },
+      { host: 'ssh.example.com', port: 22, method: '', reason: 'port', count: 1, last: '2026-09-27T10:03:00.000Z' },
+      { host: 'internal.corp.example', port: 443, method: '', reason: 'private_address', count: 1, last: '2026-09-27T10:02:00.000Z' },
     ]);
   });
 
   test('names every refusal the gatekeeper writes', () => {
     const reasons = blockedAttemptsOf([
       'deny:unresolved:ENOTFOUND', 'deny:not-a-name', 'deny:always-refused', 'deny:too-many-tunnels', 'deny:too-many-connections',
-      'deny:malformed', 'deny:unreadable-request', 'deny:not-connect', 'deny:no-grant', 'deny:path-walks-out', 'deny:own-listener',
+      'deny:malformed', 'deny:unreadable-request', 'deny:not-connect', 'deny:no-grant', 'deny:path-walks-out', 'deny:own-listener', 'deny:method',
     ].map((decision, index) => record(`h${index}.example.com`, decision, `2026-09-27T10:00:${String(index).padStart(2, '0')}.000Z`))).map((attempt) => [attempt.host, attempt.reason]);
     expect(Object.fromEntries(reasons)).toEqual({
       'h0.example.com': 'unresolved', 'h1.example.com': 'address_not_name', 'h2.example.com': 'always_refused', 'h3.example.com': 'too_many', 'h4.example.com': 'too_many',
-      'h5.example.com': 'other', 'h6.example.com': 'other', 'h7.example.com': 'other', 'h8.example.com': 'other', 'h9.example.com': 'other', 'h10.example.com': 'other',
+      'h5.example.com': 'other', 'h6.example.com': 'other', 'h7.example.com': 'other', 'h8.example.com': 'other', 'h9.example.com': 'other', 'h10.example.com': 'other', 'h11.example.com': 'method',
     });
+  });
+
+  test('keeps each refused method of a destination as its own line, counted', () => {
+    const attempts = blockedAttemptsOf([
+      record('api.github.com', 'deny:method', '2026-09-27T10:00:00.000Z', 443, 'corridor', 'POST'),
+      record('api.github.com', 'deny:method', '2026-09-27T10:01:00.000Z', 443, 'corridor', 'PUT'),
+      record('api.github.com', 'deny:method', '2026-09-27T10:02:00.000Z', 443, 'corridor', 'POST'),
+    ]);
+    expect(attempts.map((attempt) => [attempt.method, attempt.reason, attempt.count])).toEqual([
+      ['POST', 'method', 2],
+      ['PUT', 'method', 1],
+    ]);
   });
 });
 
@@ -128,7 +142,7 @@ describe('isDomainName', () => {
 });
 
 describe('setupBlockedDomainsOf', () => {
-  const record = (host: string, decision: string, at: string): SpaceJournalRecord => ({ at, listener: 'corridor', host, port: 443, decision });
+  const record = (host: string, decision: string, at: string): SpaceJournalRecord => ({ at, listener: 'corridor', host, port: 443, method: '', decision });
   const span = { startedAt: '2026-09-27T10:00:00.000Z', finishedAt: '2026-09-27T10:02:00.000Z' };
 
   test('the domains refused as not on the list during the run, once each, in the order first tried', () => {

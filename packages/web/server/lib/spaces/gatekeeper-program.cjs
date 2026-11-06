@@ -22,14 +22,16 @@
 // Everything the space sends is hostile input. Nothing it can send may end the process:
 // a crash of the gatekeeper is a denial of service the agent could trigger at will.
 
+const crypto = require('node:crypto');
 const dns = require('node:dns');
 const fs = require('node:fs');
 const http = require('node:http');
 const https = require('node:https');
 const net = require('node:net');
 const os = require('node:os');
+const tls = require('node:tls');
 
-const [bindArgument, corridorPort, windowPort, controlPort, windowDeadline, corridorCap, windowCap, controlCap] = process.argv.slice(2);
+const [bindArgument, corridorPort, windowPort, controlPort, windowDeadline, corridorCap, windowCap, controlCap, tunnelIdle, approvalTimeout] = process.argv.slice(2);
 
 /**
  * A cap given on the command line, or the production number when there is none.
@@ -86,8 +88,9 @@ const MAX_CONTROL_CONNECTIONS = cap(controlCap, 8);
 // kind. The flood is the point of the record, and 500 records of it would erase everything else.
 const NOTE_INTERVAL_MS = 60_000;
 // No byte in either direction for this long and the tunnel goes. A model answer streams,
-// and a long turn can be quiet for minutes, so this is generous on purpose.
-const TUNNEL_IDLE_MS = 300_000;
+// and a long turn can be quiet for minutes, so this is generous on purpose. It is the last
+// argument, a length like the window's deadline, so a test can watch it pass.
+const TUNNEL_IDLE_MS = Number(tunnelIdle) > 0 ? Number(tunnelIdle) : 300_000;
 const CONNECT_TIMEOUT_MS = 15_000;
 
 const MAX_HEADER_BYTES = 16 * 1024;
@@ -101,6 +104,28 @@ const JOURNAL_RECORDS = 500;
 const MAX_JOURNAL_HOST = 256;
 const MAX_JOURNAL_DECISION = 64;
 const MAX_ALLOWED_DOMAINS = 500;
+
+// The methods that cannot change anything out there. Every other method is a write as far as this
+// proxy is concerned: the corridor cannot tell `POST /issues` from `POST /search`, so the user
+// decides about the method as a whole.
+// QUERY is the RFC 10008 answer to a read that needs a body: safe and idempotent like GET, with
+// the request content of POST. A server that does not know it answers for itself.
+const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS', 'QUERY']);
+// The methods the user may approve for a destination. Anything outside this list is refused
+// outright: a custom method is not something a tool needs, and approving it would only widen the
+// set of ways the space can act on a host.
+const WRITABLE_METHODS = ['DELETE', 'PATCH', 'POST', 'PUT'];
+const MAX_WRITE_ENTRIES = 200;
+// How long a write waits for the user's answer before the gatekeeper refuses it. A length like the
+// tunnel's idle limit, so a test can watch it pass; the host shows a prompt meanwhile.
+const APPROVAL_TIMEOUT_MS = Number(approvalTimeout) > 0 ? Number(approvalTimeout) : 60_000;
+// A space can start writes faster than a person can read them. Past this the next one is refused
+// at once, so writer holds cannot fill the corridor and take the user's attention with them.
+const MAX_PENDING_APPROVALS = 8;
+// Certificates are issued per destination on demand. The cache is bounded so a space in open mode
+// cannot make the gatekeeper hold a certificate for every name it invents.
+const MAX_CERTIFICATES = 512;
+const METHOD_PATTERN = /^[A-Z]{1,16}$/;
 
 const DOMAIN_PATTERN = /^(?=.{1,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/;
 // A last label that is a number or hex is an address in one of the spellings `getaddrinfo` takes.
@@ -145,8 +170,25 @@ function readBindHost(argument) {
 // Everything the host sets, in memory only. Never a file, never an environment variable,
 // never an argument, never a label. A restart starts from "nothing is allowed".
 let networkMode = 'allowlist';
+// Whether a write the user has not approved for its destination still waits for an answer. `ask`
+// is the default a gatekeeper starts from and what a record without the choice says.
+let writePolicy = 'ask';
 let allowedDomains = new Set();
 const grants = new Map();
+// The methods the user approved for a destination. Absent means GET, HEAD and OPTIONS only.
+let writeAccess = new Map();
+// The methods the user denied for a destination. A repeat is refused at once, without a wait:
+// the answer stands until the user clears it in the access dialog.
+let deniedWrites = new Map();
+// The last time a standing denial was journalled, per destination and method: a retry loop is not
+// evidence, and 500 of its records would erase everything else the journal holds.
+const lastDenialNote = new Map();
+// Writes waiting for the user's answer, by the number this gatekeeper gave them. Each holds the
+// space's own request and socket: nothing of it is read until the answer arrives.
+const pendingApprovals = new Map();
+// Hosts waiting on `GET /pending` for one of those to appear or to time out.
+const approvalWaiters = new Set();
+let approvalSeq = 0;
 
 // When this program started, for the journal: nothing before it is on record.
 const STARTED_AT = new Date().toISOString();
@@ -163,12 +205,13 @@ let journalDropped = 0;
  * 16 KiB request line, and without this cut a space could make the whole journal too large to
  * read and hold it that way, which would take the user's only view of what it tried.
  */
-function record(listener, host, port, decision) {
+function record(listener, host, port, decision, method = '') {
   journal.push({
     at: new Date().toISOString(),
     listener,
     host: String(host || '').slice(0, MAX_JOURNAL_HOST),
     port: Number(port) || 0,
+    method: String(method || '').slice(0, 20),
     decision: String(decision).slice(0, MAX_JOURNAL_DECISION),
   });
   if (journal.length > JOURNAL_RECORDS) {
@@ -328,6 +371,154 @@ const fixedLookup = (address, family) => (hostname, options, callback) => {
 };
 
 // ---------------------------------------------------------------------------------------------
+// Certificates
+//
+// The corridor has to read the method of a request, and a TLS tunnel hides it. So the corridor
+// ends the space's TLS and starts its own: a certificate authority made here, in memory, signs
+// one certificate per destination, and the space trusts that authority through its environment.
+// The authority never leaves this process, and the certificate it signs is public.
+//
+// The DER below is written by hand because the program has nothing but the standard library.
+// Node can read X.509 but not make it, and the image's openssl would add a process per new host.
+// ---------------------------------------------------------------------------------------------
+
+/** DER length bytes. */
+function derLength(length) {
+  if (length < 0x80) return Buffer.from([length]);
+  const bytes = [];
+  let value = length;
+  while (value > 0) {
+    bytes.unshift(value & 0xff);
+    value = Math.floor(value / 256);
+  }
+  return Buffer.from([0x80 | bytes.length, ...bytes]);
+}
+
+const derTlv = (tag, content) => Buffer.concat([Buffer.from([tag]), derLength(content.length), content]);
+const derSequence = (...items) => derTlv(0x30, Buffer.concat(items));
+const derSet = (...items) => derTlv(0x31, Buffer.concat(items));
+const derInteger = (bytes) => derTlv(0x02, Buffer.from(bytes));
+const derBoolean = (value) => derTlv(0x01, Buffer.from([value ? 0xff : 0x00]));
+const derOctets = (bytes) => derTlv(0x04, bytes);
+const derBitString = (bytes) => derTlv(0x03, Buffer.concat([Buffer.from([0]), bytes]));
+const derUtf8 = (text) => derTlv(0x0c, Buffer.from(text, 'utf8'));
+
+/** An object identifier, in the base-128 form DER uses after the first two arcs. */
+function derOid(text) {
+  const parts = String(text).split('.').map(Number);
+  const bytes = [40 * parts[0] + parts[1]];
+  for (const part of parts.slice(2)) {
+    const chunk = [];
+    let value = part;
+    do {
+      chunk.unshift(value & 0x7f);
+      value = Math.floor(value / 128);
+    } while (value > 0);
+    for (let index = 0; index < chunk.length - 1; index += 1) chunk[index] |= 0x80;
+    bytes.push(...chunk);
+  }
+  return derTlv(0x06, Buffer.from(bytes));
+}
+
+/** A certificate name with one common name, which is all either side needs. */
+const derName = (commonName) => derSequence(derSet(derSequence(derOid('2.5.4.3'), derUtf8(commonName))));
+const derUtcTime = (date) => {
+  const two = (value) => String(value).padStart(2, '0');
+  const text = `${two(date.getUTCFullYear() % 100)}${two(date.getUTCMonth() + 1)}${two(date.getUTCDate())}${two(date.getUTCHours())}${two(date.getUTCMinutes())}${two(date.getUTCSeconds())}Z`;
+  return derTlv(0x17, Buffer.from(text, 'ascii'));
+};
+// ecdsa-with-SHA256, the one algorithm used here.
+const derSignatureAlgorithm = () => derSequence(derOid('1.2.840.10045.4.3.2'));
+const derExtension = (id, critical, value) => derSequence(derOid(id), ...(critical ? [derBoolean(true)] : []), derOctets(value));
+const derPem = (der) => `-----BEGIN CERTIFICATE-----\n${der.toString('base64').match(/.{1,64}/g).join('\n')}\n-----END CERTIFICATE-----\n`;
+
+/** A serial number that is positive in DER: the high bit of the first byte is never used. */
+function derSerial() {
+  const bytes = crypto.randomBytes(16);
+  bytes[0] &= 0x7f;
+  if (bytes.every((byte) => byte === 0)) bytes[15] = 1;
+  return bytes;
+}
+
+/**
+ * One certificate. `ca` makes the self-signed authority; otherwise the leaf names `host` and
+ * carries it in the subject alternative name, which is the field every client checks today.
+ */
+function buildCertificate({ subject, issuer, key, signerKey, ca, host = null, serial }) {
+  const now = Date.now();
+  const extensions = [
+    derExtension('2.5.29.19', true, derSequence(...(ca ? [derBoolean(true)] : []))),
+    derExtension('2.5.29.15', true, derBitString(ca ? Buffer.from([0x06]) : Buffer.from([0x80]))),
+  ];
+  if (host) {
+    extensions.push(derExtension('2.5.29.17', false, derSequence(derTlv(0x82, Buffer.from(host, 'ascii')))));
+    extensions.push(derExtension('2.5.29.37', false, derSequence(derOid('1.3.6.1.5.5.7.3.1'))));
+  }
+  const tbs = derSequence(
+    derTlv(0xa0, derInteger([2])),
+    derInteger(serial),
+    derSignatureAlgorithm(),
+    derName(issuer),
+    derSequence(derUtcTime(new Date(now - 300_000)), derUtcTime(new Date(now + (ca ? 3650 : 825) * 24 * 3600_000))),
+    derName(subject),
+    key.export({ type: 'spki', format: 'der' }),
+    derTlv(0xa3, derSequence(...extensions)),
+  );
+  return derSequence(tbs, derSignatureAlgorithm(), derBitString(crypto.sign('sha256', tbs, signerKey)));
+}
+
+/** A fresh authority, with one leaf key shared by every certificate it signs. */
+function createCertificateAuthority() {
+  const keys = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+  const leaf = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+  const certificate = buildCertificate({
+    subject: 'OpenChamber space gatekeeper',
+    issuer: 'OpenChamber space gatekeeper',
+    key: keys.publicKey,
+    signerKey: keys.privateKey,
+    ca: true,
+    serial: derSerial(),
+  });
+  return {
+    certificate,
+    certificatePem: derPem(certificate),
+    privateKey: keys.privateKey,
+    leafPrivateKey: leaf.privateKey,
+    leafKeyPem: leaf.privateKey.export({ type: 'pkcs8', format: 'pem' }),
+    leafPublicKey: leaf.publicKey,
+  };
+}
+
+/** The certificate for one destination, signed by the authority. */
+function issueCertificate(authority, host) {
+  return buildCertificate({
+    subject: host,
+    issuer: 'OpenChamber space gatekeeper',
+    key: authority.leafPublicKey,
+    signerKey: authority.privateKey,
+    ca: false,
+    host,
+    serial: derSerial(),
+  });
+}
+
+let authority = null;
+let authorityCertificatePem = '';
+const certificateContexts = new Map();
+
+/** The TLS context for a destination, made once and kept while the cache has room. */
+function contextFor(host) {
+  const known = certificateContexts.get(host);
+  if (known) return known;
+  const certificate = derPem(issueCertificate(authority, host));
+  const context = tls.createSecureContext({ key: authority.leafKeyPem, cert: certificate });
+  if (certificateContexts.size >= MAX_CERTIFICATES) certificateContexts.clear();
+  certificateContexts.set(host, context);
+  return context;
+}
+
+
+// ---------------------------------------------------------------------------------------------
 // Corridor
 // ---------------------------------------------------------------------------------------------
 
@@ -378,6 +569,16 @@ function refuseTarget(host, port) {
 const isDomainName = (name) => DOMAIN_PATTERN.test(name) && !NUMERIC_LABEL.test(name.slice(name.lastIndexOf('.') + 1));
 
 let openTunnels = 0;
+
+/**
+ * The idle limit on a socket that is a tunnel, or is about to become one. Armed as soon as the
+ * corridor answers the CONNECT, not only after the TLS handshake: a client that asks for a tunnel
+ * and sends nothing must not keep its place, or sixty-four of them close the corridor for the
+ * space.
+ */
+function guardTunnelIdle(socket) {
+  socket.setTimeout(TUNNEL_IDLE_MS, () => socket.destroy());
+}
 
 // The two things the space is told apart, and the only two. `refused` covers every reason the
 // gatekeeper said no; `unreachable` means it said yes and the connection out did not happen.
@@ -483,92 +684,664 @@ async function openTunnel(request, clientSocket, head) {
     refuse(clientSocket, 403, 'Forbidden', REFUSED);
     return;
   }
-  record('corridor', normalizeName(host), port, 'allow');
+  const name = normalizeName(host);
+  record('corridor', name, port, 'allow');
 
-  // The connection goes to the address that was just checked. The name is never resolved again.
-  // `allowHalfOpen`, because a tunnel passes a close in each direction on its own. Without it
-  // Node ends our side to the upstream the moment the upstream sends FIN, and anything the space
-  // writes afterwards is lost: measured against the real program, an upstream that half-closes
-  // and keeps reading never received what the space sent next. The cost is that a half-open
-  // tunnel holds its place until one side closes or the idle timeout ends it, and the tunnel cap
-  // bounds how many of those a space can hold.
-  const upstream = net.connect({ host: resolved.address, port, allowHalfOpen: true });
-  // Pulling the plug: for an error, a timeout, or a client that left before the tunnel existed.
-  const abort = () => {
-    releasePlace();
-    upstream.destroy();
+  // A raw tunnel hides the method, and the method is what the user decides about. So the corridor
+  // ends the space's TLS here and speaks HTTP/1.1 to it. The certificate names the destination
+  // that was checked a moment ago, and the authority that signs it never leaves this process.
+  let secure;
+  try {
+    const context = contextFor(name);
+    clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+    if (head && head.length > 0) clientSocket.unshift(head);
+    // Armed here and not only after the handshake: a client that asks for a tunnel and then sends
+    // nothing must not keep its place for the life of the gatekeeper. Sixty-four of those would
+    // close the corridor for the space. The TLS and HTTP layers reset this timer on activity.
+    guardTunnelIdle(clientSocket);
+    secure = new tls.TLSSocket(clientSocket, { isServer: true, secureContext: context });
+  } catch (error) {
+    record('corridor', name, port, `failed:${String(error.code || 'tls').slice(0, 32)}`);
     clientSocket.destroy();
-  };
-  let carrying = false;
-  upstream.on('error', (error) => {
-    // Allowed, and the connection out did not happen. The user's view must say that, or an
-    // unreachable host reads as a refusal in the journal and nobody can tell them apart.
-    const code = String(error.code || 'error').slice(0, 32);
-    record('corridor', normalizeName(host), port, `failed:${code}`);
-    // Only while the socket still belongs to the proxy. Once the tunnel carries somebody's
-    // bytes, writing `HTTP/1.1 502` into them puts proxy protocol in the middle of a TLS
-    // stream: a reset halfway through a download would reach the space as a record error
-    // instead of a reset. It is the same mistake as the teardown that truncated transfers.
-    if (!carrying && !clientSocket.destroyed && !clientSocket.writableEnded) {
-      // `refuse` owns the client socket from here: it drains what the space is still sending and
-      // closes when the space is done, because closing on a full receive queue sends a reset and
-      // the reset takes the answer with it. `abort` would do exactly that in the same tick, and
-      // what would be lost is `x-gatekeeper-reason: unreachable` — the one line that tells the
-      // space this host was allowed and could not be reached, rather than refused.
-      refuse(clientSocket, 502, 'Bad Gateway', UNREACHABLE);
-      releasePlace();
-      upstream.destroy();
+    releasePlace();
+    return;
+  }
+  // The place belongs to this connection until it is gone, not only until the handshake.
+  release = () => {};
+  const finished = () => releasePlace();
+  secure.on('close', finished);
+  secure.on('error', () => { secure.destroy(); });
+  secure.on('secure', () => {
+    // The certificate was issued for the name that was checked. A different server name in the
+    // handshake would let an allowed name carry another one on the same address.
+    const servername = normalizeName(secure.servername || name);
+    if (secure.servername && servername !== name) {
+      record('corridor', name, port, 'deny:sni-mismatch', '');
+      secure.destroy();
       return;
     }
-    abort();
+    secure.openchamberTarget = { host: name, port, address: resolved.address, family: resolved.family };
+    guardTunnelIdle(secure);
+    decrypted.emit('connection', secure);
   });
-  upstream.setTimeout(CONNECT_TIMEOUT_MS, abort);
-  upstream.on('connect', () => {
-    upstream.setTimeout(TUNNEL_IDLE_MS, abort);
-    clientSocket.setTimeout(TUNNEL_IDLE_MS, abort);
-    clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-    if (head && head.length > 0) upstream.write(head);
-    // From here the two sockets carry somebody's bytes, and a teardown written for an empty
-    // socket would throw them away. `release` was that teardown; it is done now, and so is
-    // every answer this proxy is still entitled to write into that socket.
-    carrying = true;
-    release = () => {};
-    joinSockets(clientSocket, upstream, releasePlace);
-  });
-  release = abort;
   // The client may have left while its name was being resolved.
-  if (clientSocket.destroyed || clientSocket.readableEnded) abort();
+  if (clientSocket.destroyed || clientSocket.readableEnded) {
+    secure.destroy();
+    releasePlace();
+  }
+}
+
+// What may not be copied to the upstream or back to the space: it describes one connection, and
+// the two connections are different ones.
+const HOP_BY_HOP_HEADERS = new Set(['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade']);
+
+/** The answer to a decrypted request that never reached an upstream. */
+function refuseDecrypted(response, status, reason, message) {
+  if (response.destroyed) return;
+  if (response.headersSent) {
+    response.destroy();
+    return;
+  }
+  response.writeHead(status, { 'content-type': 'application/json', 'x-gatekeeper-reason': reason, 'cache-control': 'no-store' });
+  response.end(JSON.stringify({ error: message }));
+}
+
+/** The host the request says it is for, which must be the name the corridor checked. */
+function requestHostOf(request, target) {
+  const header = request.headers?.host;
+  if (!header) return target.host;
+  const text = String(header).trim();
+  const host = text.startsWith('[') ? text : text.replace(/:\d+$/, '');
+  return normalizeName(host);
+}
+
+/** The origin-form path, or `{ mismatch: true }` for an absolute-form URL naming another host. */
+function requestPathOf(request, target) {
+  const url = String(request.url || '/');
+  if (!/^https?:\/\//i.test(url)) return { path: url === '' ? '/' : url };
+  try {
+    const parsed = new URL(url);
+    if (normalizeName(parsed.hostname) !== target.host) return { mismatch: true };
+    return { path: `${parsed.pathname}${parsed.search}` };
+  } catch {
+    return { mismatch: true };
+  }
 }
 
 /**
- * Two sockets, joined for as long as they both live, and the place given back when they are
- * both gone.
- *
- * `pipe` is what carries a close across: when one side sends FIN, pipe ends the other side once
- * what is buffered has gone out. Destroying on `end` instead is how a proxy truncates a
- * download, and the larger the answer and the slower the reader, the more of it goes missing.
- * The last draft did exactly that, and nothing in the suite noticed, because every test read the
- * status line and stopped.
+ * GraphQL over HTTP sends reads and writes as the same POST, and the operation type is inside the
+ * document, not the method. This classifies a body so a document that can only read goes out like
+ * a GET, while anything that could mutate (or that this cannot read with certainty) still waits
+ * for the user. `application/graphql` carries the document itself; everything else is the JSON
+ * envelope the guide at graphql.org describes.
  */
-function joinSockets(clientSocket, upstream, done) {
-  let closed = 0;
-  const bothGone = () => {
-    closed += 1;
-    if (closed >= 2) done();
-  };
-  // `pipe` carries a FIN across, and that is what keeps a transfer whole. It cannot carry a
-  // death: when one socket is destroyed, pipe unpipes its peer, the peer goes paused, and a
-  // paused socket never notices that the other end is gone. So a peer whose partner died is told
-  // to go too, with `destroySoon`, which writes out what it still holds before it closes.
-  const follow = (peer) => () => {
-    if (!peer.destroyed) peer.destroySoon();
-    bothGone();
-  };
-  upstream.on('close', follow(clientSocket));
-  clientSocket.on('close', follow(upstream));
-  upstream.pipe(clientSocket);
-  clientSocket.pipe(upstream);
+const GRAPHQL_BODY_LIMIT = 1024 * 1024;
+const GRAPHQL_PATH_PATTERN = /\/graphql(\.json)?\/?$/i;
+const GRAPHQL_MEDIA_TYPE = 'application/graphql';
+
+function isGraphqlRequest(request, path) {
+  if (GRAPHQL_PATH_PATTERN.test(path.split('?')[0])) return true;
+  const type = String(request.headers['content-type'] ?? '').toLowerCase().split(';')[0].trim();
+  return type === GRAPHQL_MEDIA_TYPE;
 }
+
+function isRawGraphqlRequest(request) {
+  return String(request.headers['content-type'] ?? '').toLowerCase().split(';')[0].trim() === GRAPHQL_MEDIA_TYPE;
+}
+
+/** The index after a GraphQL string or block string, or -1 when it never closes. */
+function skipGraphqlString(text, start) {
+  const length = text.length;
+  if (text.startsWith('"""', start)) {
+    let at = start + 3;
+    while (at < length) {
+      if (text.startsWith('\\"""', at)) { at += 4; continue; }
+      if (text.startsWith('"""', at)) return at + 3;
+      at += 1;
+    }
+    return -1;
+  }
+  let at = start + 1;
+  while (at < length) {
+    const character = text[at];
+    if (character === '\\') { at += 2; continue; }
+    if (character === '"') return at + 1;
+    // A normal string cannot span a line; a newline means the document is not what it claims.
+    if (character === '\n' || character === '\r') return -1;
+    at += 1;
+  }
+  return -1;
+}
+
+const NAME_START = /[A-Za-z_]/;
+const NAME_PART = /[A-Za-z0-9_]/;
+
+/**
+ * The operation types a document defines: 'query', 'mutation', 'subscription', or null when the
+ * document is not something this can read with certainty. Only the top level is read; nothing
+ * inside a selection set can start a second operation. Fragments are skipped (a fragment alone
+ * is not executable), and so are comments, commas and block strings.
+ */
+function operationTypesOf(text) {
+  const types = new Set();
+  const length = text.length;
+  let at = 0;
+  // 'between' expects a definition, 'header' is past its keyword, 'body' is inside `{...}`.
+  let phase = 'between';
+  // The closers still owed. A header may open `(` and `[` (variable types, default values,
+  // directive arguments) before the body's `{`; only falling back to empty ends a definition.
+  const closers = [];
+  while (at < length) {
+    const character = text[at];
+    if (character === ' ' || character === '\t' || character === '\n' || character === '\r' || character === ',' || character === '\ufeff') { at += 1; continue; }
+    if (character === '#') {
+      while (at < length && text[at] !== '\n' && text[at] !== '\r') at += 1;
+      continue;
+    }
+    if (character === '"') {
+      at = skipGraphqlString(text, at);
+      if (at < 0) return null;
+      continue;
+    }
+    if (closers.length > 0) {
+      if (character === '{') closers.push('}');
+      else if (character === '(') closers.push(')');
+      else if (character === '[') closers.push(']');
+      else if (character === '}' || character === ')' || character === ']') {
+        if (closers.pop() !== character) return null;
+        if (closers.length === 0 && phase === 'body') phase = 'between';
+      }
+      at += 1;
+      continue;
+    }
+    if (character === '{') {
+      if (phase === 'between') types.add('query');
+      else if (phase !== 'header') return null;
+      closers.push('}');
+      phase = 'body';
+      at += 1;
+      continue;
+    }
+    if (character === '(' || character === '[') {
+      // A group that is not part of a definition header is not a document this understands.
+      if (phase !== 'header') return null;
+      closers.push(character === '(' ? ')' : ']');
+      at += 1;
+      continue;
+    }
+    if (character === '}' || character === ')' || character === ']') return null;
+    if (NAME_START.test(character)) {
+      let end = at;
+      while (end < length && NAME_PART.test(text[end])) end += 1;
+      const word = text.slice(at, end);
+      if (phase === 'between') {
+        if (word === 'query' || word === 'mutation' || word === 'subscription') {
+          types.add(word);
+          phase = 'header';
+        } else if (word === 'fragment') {
+          phase = 'header';
+        } else {
+          return null;
+        }
+      }
+      // In a header the operation name, 'on', type names and directives say nothing about the type.
+      at = end;
+      continue;
+    }
+    // Punctuation of a header (`$ ! = : @ | &` and variable names' digits) is harmless there.
+    if (phase === 'header' || phase === 'between') { at += 1; continue; }
+    return null;
+  }
+  if (closers.length !== 0 || phase === 'header' || types.size === 0) return null;
+  return types;
+}
+
+/**
+ * 'read' when every operation the body can execute is a query, 'write' when it names a mutation
+ * or a subscription, 'unknown' for anything else: a body that does not parse, a batch with a bad
+ * item, a persisted query with no document, or a document this tokenizer does not follow. Only
+ * 'read' is let through without the user; every other answer waits for it.
+ */
+function classifyGraphqlBody(body, { raw = false } = {}) {
+  const text = body.toString('utf8').replace(/^\ufeff/, '');
+  let documents;
+  if (raw) {
+    documents = [text];
+  } else {
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      return 'unknown';
+    }
+    const items = Array.isArray(parsed) ? parsed : [parsed];
+    if (items.length === 0) return 'unknown';
+    documents = [];
+    for (const item of items) {
+      // JSON.parse gives only plain objects here, so `instanceof` is enough; a string is asked
+      // for by its tag because a primitive string has no prototype of its own to test.
+      if (!(item instanceof Object) || Array.isArray(item)) return 'unknown';
+      if (Object.prototype.toString.call(item.query) !== '[object String]') return 'unknown';
+      documents.push(item.query);
+    }
+  }
+  for (const document of documents) {
+    const types = operationTypesOf(document);
+    if (types === null) return 'unknown';
+    if (types.has('mutation') || types.has('subscription')) return 'write';
+  }
+  return 'read';
+}
+
+/**
+ * The body of a request, up to a limit. `complete` carries every byte; `prefix` is what was read
+ * before the limit passed, with the rest still unread on the request; `failed` means the client
+ * left. A classified read is forwarded from `body`; a held write keeps it for the forward that
+ * follows the user's yes.
+ */
+function readRequestBody(request, limit) {
+  return new Promise((resolve) => {
+    const chunks = [];
+    let size = 0;
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      request.removeListener('data', onData);
+      request.removeListener('end', onEnd);
+      request.removeListener('error', onError);
+      request.removeListener('aborted', onError);
+      if (value.prefix) request.pause();
+      resolve(value);
+    };
+    const onData = (chunk) => {
+      size += chunk.length;
+      chunks.push(chunk);
+      if (size > limit) finish({ prefix: Buffer.concat(chunks) });
+    };
+    const onEnd = () => finish({ body: Buffer.concat(chunks) });
+    const onError = () => finish({ failed: true });
+    request.on('data', onData);
+    request.on('end', onEnd);
+    request.on('error', onError);
+    request.on('aborted', onError);
+  });
+}
+
+/**
+ * One request, forwarded over a TLS connection the gatekeeper makes itself, to the address that
+ * was checked when the tunnel was opened. The name is never resolved again.
+ *
+ * `buffered` is set when the body was already read to decide on it: `body` holds every byte and
+ * the request is ended, `prefix` holds the bytes read before a limit with the rest still on the
+ * request. Otherwise the request streams as it arrives, as a raw tunnel did. A complete body gets
+ * the length it actually has: the gateway drops `transfer-encoding`, so a chunked request would
+ * otherwise go out with no length at all.
+ */
+function forwardRequest(request, response, target, path, buffered) {
+  const headers = {};
+  for (const [name, value] of Object.entries(request.headers)) {
+    const lower = name.toLowerCase();
+    // `expect: 100-continue` would wait for an answer this request never sends: the body streams
+    // as it is, and the upstream answers without the interim response.
+    if (HOP_BY_HOP_HEADERS.has(lower) || lower === 'proxy-authorization' || lower === 'expect') continue;
+    headers[lower] = value;
+  }
+  headers.host = request.headers.host || target.host;
+  if (buffered?.body) headers['content-length'] = String(buffered.body.length);
+  // A GraphQL document read as a query is ordinary traffic, as a GET is: its failures are not a
+  // restriction the user has to look at, so `quiet` keeps them out of the journal.
+  const notable = buffered?.quiet ? false : !SAFE_METHODS.has(String(request.method || '').toUpperCase());
+  let given = false;
+  const outgoing = https.request({
+    hostname: target.host,
+    port: target.port,
+    method: request.method,
+    path,
+    headers,
+    servername: target.host,
+    lookup: fixedLookup(target.address, target.family),
+    agent: false,
+  }, (answer) => {
+    clearTimeout(connectTimer);
+    const answerHeaders = {};
+    for (const [name, value] of Object.entries(answer.headers)) {
+      if (HOP_BY_HOP_HEADERS.has(name.toLowerCase())) continue;
+      answerHeaders[name] = value;
+    }
+    response.writeHead(answer.statusCode || 502, answerHeaders);
+    answer.on('error', () => { response.destroy(); });
+    answer.pipe(response);
+  });
+  // A host that accepts nothing at all is given the same 15 seconds a raw tunnel had. Once the
+  // connection is up the idle limit applies instead, so a long upload or a streaming answer is
+  // bounded by silence and not by its total length.
+  const connectTimer = setTimeout(() => {
+    if (given) return;
+    given = true;
+    if (notable) record('corridor', target.host, target.port, 'failed:timeout', String(request.method || ''));
+    if (!response.headersSent) refuseDecrypted(response, 504, UNREACHABLE, 'the upstream did not answer in time');
+    else response.destroy();
+    outgoing.destroy();
+  }, CONNECT_TIMEOUT_MS);
+  outgoing.on('socket', (socket) => {
+    socket.once(socket.encrypted ? 'secureConnect' : 'connect', () => clearTimeout(connectTimer));
+  });
+  outgoing.setTimeout(TUNNEL_IDLE_MS, () => {
+    given = true;
+    if (notable) record('corridor', target.host, target.port, 'failed:timeout', String(request.method || ''));
+    if (!response.headersSent) refuseDecrypted(response, 504, UNREACHABLE, 'the upstream did not answer in time');
+    else response.destroy();
+    outgoing.destroy();
+  });
+  outgoing.on('error', (error) => {
+    if (given) return;
+    given = true;
+    const code = String(error.code || 'error').slice(0, 32);
+    // Allowed, and the connection out did not happen. Only a write is worth the ring space here;
+    // a read that failed is not a restriction the user has to look at.
+    if (notable) record('corridor', target.host, target.port, `failed:${code}`, String(request.method || ''));
+    if (!response.headersSent) refuseDecrypted(response, 502, UNREACHABLE, 'the upstream did not answer');
+    else response.destroy();
+  });
+  response.on('close', () => {
+    if (!response.writableFinished) outgoing.destroy();
+  });
+  writeForwardedBody(outgoing, request, buffered);
+}
+
+/**
+ * Sends the body a forward has left to send. Without a buffer the request streams as it arrived;
+ * `body` was read whole for classification and nothing is left on the request; `prefix` holds what
+ * a limit read, with the rest still coming. Kept apart so the byte order has its own test.
+ */
+function writeForwardedBody(outgoing, request, buffered) {
+  if (!buffered) {
+    request.pipe(outgoing);
+    return;
+  }
+  if (buffered.body) {
+    outgoing.end(buffered.body);
+    return;
+  }
+  if (buffered.prefix.length > 0) outgoing.write(buffered.prefix);
+  request.pipe(outgoing);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Waiting for the user
+//
+// A write the user has not approved does not fail: it waits, its body unread and its socket held,
+// until the answer comes or the limit passes. The host learns of it from `GET /pending`, shows a
+// prompt, and answers `POST /approvals`. Approving the method for the destination from the grant
+// dialog releases every wait for it, so both ways of saying yes do the same thing.
+// ---------------------------------------------------------------------------------------------
+
+// What the user is approving, in one line: the destination, the port the corridor opened, and the
+// path and query the space wrote. Bounded like every other string that leaves this process, so a
+// query of a megabyte cannot travel to the host.
+const MAX_APPROVAL_URL_CHARACTERS = 2048;
+
+const approvalUrlOf = (entry) => {
+  const port = entry.target.port === 443 ? '' : `:${entry.target.port}`;
+  const url = `https://${entry.target.host}${port}${entry.path}`;
+  return url.length > MAX_APPROVAL_URL_CHARACTERS ? `${url.slice(0, MAX_APPROVAL_URL_CHARACTERS)}…` : url;
+};
+
+const approvalOf = (entry) => ({
+  id: entry.id,
+  host: entry.target.host,
+  port: entry.target.port,
+  method: entry.method,
+  url: approvalUrlOf(entry),
+  expiresAt: entry.expiresAt,
+});
+
+/** The waits a host that last saw `since` has not heard of. Ids only grow while this process lives. */
+const approvalsSince = (since) => Array.from(pendingApprovals.values())
+  .filter((entry) => entry.id > since)
+  .map(approvalOf);
+
+function answerApprovals(response, since) {
+  answerJson(response, 200, { since: Math.max(approvalSeq, since), requests: approvalsSince(since) });
+}
+
+function finishWaiter(waiter) {
+  if (!approvalWaiters.delete(waiter)) return;
+  clearTimeout(waiter.timer);
+  if (!waiter.response.writableEnded && !waiter.response.destroyed) answerApprovals(waiter.response, waiter.since);
+}
+
+/** Tells every waiting host that something it has not heard of is there. */
+function wakeApprovalWaiters() {
+  for (const waiter of Array.from(approvalWaiters)) {
+    if (approvalsSince(waiter.since).length > 0) finishWaiter(waiter);
+  }
+}
+
+/** A destination and method the user refused, kept within the list the host can read back. */
+function rememberDeniedWrite(host, method) {
+  const known = deniedWrites.get(host);
+  if (known) {
+    known.add(method);
+    return;
+  }
+  if (deniedWrites.size >= MAX_WRITE_ENTRIES) return;
+  deniedWrites.set(host, new Set([method]));
+}
+
+/**
+ * The outcome of a wait: the request goes out, or it is refused with the reason. `rememberDeny`
+ * is set only for the user's own answer: a wait that ran out of time is refused, not decided, and
+ * must not silence that destination for the rest of the process.
+ */
+function settleApproval(entry, allow, { rememberDeny = false } = {}) {
+  if (pendingApprovals.get(entry.id) !== entry) return;
+  pendingApprovals.delete(entry.id);
+  clearTimeout(entry.timer);
+  if (allow) {
+    record('corridor', entry.target.host, entry.target.port, 'allow', entry.method);
+    forwardRequest(entry.request, entry.response, entry.target, entry.path, entry.buffered);
+    return;
+  }
+  // The answer stands for the destination: the next identical write is refused without asking.
+  if (rememberDeny) rememberDeniedWrite(entry.target.host, entry.method);
+  // Nothing of a refused write has been read: a request the user did not allow is not stored.
+  entry.request.resume();
+  record('corridor', entry.target.host, entry.target.port, 'deny:method', entry.method);
+  refuseDecrypted(entry.response, 403, REFUSED, 'the user did not allow this write');
+}
+
+function holdForApproval(request, response, target, path, method, buffered) {
+  if (pendingApprovals.size >= MAX_PENDING_APPROVALS) {
+    request.resume();
+    record('corridor', target.host, target.port, 'deny:too-many-approvals', method);
+    refuseDecrypted(response, 403, REFUSED, 'too many writes are already waiting for the user');
+    return;
+  }
+  approvalSeq += 1;
+  const entry = {
+    id: approvalSeq,
+    method,
+    target,
+    path,
+    request,
+    response,
+    buffered,
+    expiresAt: new Date(Date.now() + APPROVAL_TIMEOUT_MS).toISOString(),
+    timer: null,
+  };
+  entry.timer = setTimeout(() => settleApproval(entry, false), APPROVAL_TIMEOUT_MS);
+  pendingApprovals.set(entry.id, entry);
+  // A space that leaves takes its wait with it; the place is given back by the response's own close.
+  response.on('close', () => {
+    if (pendingApprovals.delete(entry.id)) clearTimeout(entry.timer);
+  });
+  wakeApprovalWaiters();
+}
+
+/**
+ * A GraphQL write that the user has not approved: read it (bounded), and send it on only when the
+ * whole document reads. A body past the limit is held, not refused: the bytes read travel with
+ * the wait and the rest streams after them on the user's yes.
+ *
+ * `denied` is the destination and method already refused: a document that still reads is
+ * ordinary traffic and goes out, while a mutation or an unreadable body is refused at once
+ * without asking again. A denial is about writes, not about reads that happen to use POST.
+ */
+function decideGraphqlRequest(request, response, target, path, method, { denied = false } = {}) {
+  readRequestBody(request, GRAPHQL_BODY_LIMIT).then((read) => {
+    if (read.failed) {
+      request.resume();
+      record('corridor', target.host, target.port, 'deny:unreadable-request', method);
+      refuseDecrypted(response, 400, REFUSED, 'the gatekeeper could not read this request');
+      return;
+    }
+    const verdict = read.body ? classifyGraphqlBody(read.body, { raw: isRawGraphqlRequest(request) }) : 'unknown';
+    if (verdict === 'read') {
+      forwardRequest(request, response, target, path, { body: read.body, quiet: true });
+      return;
+    }
+    if (denied) {
+      request.resume();
+      noteStandingDenial(target.host, target.port, method);
+      refuseDecrypted(response, 403, REFUSED, 'the user did not allow this write');
+      return;
+    }
+    if (read.body) {
+      holdForApproval(request, response, target, path, method, { body: read.body });
+      return;
+    }
+    holdForApproval(request, response, target, path, method, { prefix: read.prefix });
+  }).catch(() => {
+    if (!response.headersSent) refuseDecrypted(response, 502, UNREACHABLE, 'the gatekeeper could not serve this request');
+    else response.destroy();
+  });
+}
+
+/** The host's answer for one wait. `{ status }` is what the control listener answers with. */
+function decideApproval(body) {
+  const id = Number(body.id);
+  if (!Number.isSafeInteger(id) || id <= 0) return { status: 400, error: 'id is the number the gatekeeper gave the wait' };
+  const entry = pendingApprovals.get(id);
+  if (!entry) return { status: 404, error: 'no write is waiting with that id; it was answered or its time passed' };
+  settleApproval(entry, body.allow === true, { rememberDeny: body.allow !== true });
+  return { status: 200 };
+}
+
+/**
+ * A request that came through the corridor's TLS. Everything outside SAFE_METHODS is a write here,
+ * and a write passes only when the user approved that method for this destination. The journal
+ * records the method beside the host, so the dialog can offer the one the agent tried.
+ */
+function serveDecryptedRequest(request, response) {
+  const target = request.socket?.openchamberTarget;
+  if (!target) {
+    request.resume();
+    refuseDecrypted(response, 502, UNREACHABLE, 'the gatekeeper lost the destination of this connection');
+    return;
+  }
+  const method = String(request.method || '').toUpperCase();
+  if (!METHOD_PATTERN.test(method)) {
+    request.resume();
+    record('corridor', target.host, target.port, 'deny:method', method.slice(0, 20));
+    refuseDecrypted(response, 403, REFUSED, 'the gatekeeper does not take this method');
+    return;
+  }
+  if (requestHostOf(request, target) !== target.host) {
+    // The tunnel was opened for one name. A different `Host`, or an absolute URL naming another
+    // host, would use that name's route to reach a service the user never approved.
+    request.resume();
+    record('corridor', target.host, target.port, 'deny:host-mismatch', method);
+    refuseDecrypted(response, 403, REFUSED, 'the gatekeeper does not take this destination');
+    return;
+  }
+  const { path, mismatch } = requestPathOf(request, target);
+  if (mismatch) {
+    request.resume();
+    record('corridor', target.host, target.port, 'deny:host-mismatch', method);
+    refuseDecrypted(response, 403, REFUSED, 'the gatekeeper does not take this destination');
+    return;
+  }
+  if (SAFE_METHODS.has(method)) {
+    forwardRequest(request, response, target, path);
+    return;
+  }
+  const approved = writeAccess.get(target.host);
+  if (approved && approved.has(method)) {
+    record('corridor', target.host, target.port, 'allow', method);
+    forwardRequest(request, response, target, path);
+    return;
+  }
+  // A method the user already denied there is refused at once: the answer stands until cleared.
+  // One record a minute for the destination: a retrying agent would otherwise fill the journal.
+  if (deniedWrites.get(target.host)?.has(method)) {
+    // The denial covers writes there, not reads that arrive as one: a GraphQL document that
+    // only queries is classified as usual and goes out; a mutation is refused without asking.
+    if ((method === 'POST' || method === 'PUT') && isGraphqlRequest(request, path)) {
+      decideGraphqlRequest(request, response, target, path, method, { denied: true });
+      return;
+    }
+    request.resume();
+    noteStandingDenial(target.host, target.port, method);
+    refuseDecrypted(response, 403, REFUSED, 'the user did not allow this write');
+    return;
+  }
+  // The user chose an open internet whose writes go out on their own: no wait, no prompt.
+  if (writePolicy === 'allow' && WRITABLE_METHODS.includes(method)) {
+    record('corridor', target.host, target.port, 'allow', method);
+    forwardRequest(request, response, target, path);
+    return;
+  }
+  if (WRITABLE_METHODS.includes(method)) {
+    // A GraphQL document that can only read is a GET in a POST's clothing (GitHub and most
+    // servers take reads this way), so it is read and sent on; a mutation, or anything the
+    // classifier cannot read with certainty, still waits for the user.
+    if ((method === 'POST' || method === 'PUT') && isGraphqlRequest(request, path)) {
+      decideGraphqlRequest(request, response, target, path, method);
+      return;
+    }
+    // The user decides, and the request waits for the answer: see "Waiting for the user".
+    holdForApproval(request, response, target, path, method);
+    return;
+  }
+  // A method the user could not approve even if asked: there is nothing to wait for.
+  request.resume();
+  record('corridor', target.host, target.port, 'deny:method', method);
+  refuseDecrypted(response, 403, REFUSED, 'the gatekeeper does not take this method');
+}
+
+const decrypted = http.createServer({ maxHeaderSize: MAX_HEADER_BYTES }, (request, response) => {
+  try {
+    serveDecryptedRequest(request, response);
+  } catch {
+    refuseDecrypted(response, 502, UNREACHABLE, 'the gatekeeper could not serve this request');
+  }
+});
+decrypted.headersTimeout = HEADERS_TIMEOUT_MS;
+// A body may take as long as it takes, as a raw tunnel allowed. Silence is bounded by the same
+// idle limit the socket had before a request: `requestTimeout` disables the whole-exchange
+// deadline, and `timeout` is re-applied by the HTTP server at the start of every request, so a
+// keep-alive connection is not left with the server default of no timeout.
+decrypted.timeout = TUNNEL_IDLE_MS;
+decrypted.requestTimeout = 0;
+decrypted.on('clientError', (error, socket) => {
+  // A client that leaves in the middle of a body is ordinary traffic, not a probe. That reset is
+  // already journalled as `failed:<code>` for a write, and a second blank `deny:unreadable-request`
+  // would put an empty row in the user's blocked list after every cancelled upload.
+  const code = String(error?.code ?? '');
+  if (code !== 'ECONNRESET' && code !== 'EPIPE' && code !== 'ERR_STREAM_PREMATURE_CLOSE') {
+    noteRefusedTraffic('corridor', 'deny:unreadable-request');
+  }
+  if (!socket.destroyed && socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+  socket.destroy();
+});
+decrypted.on('upgrade', (request, socket) => {
+  // A WebSocket is a GET on the wire and can change everything after it. The method policy
+  // cannot see those frames, so this corridor does not carry them.
+  record('corridor', request.socket?.openchamberTarget?.host ?? '', request.socket?.openchamberTarget?.port ?? 0, 'deny:upgrade', String(request.method || ''));
+  if (!socket.destroyed && socket.writable) socket.end('HTTP/1.1 403 Forbidden\r\nx-gatekeeper-reason: refused\r\nConnection: close\r\n\r\n');
+});
 
 /** Anything but CONNECT. Stage 0 proved that OpenCode, curl, npm and git all use CONNECT for https. */
 function refusePlainProxy(request, response) {
@@ -667,6 +1440,17 @@ const isOwnListener = (address, port) => (isLoopback(address) || ownAddresses.ha
 
 async function serveWindow(request, response) {
   request.on('error', () => {});
+  // The space fetches the certificate the corridor signs with, before its own server starts. It
+  // is public, and the path is reserved: no grant id may be `ca`.
+  if (request.method === 'GET' && (request.url === '/ca' || request.url === '/ca.pem')) {
+    if (!authorityCertificatePem) {
+      answerJson(response, 503, { error: 'the gatekeeper has no certificate yet' });
+      return;
+    }
+    response.writeHead(200, { 'content-type': 'application/x-pem-file', 'cache-control': 'no-store' });
+    response.end(authorityCertificatePem);
+    return;
+  }
   const match = WINDOW_PATH.exec(request.url || '');
   if (match && walksOutOfGrant(match[2] || '')) {
     // Its own decision, because the journal is the user's only view: "tried to walk out of its
@@ -799,8 +1583,63 @@ function setNetwork(body) {
   // would always refuse. An address on it would be a way around the ranges this refuses anyway.
   const wrong = names.find((name) => !isDomainName(name) || parseIPv4(name) || parseIPv6(name));
   if (wrong !== undefined) return `'${wrong}' is not a domain name. The allowlist holds exact names, no wildcards and no addresses.`;
+  if (body.writes !== undefined && body.writes !== 'ask' && body.writes !== 'allow') return 'writes is "ask" or "allow"';
   networkMode = body.mode;
   allowedDomains = new Set(names);
+  writePolicy = body.writes === 'allow' ? 'allow' : 'ask';
+  return null;
+}
+
+/**
+ * The methods the user approved, per destination. A name and the four methods that can change
+ * something out there; anything else is refused, and a list that is not one is never read as an
+ * empty one. The host sends the whole list every time, so a destination the user has not approved
+ * cannot linger from an earlier request.
+ */
+/** A `{ entries }` body as a map of host to methods, or an error naming what is wrong with it. */
+function writeEntriesOf(body) {
+  const entries = Array.isArray(body.entries) ? body.entries : null;
+  if (entries === null) return { problem: 'entries must be a list of { host, methods }' };
+  if (entries.length > MAX_WRITE_ENTRIES) return { problem: `at most ${MAX_WRITE_ENTRIES} destinations` };
+  const next = new Map();
+  for (const entry of entries) {
+    if (!(entry instanceof Object) || Array.isArray(entry)) return { problem: 'a destination is an object with a host and methods' };
+    const name = normalizeName(asText(entry.host));
+    if (!isDomainName(name) || parseIPv4(name) || parseIPv6(name)) {
+      return { problem: `'${name}' is not a domain name. A write rule names an exact host, no wildcard and no address.` };
+    }
+    const methods = Array.isArray(entry.methods) ? entry.methods.map((method) => String(method).toUpperCase()) : null;
+    if (methods === null || methods.length === 0 || methods.length > WRITABLE_METHODS.length) {
+      return { problem: `the methods of '${name}' are one to ${WRITABLE_METHODS.length} of ${WRITABLE_METHODS.join(', ')}` };
+    }
+    const wrong = methods.find((method) => !WRITABLE_METHODS.includes(method));
+    if (wrong !== undefined) return { problem: `'${wrong}' is not a method a user can decide. The methods are ${WRITABLE_METHODS.join(', ')}.` };
+    const known = next.get(name) ?? new Set();
+    for (const method of methods) known.add(method);
+    next.set(name, known);
+  }
+  return { next };
+}
+
+function setWrites(body) {
+  const parsed = writeEntriesOf(body);
+  if (parsed.problem) return parsed.problem;
+  writeAccess = parsed.next;
+  // A standing approval from the dialog is an answer too: every wait it covers goes out now.
+  for (const entry of Array.from(pendingApprovals.values())) {
+    if (parsed.next.get(entry.target.host)?.has(entry.method)) settleApproval(entry, true);
+  }
+  return null;
+}
+
+function setDenials(body) {
+  const parsed = writeEntriesOf(body);
+  if (parsed.problem) return parsed.problem;
+  deniedWrites = parsed.next;
+  // The answer now covers waits that were opened before it: they are refused, not asked again.
+  for (const entry of Array.from(pendingApprovals.values())) {
+    if (parsed.next.get(entry.target.host)?.has(entry.method)) settleApproval(entry, false);
+  }
   return null;
 }
 
@@ -865,7 +1704,43 @@ async function serveControl(request, response) {
   if (request.method === 'GET' && path === '/policy') {
     // What the host last said, so it can tell a gatekeeper that forgot from one that remembers.
     // Ids and names only: a secret is never read back, not even by the host.
-    answerJson(response, 200, { mode: networkMode, domains: Array.from(allowedDomains), grants: Array.from(grants.keys()) });
+    answerJson(response, 200, {
+      mode: networkMode,
+      domains: Array.from(allowedDomains),
+      grants: Array.from(grants.keys()),
+      writes: Array.from(writeAccess, ([host, methods]) => ({ host, methods: Array.from(methods).sort() })),
+      denials: Array.from(deniedWrites, ([host, methods]) => ({ host, methods: Array.from(methods).sort() })),
+    });
+    return;
+  }
+  if (request.method === 'GET' && path === '/ca') {
+    // The certificate the space trusts. It is public: only the gatekeeper's memory holds the key.
+    if (!authorityCertificatePem) {
+      answerJson(response, 503, { error: 'the gatekeeper has no certificate yet' });
+      return;
+    }
+    response.writeHead(200, { 'content-type': 'application/x-pem-file', 'cache-control': 'no-store' });
+    response.end(authorityCertificatePem);
+    return;
+  }
+  if (request.method === 'GET' && path === '/pending') {
+    // A long poll: the host waits here for a write that needs the user, and is answered the moment
+    // one appears, or when the wait it asked for ends. `since` is the highest id it has seen.
+    const url = new URL(request.url || '/', 'http://127.0.0.1');
+    const since = Number(url.searchParams.get('since'));
+    const waitMs = Number(url.searchParams.get('wait'));
+    const from = Number.isSafeInteger(since) && since > 0 ? since : 0;
+    if (approvalsSince(from).length > 0 || !(waitMs > 0)) {
+      answerApprovals(response, from);
+      return;
+    }
+    const waiter = { response, since: from, timer: null };
+    waiter.timer = setTimeout(() => finishWaiter(waiter), Math.min(waitMs, 30_000));
+    approvalWaiters.add(waiter);
+    response.on('close', () => {
+      clearTimeout(waiter.timer);
+      approvalWaiters.delete(waiter);
+    });
     return;
   }
   if (request.method === 'GET' && path === '/journal') {
@@ -873,7 +1748,7 @@ async function serveControl(request, response) {
     answerJson(response, 200, { records: journal.slice(), dropped: journalDropped, since: STARTED_AT });
     return;
   }
-  if (request.method !== 'POST' || (path !== '/network' && path !== '/grants')) {
+  if (request.method !== 'POST' || (path !== '/network' && path !== '/grants' && path !== '/writes' && path !== '/denials' && path !== '/approvals')) {
     answerJson(response, 404, { error: 'no such control endpoint' });
     return;
   }
@@ -889,7 +1764,16 @@ async function serveControl(request, response) {
     answerJson(response, 400, { error: 'the body is not an object' });
     return;
   }
-  const problem = path === '/network' ? setNetwork(body) : addGrant(body);
+  if (path === '/approvals') {
+    const decision = decideApproval(body);
+    if (decision.error) answerJson(response, decision.status, { error: decision.error });
+    else answerJson(response, 200, { ok: true });
+    return;
+  }
+  const problem = path === '/network' ? setNetwork(body)
+    : path === '/writes' ? setWrites(body)
+      : path === '/denials' ? setDenials(body)
+        : addGrant(body);
   if (problem) answerJson(response, 400, { error: problem });
   else answerJson(response, 200, { ok: true });
 }
@@ -906,6 +1790,16 @@ const lastNote = new Map();
  * HTTP parser threw out. Recorded at most once a minute per listener and per kind, because the
  * flood is the point of the record and 500 notes of it would erase everything else.
  */
+/** A standing denial of one method at one destination, noted at most once a minute per pair. */
+function noteStandingDenial(host, port, method) {
+  const key = `${host}\u0000${method}`;
+  const now = Date.now();
+  const last = lastDenialNote.get(key) ?? 0;
+  if (now - last < NOTE_INTERVAL_MS) return;
+  lastDenialNote.set(key, now);
+  record('corridor', host, port, 'deny:method', method);
+}
+
 function noteRefusedTraffic(listener, decision) {
   const key = `${listener}:${decision}`;
   const last = lastNote.get(key) ?? 0;
@@ -967,6 +1861,15 @@ async function main() {
     console.error('gatekeeper: arguments are <bind host> <corridor port> <window port> <control port>');
     process.exit(2);
   }
+  try {
+    // Before anything listens: a corridor that cannot make the certificate its space trusts has
+    // no way to read a method, and failing to start is the safe answer.
+    authority = createCertificateAuthority();
+    authorityCertificatePem = authority.certificatePem;
+  } catch {
+    console.error('gatekeeper: could not create the certificate for its corridor');
+    process.exit(2);
+  }
   await listen(corridor, corridorPort, bindHost);
   await listen(windowServer, windowPort, bindHost);
   // Last, and on loopback only: an answer from here means all three are up.
@@ -999,5 +1902,5 @@ function describeFailure(error) {
 if (require.main === module) {
   main();
 } else {
-  module.exports = { addGrant, chooseAddress, isBlockedAddress, isDomainName, joinSockets, parseIPv4, parseIPv6, refuseTarget, setNetwork, splitTarget, walksOutOfGrant };
+  module.exports = { APPROVAL_TIMEOUT_MS, MAX_PENDING_APPROVALS, SAFE_METHODS, TUNNEL_IDLE_MS, WRITABLE_METHODS, addGrant, approvalsSince, chooseAddress, classifyGraphqlBody, createCertificateAuthority, decideApproval, guardTunnelIdle, holdForApproval, isBlockedAddress, isDomainName, issueCertificate, parseIPv4, parseIPv6, refuseTarget, setNetwork, setWrites, splitTarget, walksOutOfGrant, writeForwardedBody };
 }

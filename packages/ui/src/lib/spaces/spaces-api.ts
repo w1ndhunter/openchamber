@@ -85,12 +85,25 @@ const switchChangeSchema = z.object({
 
 export type SpacesSwitchChange = z.infer<typeof switchChangeSchema>;
 
+// `writes: 'ask'` holds each write for an approval; `'allow'` lets it out. A host that predates
+// the choice answers without it, and that reads as asking, which is the safer side.
 const networkSchema = z.object({
   mode: z.enum(['allowlist', 'open']),
   domains: z.array(z.string()),
+  writes: z.enum(['ask', 'allow']).default('ask'),
 });
 
 export type SpaceNetwork = z.infer<typeof networkSchema>;
+
+// A method the user approved for one destination: GET, HEAD and OPTIONS need none, and the rest
+// of the methods are not approvable at all.
+const writeAccessSchema = z.object({
+  host: z.string(),
+  methods: z.array(z.enum(['DELETE', 'PATCH', 'POST', 'PUT'])),
+});
+
+type SpaceWriteAccess = z.infer<typeof writeAccessSchema>;
+export type SpaceWriteMethod = SpaceWriteAccess['methods'][number];
 
 const grantSchema = z.discriminatedUnion('kind', [
   z.object({
@@ -166,6 +179,10 @@ const spaceEntrySchema = z.object({
   failure: failureSchema.nullable(),
   // Null when the host could not read what the user chose: unknown, never "open".
   network: networkSchema.nullable(),
+  // The methods the user approved, per destination, said again to the gatekeeper at every start.
+  writeAccess: z.array(writeAccessSchema).default([]),
+  // The methods the user denied there: refused without a prompt until cleared.
+  deniedWrites: z.array(writeAccessSchema).default([]),
   grants: z.array(grantSchema),
   access: z.enum(['granted', 'needs_access', 'unknown']).nullable(),
   needsAccess: z.array(z.string()),
@@ -377,6 +394,31 @@ export const grantSpaceAccess = async (spaceId: string, body: GrantRequest): Pro
 export const openSpaceDomain = async (spaceId: string, domain: string): Promise<SpaceNetwork> =>
   (await request(`${SPACES_ROUTE}/${spaceId}/network/domains`, z.object({ network: networkSchema }), { method: 'POST', body: JSON.stringify({ domain }) })).network;
 
+/**
+ * Approves one or more methods for one destination, live; answers every approval the space holds
+ * now. The gatekeeper refuses the method until this call, and the record keeps it for the next start.
+ */
+export const approveSpaceWrites = async (spaceId: string, host: string, methods: readonly SpaceWriteMethod[]): Promise<SpaceWriteAccess[]> =>
+  (await request(`${SPACES_ROUTE}/${spaceId}/writes`, z.object({ writeAccess: z.array(writeAccessSchema) }), { method: 'POST', body: JSON.stringify({ host, methods }) })).writeAccess;
+
+/**
+ * Takes back approvals for a destination, live: the listed methods, or every method for it with
+ * an empty list. The next write asks again; the record keeps the change for the next start.
+ */
+export const revokeSpaceWrites = async (spaceId: string, host: string, methods: readonly SpaceWriteMethod[]): Promise<SpaceWriteAccess[]> =>
+  (await request(`${SPACES_ROUTE}/${spaceId}/writes`, z.object({ writeAccess: z.array(writeAccessSchema) }), { method: 'DELETE', body: JSON.stringify({ host, methods }) })).writeAccess;
+
+/** Denies methods for a destination, clears them with an empty list, or replaces its list. */
+export const denySpaceWrites = async (spaceId: string, host: string, methods: readonly SpaceWriteMethod[]): Promise<SpaceWriteAccess[]> =>
+  (await request(`${SPACES_ROUTE}/${spaceId}/denials`, z.object({ deniedWrites: z.array(writeAccessSchema) }), { method: 'POST', body: JSON.stringify({ host, methods }) })).deniedWrites;
+
+/**
+ * The answer for a write that is waiting in the gatekeeper: `allowed` sends it on, anything else
+ * refuses it. `settled` is false when the wait was already gone, which is not a failure.
+ */
+export const decideSpaceApproval = async (spaceId: string, requestId: number, allowed: boolean): Promise<boolean> =>
+  (await request(`${SPACES_ROUTE}/${spaceId}/approvals`, z.object({ settled: z.boolean() }), { method: 'POST', body: JSON.stringify({ requestId, allowed }) })).settled;
+
 // One attempt the gatekeeper recorded: never a path, a body or a secret. `host` is what the agent
 // asked for, so it is data to show, never to act on without the user.
 const journalRecordSchema = z.object({
@@ -384,6 +426,8 @@ const journalRecordSchema = z.object({
   listener: z.string(),
   host: z.string(),
   port: z.number(),
+  // The method of a decrypted request; empty for a CONNECT decision and for a host before it.
+  method: z.string().default(''),
   decision: z.string(),
 });
 

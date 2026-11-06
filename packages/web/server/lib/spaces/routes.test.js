@@ -61,6 +61,9 @@ const journeyOf = (overrides = {}) => {
     removeSpace: record('removeSpace', { id: ID, removed: true }),
     grantAccess: record('grantAccess', { grant: { id: 'open-1' } }),
     openDomain: record('openDomain', { network: { mode: 'allowlist', domains: ['registry.npmjs.org'] } }),
+    approveWrites: record('approveWrites', { writeAccess: [{ host: 'api.github.com', methods: ['POST'] }] }),
+    revokeWrites: record('revokeWrites', { writeAccess: [] }),
+    decideWriteApproval: record('decideWriteApproval', { settled: true }),
     readJournal: record('readJournal', { records: [], dropped: 0, since: 'now' }),
     previewApply: record('previewApply', { changedPaths: 2 }),
     applySpace: record('applySpace', { applied: { status: 'applied' } }),
@@ -91,7 +94,7 @@ describe('space routes', () => {
   });
   it('answers every journey route with 404 and isolated_spaces_off while the feature is off, and the switch still works', async () => {
     const { call, calls } = await serve({ journey: null, switchState: { enabled: false } });
-    for (const [method, path] of [['GET', ''], ['POST', ''], ['GET', '/places'], ['POST', `/${ID}/start`], ['POST', `/${ID}/stop`], ['POST', `/${ID}/restart`], ['POST', `/${ID}/restart-opencode`], ['POST', `/${ID}/grants`], ['GET', '/logins'], ['GET', '/custom-providers'], ['DELETE', `/${ID}`], ['GET', `/${ID}/journal`], ['GET', `/${ID}/apply`], ['POST', `/${ID}/apply`], ['GET', '/idle-stop'], ['PUT', '/idle-stop'], ['POST', `/${ID}/setup`], ['GET', `/${ID}/setup`], ['GET', '/places/docker/disk'], ['POST', '/places/docker/clean-up'], ['POST', '/places/docker/image'], ['GET', '/places/local/setup'], ['POST', '/places/local/setup']]) {
+    for (const [method, path] of [['GET', ''], ['POST', ''], ['GET', '/places'], ['POST', `/${ID}/start`], ['POST', `/${ID}/stop`], ['POST', `/${ID}/restart`], ['POST', `/${ID}/restart-opencode`], ['POST', `/${ID}/grants`], ['POST', `/${ID}/writes`], ['DELETE', `/${ID}/writes`], ['POST', `/${ID}/approvals`], ['GET', '/logins'], ['GET', '/custom-providers'], ['DELETE', `/${ID}`], ['GET', `/${ID}/journal`], ['GET', `/${ID}/apply`], ['POST', `/${ID}/apply`], ['GET', '/idle-stop'], ['PUT', '/idle-stop'], ['POST', `/${ID}/setup`], ['GET', `/${ID}/setup`], ['GET', '/places/docker/disk'], ['POST', '/places/docker/clean-up'], ['POST', '/places/docker/image'], ['GET', '/places/local/setup'], ['POST', '/places/local/setup']]) {
       expect(await call(method, `${SPACES_ROUTE}${path}`, method === 'GET' || method === 'DELETE' ? undefined : {}), `${method} ${path}`).toEqual({ status: 404, body: { code: 'isolated_spaces_off', message: 'Isolated spaces are turned off.', details: null } });
     }
     expect(await call('GET', `${SPACES_ROUTE}/switch`)).toEqual({ status: 200, body: { enabled: false, spaces: [] } });
@@ -170,6 +173,9 @@ describe('space routes', () => {
     expect(await call('POST', `${SPACES_ROUTE}/${ID}/restart-opencode`)).toEqual({ status: 200, body: { id: ID, state: 'running' } });
     expect(await call('POST', `${SPACES_ROUTE}/${ID}/grants`, { kind: 'domain', upstream: 'https://registry.example.com/' })).toEqual({ status: 200, body: { grant: { id: 'open-1' } } });
     expect(await call('POST', `${SPACES_ROUTE}/${ID}/network/domains`, { domain: 'registry.npmjs.org' })).toEqual({ status: 200, body: { network: { mode: 'allowlist', domains: ['registry.npmjs.org'] } } });
+    expect(await call('POST', `${SPACES_ROUTE}/${ID}/writes`, { host: 'api.github.com', methods: ['POST'] })).toEqual({ status: 200, body: { writeAccess: [{ host: 'api.github.com', methods: ['POST'] }] } });
+    expect(await call('DELETE', `${SPACES_ROUTE}/${ID}/writes`, { host: 'api.github.com', methods: ['POST'] })).toEqual({ status: 200, body: { writeAccess: [] } });
+    expect(await call('POST', `${SPACES_ROUTE}/${ID}/approvals`, { requestId: 3, allowed: true })).toEqual({ status: 200, body: { settled: true } });
     expect(await call('GET', `${SPACES_ROUTE}/logins`)).toEqual({ status: 200, body: { logins: [{ provider: 'openai', method: 'chatgpt-token-sharing', expires: '2026-09-26T11:00:00.000Z', state: 'usable' }] } });
     expect(await call('GET', `${SPACES_ROUTE}/custom-providers?directory=%2Fhome%2Fme%2Fproject`)).toEqual({ status: 200, body: { providers: [{ id: 'ollama-local', name: 'Ollama (local)', hasKey: false }] } });
     expect(await call('GET', `${SPACES_ROUTE}/${ID}/journal`)).toEqual({ status: 200, body: { records: [], dropped: 0, since: 'now' } });
@@ -179,7 +185,7 @@ describe('space routes', () => {
     expect(await call('GET', `${SPACES_ROUTE}/${ID}/setup`)).toEqual({ status: 200, body: { setup: null, output: null } });
     expect(await call('DELETE', `${SPACES_ROUTE}/${ID}`)).toEqual({ status: 200, body: { id: ID, removed: true } });
     expect(journey.calls).toEqual([
-      ['listSpaces', { access: true }], ['readDisk', 'docker'], ['cleanUpDisk', 'docker'], ['pullImage', 'docker'], ['createSpace', request], ['startSpace', ID], ['stopSpace', ID], ['restartSpace', ID], ['restartOpenCode', ID], ['grantAccess', ID, { kind: 'domain', upstream: 'https://registry.example.com/' }], ['openDomain', ID, { domain: 'registry.npmjs.org' }], ['readHostLogins'], ['readHostCustomProviders', '/home/me/project'], ['readJournal', ID], ['previewApply', ID], ['applySpace', ID, { as: 'branch', branch: 'b' }], ['runSetup', ID, { commands: ['npm ci'] }], ['readSetup', ID], ['removeSpace', ID, { allowUnsaved: false }],
+      ['listSpaces', { access: true }], ['readDisk', 'docker'], ['cleanUpDisk', 'docker'], ['pullImage', 'docker'], ['createSpace', request], ['startSpace', ID], ['stopSpace', ID], ['restartSpace', ID], ['restartOpenCode', ID], ['grantAccess', ID, { kind: 'domain', upstream: 'https://registry.example.com/' }], ['openDomain', ID, { domain: 'registry.npmjs.org' }], ['approveWrites', ID, { host: 'api.github.com', methods: ['POST'] }], ['revokeWrites', ID, { host: 'api.github.com', methods: ['POST'] }], ['decideWriteApproval', ID, { requestId: 3, allowed: true }], ['readHostLogins'], ['readHostCustomProviders', '/home/me/project'], ['readJournal', ID], ['previewApply', ID], ['applySpace', ID, { as: 'branch', branch: 'b' }], ['runSetup', ID, { commands: ['npm ci'] }], ['readSetup', ID], ['removeSpace', ID, { allowUnsaved: false }],
     ]);
   });
 

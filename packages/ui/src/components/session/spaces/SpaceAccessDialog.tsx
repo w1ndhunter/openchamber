@@ -1,8 +1,9 @@
 /**
  * The grant dialog of an isolated space (journey step 4): model keys per provider,
- * the domains the space may reach, and the attempts its gatekeeper refused, each opened from here.
- * Every grant goes through the host at once; nothing is saved at the end. A grant cannot be taken
- * back (decision 4), so opened domains show without a remove button.
+ * the domains the space may reach, the writes the user allowed or denied, and the attempts its
+ * gatekeeper refused, each opened from here. Every grant goes through the host at once; nothing
+ * is saved at the end. A grant cannot be taken back (decision 4), so opened domains show without
+ * a remove button; a write decision can, which returns that method to asking.
  *
  * The journal lives in the gatekeeper's memory only: it holds nothing from before the last start,
  * and the dialog says so, so that an empty list never reads as "the agent tried nothing" when the
@@ -24,14 +25,14 @@ import { useI18n, type I18nKey } from '@/lib/i18n';
 import { getCurrentIntlLocale } from '@/lib/i18n/intl';
 import { blockedAttemptsOf, isDomainName, providerAccessOf, type BlockReason } from '@/lib/spaces/space-access';
 import { SPACE_LOGIN_ONLY_PROVIDERS } from '@/lib/spaces/model-access';
-import { grantSpaceAccess, providerGrantOf, type SpaceEntry } from '@/lib/spaces/spaces-api';
+import { grantSpaceAccess, providerGrantOf, type SpaceEntry, type SpaceWriteMethod } from '@/lib/spaces/spaces-api';
 import { runSpaceAction, spaceMenuActionsOf } from '@/lib/spaces/space-repair';
 import { refreshSpacesJourney, useSpacesStore } from '@/lib/spaces/spaces-store';
 import { useUIStore } from '@/stores/useUIStore';
 import { ModelKeySource } from './ModelKeySource';
 import { isAccessChoiceComplete, modelGrantOf, usableHostLoginOf, useSpaceHostLogins, useSpaceModelProviders, type HostLoginOffer, type KeySourceChoice, type SpaceModelProviderOption } from './spaceModelKeys';
 import { failureOfError, spaceFailureText } from './spaceFailureText';
-import { useOpenSpaceDomain, useSpaceJournal } from './spaceNetwork';
+import { useApproveSpaceWrites, useClearSpaceDenial, useOpenSpaceDomain, useRevokeSpaceWrites, useSpaceJournal } from './spaceNetwork';
 
 const REASON_TEXT = {
   not_on_list: 'spaces.access.reason.notOnList',
@@ -40,9 +41,15 @@ const REASON_TEXT = {
   address_not_name: 'spaces.access.reason.addressNotName',
   port: 'spaces.access.reason.port',
   always_refused: 'spaces.access.reason.alwaysRefused',
+  method: 'spaces.access.reason.method',
   too_many: 'spaces.access.reason.tooMany',
   other: 'spaces.access.reason.other',
 } satisfies Record<BlockReason, I18nKey>;
+
+const WRITE_METHODS: ReadonlySet<string> = new Set(['DELETE', 'PATCH', 'POST', 'PUT']);
+// The journal's method is text the gatekeeper wrote, so it is checked against the set before it
+// is used as one of the four: a `GET`, an empty record or anything else is not approvable.
+const isWriteMethod = (value: string): value is SpaceWriteMethod => WRITE_METHODS.has(value);
 
 /** A time of the journal in the user's language: the hour when it is today, the date as well when it is not. */
 const formatJournalTime = (value: string): string => {
@@ -217,7 +224,85 @@ const NetworkSection: React.FC<{ entry: SpaceEntry; domains: ReturnType<typeof u
   );
 };
 
-const BlockedSection: React.FC<{ entry: SpaceEntry; journal: ReturnType<typeof useSpaceJournal>; domains: ReturnType<typeof useOpenSpaceDomain> }> = ({ entry, journal, domains }) => {
+/** One method a user decided about: a chip that takes the decision back and returns it to asking. */
+const DecisionChip: React.FC<{ method: SpaceWriteMethod; kind: 'allowed' | 'denied'; busy: boolean; disabled: boolean; title: string; onClick: () => void }> = ({ method, kind, busy, disabled, title, onClick }) => (
+  <button
+    type="button"
+    className="oc-tile-inset inline-flex min-h-8 items-center gap-1 rounded-full px-2.5 font-mono typography-micro text-foreground transition-colors hover:bg-interactive-hover focus-visible:bg-interactive-hover disabled:pointer-events-none disabled:opacity-60"
+    title={title}
+    aria-label={title}
+    disabled={disabled}
+    onClick={onClick}
+  >
+    {method}
+    <span className="inline-flex size-3 shrink-0 items-center justify-center" aria-hidden="true">
+      {busy ? <Icon name="loader-4" className="h-3 w-3 animate-spin" /> : <span className={kind === 'denied' ? 'text-muted-foreground' : undefined}>{kind === 'denied' ? '↺' : '×'}</span>}
+    </span>
+  </button>
+);
+
+/**
+ * The user's standing answers about writes, kept in the record and not in the journal, so they
+ * stay visible and reversible after a stop, a restart or an eviction. One row per destination:
+ * allowed methods go out, denied ones are refused, and taking either back returns it to asking.
+ */
+const WritesSection: React.FC<{ entry: SpaceEntry; revokes: ReturnType<typeof useRevokeSpaceWrites>; denials: ReturnType<typeof useClearSpaceDenial> }> = ({ entry, revokes, denials }) => {
+  const { t } = useI18n();
+  const hosts = [...new Set([...entry.writeAccess, ...entry.deniedWrites].map((rule) => rule.host))].sort();
+  if (hosts.length === 0) return <p className="typography-meta text-muted-foreground">{t('spaces.access.writes.empty')}</p>;
+  return (
+    <div className="space-y-2">
+      <p className="typography-meta text-muted-foreground">{t('spaces.access.writes.intro')}</p>
+      <ul className="space-y-2">
+        {hosts.map((host) => {
+          const allowed = entry.writeAccess.find((rule) => rule.host === host)?.methods ?? [];
+          const denied = entry.deniedWrites.find((rule) => rule.host === host)?.methods ?? [];
+          const error = revokes.error?.key.startsWith(`${host}:`) ? revokes.error.text : denials.error?.key.startsWith(`${host}:`) ? denials.error.text : null;
+          return (
+            <li key={host} className="space-y-1">
+              <div className="font-mono typography-meta text-foreground break-all">{host}</div>
+              {allowed.length > 0 ? (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="typography-micro text-muted-foreground">{t('spaces.access.blocked.opened')}</span>
+                  {allowed.map((method) => (
+                    <DecisionChip
+                      key={`allowed:${method}`}
+                      method={method}
+                      kind="allowed"
+                      busy={revokes.revoking === `${host}:${method}`}
+                      disabled={revokes.revoking !== null}
+                      title={t('spaces.access.writes.revokeMethod', { method })}
+                      onClick={() => void revokes.revoke(host, method)}
+                    />
+                  ))}
+                </div>
+              ) : null}
+              {denied.length > 0 ? (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="typography-micro text-muted-foreground">{t('spaces.access.writes.denied')}</span>
+                  {denied.map((method) => (
+                    <DecisionChip
+                      key={`denied:${method}`}
+                      method={method}
+                      kind="denied"
+                      busy={denials.clearing === `${host}:${method}`}
+                      disabled={denials.clearing !== null}
+                      title={t('spaces.access.writes.clearDenial', { method })}
+                      onClick={() => void denials.clear(host, method, denied.filter((kept) => kept !== method))}
+                    />
+                  ))}
+                </div>
+              ) : null}
+              {error ? <div className="typography-micro text-status-error">{error}</div> : null}
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+};
+
+const BlockedSection: React.FC<{ entry: SpaceEntry; journal: ReturnType<typeof useSpaceJournal>; domains: ReturnType<typeof useOpenSpaceDomain>; writes: ReturnType<typeof useApproveSpaceWrites> }> = ({ entry, journal, domains, writes }) => {
   const { t } = useI18n();
   if (entry.state !== 'running') return <p className="typography-meta text-muted-foreground">{t('spaces.access.blocked.stopped')}</p>;
   if (journal.state.kind === 'loading') return <p className="typography-meta text-muted-foreground">{t('spaces.access.blocked.loading')}</p>;
@@ -238,17 +323,22 @@ const BlockedSection: React.FC<{ entry: SpaceEntry; journal: ReturnType<typeof u
           {attempts.map((attempt) => {
             const opened = allowlist?.includes(attempt.host) ?? false;
             const canOpen = attempt.reason === 'not_on_list' && allowlist !== null && isDomainName(attempt.host);
+            const method = attempt.reason === 'method' && isWriteMethod(attempt.method) ? attempt.method : null;
+            const approved = method !== null && entry.writeAccess.some((entryAccess) => entryAccess.host === attempt.host && entryAccess.methods.includes(method));
+            const writeKey = method === null ? null : `${attempt.host}:${method}`;
             const last = formatJournalTime(attempt.last);
             return (
-              <li key={`${attempt.reason}:${attempt.host}:${attempt.port}`} className="flex items-start gap-2">
+              <li key={`${attempt.reason}:${attempt.host}:${attempt.port}:${attempt.method}`} className="flex items-start gap-2">
                 <div className="min-w-0 flex-1">
                   <div className="font-mono typography-meta text-foreground break-all">{attempt.reason === 'port' ? `${attempt.host}:${attempt.port}` : attempt.host}</div>
                   <div className="typography-micro text-muted-foreground">
+                    {method ? `${method} · ` : null}
                     {t(REASON_TEXT[attempt.reason], { port: attempt.port })}
                     {' · '}
                     {attempt.count === 1 ? t('spaces.access.blocked.countSingle', { time: last }) : t('spaces.access.blocked.countPlural', { count: attempt.count, time: last })}
                   </div>
                   {domains.error?.domain === attempt.host ? <div className="typography-micro text-status-error">{domains.error.text}</div> : null}
+                  {writeKey !== null && writes.error?.key === writeKey ? <div className="typography-micro text-status-error">{writes.error.text}</div> : null}
                 </div>
                 {canOpen ? (
                   opened
@@ -257,6 +347,16 @@ const BlockedSection: React.FC<{ entry: SpaceEntry; journal: ReturnType<typeof u
                       <Button variant="outline" size="xs" className="shrink-0 gap-1" disabled={domains.opening !== null} onClick={() => void domains.open(attempt.host)}>
                         {domains.opening === attempt.host ? <Icon name="loader-4" className="h-3 w-3 animate-spin" /> : null}
                         {t('spaces.access.openDomain')}
+                      </Button>
+                    )
+                ) : null}
+                {method !== null ? (
+                  approved
+                    ? <span className="shrink-0 typography-micro text-muted-foreground">{t('spaces.access.blocked.approved')}</span>
+                    : (
+                      <Button variant="outline" size="xs" className="shrink-0 gap-1" disabled={writes.approving !== null} onClick={() => void writes.approve(attempt.host, method)}>
+                        {writes.approving === writeKey ? <Icon name="loader-4" className="h-3 w-3 animate-spin" /> : null}
+                        {t('spaces.access.allowMethod', { method })}
                       </Button>
                     )
                 ) : null}
@@ -302,6 +402,9 @@ const SpaceAccessBody: React.FC<{ entry: SpaceEntry; focusProviderId: string | n
   const running = entry.state === 'running';
   const journal = useSpaceJournal(entry.id, running);
   const domains = useOpenSpaceDomain(entry.id);
+  const writes = useApproveSpaceWrites(entry.id);
+  const revokes = useRevokeSpaceWrites(entry.id);
+  const denials = useClearSpaceDenial(entry.id);
   return (
     <div className="space-y-5 pe-3">
       <p className="typography-meta text-muted-foreground">{t('spaces.access.intro')}</p>
@@ -318,6 +421,9 @@ const SpaceAccessBody: React.FC<{ entry: SpaceEntry; focusProviderId: string | n
       <Section title={t('spaces.access.network.label')}>
         <NetworkSection entry={entry} domains={domains} />
       </Section>
+      <Section title={t('spaces.access.writes.label')}>
+        <WritesSection entry={entry} revokes={revokes} denials={denials} />
+      </Section>
       <Section
         title={t('spaces.access.blocked.label')}
         action={running ? (
@@ -327,7 +433,7 @@ const SpaceAccessBody: React.FC<{ entry: SpaceEntry; focusProviderId: string | n
           </Button>
         ) : null}
       >
-        <BlockedSection entry={entry} journal={journal} domains={domains} />
+        <BlockedSection entry={entry} journal={journal} domains={domains} writes={writes} />
       </Section>
     </div>
   );

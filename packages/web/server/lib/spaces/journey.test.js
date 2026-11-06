@@ -19,7 +19,7 @@ import { createPlaceRegistry } from './places/registry.js';
 import { createSpaceRecords } from './space-records.js';
 
 const PROJECT = '/home/me/project';
-const NETWORK = { mode: 'allowlist', domains: ['api.anthropic.com'] };
+const NETWORK = { mode: 'allowlist', domains: ['api.anthropic.com'], writes: 'ask' };
 const BASE = 'b'.repeat(40);
 const quiet = { warn: () => {} };
 const folders = [];
@@ -35,7 +35,7 @@ afterEach(() => {
 });
 
 /** A journey on fresh stand-ins. `failAt` names a stand-in step that rejects. */
-const journeyWith = ({ readHostLogin = null, hostProviders = undefined, failAt = null, place = createMemoryPlace(), morePlaces = [], projects = [PROJECT], historyStatus = 'sent', holdCodeIn = false, holdCodeOut = false, holdIdleSave = false, holdReady = false, holdLoginRow = false, hostEnvironment = {}, hostLogin = null, dataDir = null, archiveChats = null, logger = quiet, resolveDirectory = undefined } = {}) => {
+const journeyWith = ({ readHostLogin = null, hostProviders = undefined, failAt = null, place = createMemoryPlace(), morePlaces = [], projects = [PROJECT], historyStatus = 'sent', holdCodeIn = false, holdCodeOut = false, holdIdleSave = false, holdReady = false, holdLoginRow = false, hostEnvironment = {}, hostLogin = null, dataDir = null, archiveChats = null, waitingApprovals = [], logger = quiet, resolveDirectory = undefined } = {}) => {
   // With `holdCodeIn`, code in waits until the test lets it go, so a creation stays under way;
   // `holdCodeOut` does the same for the fetch of an apply.
   let releaseCodeIn = () => {};
@@ -52,12 +52,41 @@ const journeyWith = ({ readHostLogin = null, hostProviders = undefined, failAt =
   const fail = (step) => { if (failAt === step) throw new SpaceError(`${step}_failed`, `the stand-in for ${step} failed`); };
   // The stand-in gatekeeper holds grant ids per space, like the program's memory: a stop forgets them.
   const held = new Map();
+  const heldWrites = new Map();
+  const heldDenials = new Map();
+  // Writes waiting for the user: `waitingApprovals` answers once, then the watch is quiet, as a
+  // real long poll is. The quiet answer is a promise that never settles and holds no timer.
+  const approvalQueue = [...waitingApprovals];
+  const approvalWaits = [];
+  const quiet = new Promise(() => {});
   const gatekeeper = {
     setNetwork: async (spaceId, network) => { calls.push(['setNetwork', spaceId, network]); fail('setNetwork'); },
+    setWrites: async (spaceId, entries) => { calls.push(['setWrites', spaceId, entries]); fail('setWrites'); heldWrites.set(spaceId, entries); },
+    setDenials: async (spaceId, entries) => { calls.push(['setDenials', spaceId, entries]); fail('setDenials'); heldDenials.set(spaceId, entries); },
+    waitForApprovals: async (spaceId, { since = 0 } = {}) => {
+      approvalWaits.push({ spaceId, since });
+      const requests = approvalQueue.splice(0).filter((request) => request.id > since);
+      if (requests.length === 0) return quiet;
+      return { requests, since: requests[requests.length - 1].id };
+    },
+    decideApproval: async (spaceId, decision) => {
+      calls.push(['decideApproval', spaceId, decision]);
+      fail('decideApproval');
+      // A refusal stands for its destination, as the gatekeeper records it.
+      const refused = decision.allowed === false ? waitingApprovals.find((request) => request.id === decision.id) : undefined;
+      if (refused) {
+        const denials = heldDenials.get(spaceId) ?? [];
+        const known = denials.find((entry) => entry.host === refused.host);
+        if (known) { if (!known.methods.includes(refused.method)) known.methods.push(refused.method); }
+        else denials.push({ host: refused.host, methods: [refused.method] });
+        heldDenials.set(spaceId, denials);
+      }
+      return { settled: true };
+    },
     addGrant: async (spaceId, grant) => { calls.push(['addGrant', spaceId, grant]); fail('addGrant'); if (!held.has(spaceId)) held.set(spaceId, new Set()); held.get(spaceId).add(grant.id); },
-    readPolicy: async (spaceId) => { calls.push(['readPolicy', spaceId]); fail('readPolicy'); return { mode: 'allowlist', domains: [], grants: Array.from(held.get(spaceId) ?? []) }; },
+    readPolicy: async (spaceId) => { calls.push(['readPolicy', spaceId]); fail('readPolicy'); return { mode: 'allowlist', domains: [], grants: Array.from(held.get(spaceId) ?? []), writes: heldWrites.get(spaceId) ?? [], denials: heldDenials.get(spaceId) ?? [] }; },
     readJournal: async (spaceId) => { calls.push(['readJournal', spaceId]); return { records: [], dropped: 0, since: '2026-09-26T10:00:00.000Z' }; },
-    forget: (spaceId) => { held.delete(spaceId); },
+    forget: (spaceId) => { held.delete(spaceId); heldWrites.delete(spaceId); heldDenials.delete(spaceId); },
   };
   // The idle stop setting as the host keeps it, and each one said to a server inside, apart from
   // `calls` so the order of the other steps reads as it did before 5d-3.
@@ -135,7 +164,7 @@ const journeyWith = ({ readHostLogin = null, hostProviders = undefined, failAt =
     logger,
     now: () => new Date(clock.time),
   });
-  return { journey, place, records, calls, events, changes, manager, releaseCodeIn, releaseCodeOut, releaseReady, releaseLoginRow, gatekeeper, dataDir, idle, defaultMode, userTaskTitles, clock };
+  return { journey, place, records, calls, events, changes, manager, releaseCodeIn, releaseCodeOut, releaseReady, releaseLoginRow, gatekeeper, approvalWaits, dataDir, idle, defaultMode, userTaskTitles, clock };
 };
 
 const REQUEST = { projectDirectory: PROJECT, name: ' Fix login ', start: 'uncommitted', network: NETWORK };
@@ -682,20 +711,20 @@ describe('the journey: opening a domain', () => {
 
   it('tells the gatekeeper the allowlist with the domain, then remembers it for the next start', async () => {
     const { journey, records, calls, id } = await ready();
-    expect(await journey.openDomain(id, { domain: ' Registry.NPMJS.org ' })).toEqual({ network: { mode: 'allowlist', domains: ['api.anthropic.com', 'registry.npmjs.org'] } });
-    expect(calls).toEqual([['setNetwork', id, { mode: 'allowlist', domains: ['api.anthropic.com', 'registry.npmjs.org'] }]]);
+    expect(await journey.openDomain(id, { domain: ' Registry.NPMJS.org ' })).toEqual({ network: { mode: 'allowlist', domains: ['api.anthropic.com', 'registry.npmjs.org'], writes: 'ask' } });
+    expect(calls).toEqual([['setNetwork', id, { mode: 'allowlist', domains: ['api.anthropic.com', 'registry.npmjs.org'], writes: 'ask' }]]);
     expect(records.read(id).record.network.domains).toEqual(['api.anthropic.com', 'registry.npmjs.org']);
 
     // A domain already on the list changes nothing.
     calls.splice(0);
-    expect(await journey.openDomain(id, { domain: 'registry.npmjs.org' })).toEqual({ network: { mode: 'allowlist', domains: ['api.anthropic.com', 'registry.npmjs.org'] } });
+    expect(await journey.openDomain(id, { domain: 'registry.npmjs.org' })).toEqual({ network: { mode: 'allowlist', domains: ['api.anthropic.com', 'registry.npmjs.org'], writes: 'ask' } });
     expect(calls).toEqual([]);
 
     // The next start says the list with the opened domain again.
     await journey.stopSpace(id);
     calls.splice(0);
     await journey.startSpace(id);
-    expect(calls.find(([name]) => name === 'setNetwork')).toEqual(['setNetwork', id, { mode: 'allowlist', domains: ['api.anthropic.com', 'registry.npmjs.org'] }]);
+    expect(calls.find(([name]) => name === 'setNetwork')).toEqual(['setNetwork', id, { mode: 'allowlist', domains: ['api.anthropic.com', 'registry.npmjs.org'], writes: 'ask' }]);
   });
 
   it('refuses what is not a name, a stopped space, an open network, and a record it cannot read, telling the gatekeeper nothing', async () => {
@@ -727,6 +756,237 @@ describe('the journey: opening a domain', () => {
     records.update(id, { network: { mode: 'allowlist', domains: Array.from({ length: 200 }, (_, index) => `d${index}.example.com`) } });
     await expect(journey.openDomain(id, { domain: 'one-more.example.com' })).rejects.toMatchObject({ code: 'too_many_domains' });
     expect(calls).toEqual([]);
+  });
+});
+
+describe('the journey: approving a method', () => {
+  const ready = async (options = {}, request = REQUEST) => {
+    const made = journeyWith(options);
+    const { id } = await made.journey.createSpace(request);
+    await until(() => steps(made.events, id).includes('ready'));
+    made.calls.splice(0);
+    return { ...made, id };
+  };
+
+  it('tells the gatekeeper, then remembers the method for the next start', async () => {
+    const { journey, records, calls, id } = await ready();
+    expect(await journey.approveWrites(id, { host: ' API.GitHub.com ', methods: ['POST'] })).toEqual({ writeAccess: [{ host: 'api.github.com', methods: ['POST'] }] });
+    expect(calls).toEqual([['setWrites', id, [{ host: 'api.github.com', methods: ['POST'] }]]]);
+    expect(records.read(id).record.writeAccess).toEqual([{ host: 'api.github.com', methods: ['POST'] }]);
+
+    // A second method for the same destination is added to the first, in the order the record keeps.
+    calls.splice(0);
+    expect(await journey.approveWrites(id, { host: 'api.github.com', methods: ['PUT'] })).toEqual({ writeAccess: [{ host: 'api.github.com', methods: ['POST', 'PUT'] }] });
+    expect(calls).toEqual([['setWrites', id, [{ host: 'api.github.com', methods: ['POST', 'PUT'] }]]]);
+
+    // The next start says it again, because a gatekeeper starts with nothing approved.
+    await journey.stopSpace(id);
+    calls.splice(0);
+    await journey.startSpace(id);
+    expect(calls.find(([name]) => name === 'setWrites')).toEqual(['setWrites', id, [{ host: 'api.github.com', methods: ['POST', 'PUT'] }]]);
+  });
+
+  it('refuses what is not a name and method, a stopped space and a record it cannot read', async () => {
+    const { journey, records, calls, id } = await ready();
+    for (const request of [
+      { host: '', methods: ['POST'] },
+      { host: 'localhost', methods: ['POST'] },
+      { host: '10.0.0.1', methods: ['POST'] },
+      { host: 'example.com', methods: [] },
+      { host: 'example.com', methods: ['GET'] },
+      { host: 'example.com', methods: ['CONNECT'] },
+      { host: 'example.com', methods: ['POST'], extra: 1 },
+    ]) {
+      await expect(journey.approveWrites(id, request), JSON.stringify(request)).rejects.toMatchObject({ code: 'invalid_write_access' });
+    }
+    await expect(journey.approveWrites(id, null)).rejects.toMatchObject({ code: 'invalid_write_access' });
+    records.remove(id);
+    await expect(journey.approveWrites(id, { host: 'example.com', methods: ['POST'] })).rejects.toMatchObject({ code: 'space_record_unreadable' });
+    await journey.stopSpace(id);
+    await expect(journey.approveWrites(id, { host: 'example.com', methods: ['POST'] })).rejects.toMatchObject({ code: 'space_not_running' });
+    expect(calls.filter(([name]) => name === 'setWrites')).toEqual([]);
+  });
+
+  it('does not remember a method the gatekeeper did not take', async () => {
+    const { records, place, dataDir, id } = await ready();
+    const failing = journeyWith({ place, dataDir, failAt: 'setWrites' });
+    await expect(failing.journey.approveWrites(id, { host: 'api.github.com', methods: ['POST'] })).rejects.toMatchObject({ code: 'setWrites_failed' });
+    expect(records.read(id).record.writeAccess).toEqual([]);
+  });
+
+  it('refuses a destination past the size of a record', async () => {
+    const { journey, records, calls, id } = await ready();
+    records.update(id, { writeAccess: Array.from({ length: 200 }, (_, index) => ({ host: `d${index}.example.com`, methods: ['POST'] })) });
+    await expect(journey.approveWrites(id, { host: 'one-more.example.com', methods: ['POST'] })).rejects.toMatchObject({ code: 'too_many_write_access' });
+    expect(calls).toEqual([]);
+  });
+});
+
+describe('the journey: taking an approval back', () => {
+  const ready = async () => {
+    const made = journeyWith();
+    const { id } = await made.journey.createSpace(REQUEST);
+    await until(() => steps(made.events, id).includes('ready'));
+    made.calls.splice(0);
+    return { ...made, id };
+  };
+
+  it('takes back one method, then the whole destination, and the next write asks again', async () => {
+    const { journey, records, calls, id } = await ready();
+    await journey.approveWrites(id, { host: 'api.github.com', methods: ['POST', 'PUT'] });
+    calls.splice(0);
+
+    expect(await journey.revokeWrites(id, { host: ' API.GitHub.com ', methods: ['POST'] })).toEqual({ writeAccess: [{ host: 'api.github.com', methods: ['PUT'] }] });
+    expect(calls).toEqual([['setWrites', id, [{ host: 'api.github.com', methods: ['PUT'] }]]]);
+    expect(records.read(id).record.writeAccess).toEqual([{ host: 'api.github.com', methods: ['PUT'] }]);
+
+    expect(await journey.revokeWrites(id, { host: 'api.github.com', methods: [] })).toEqual({ writeAccess: [] });
+    expect(records.read(id).record.writeAccess).toEqual([]);
+
+    // A start says only a non-empty list, so nothing approved means nothing to say.
+    await journey.stopSpace(id);
+    calls.splice(0);
+    await journey.startSpace(id);
+    expect(calls.filter(([name]) => name === 'setWrites')).toEqual([]);
+  });
+
+  it('refuses what it cannot name, a stopped space and a record it cannot read', async () => {
+    const { journey, records, calls, id } = await ready();
+    for (const request of [
+      { host: '', methods: ['POST'] },
+      { host: 'localhost', methods: ['POST'] },
+      { host: '10.0.0.1', methods: ['POST'] },
+      { host: 'example.com', methods: ['GET'] },
+      { host: 'example.com', methods: ['POST'], extra: 1 },
+    ]) {
+      await expect(journey.revokeWrites(id, request), JSON.stringify(request)).rejects.toMatchObject({ code: 'invalid_write_access' });
+    }
+    await expect(journey.revokeWrites(id, null)).rejects.toMatchObject({ code: 'invalid_write_access' });
+    records.remove(id);
+    await expect(journey.revokeWrites(id, { host: 'example.com', methods: ['POST'] })).rejects.toMatchObject({ code: 'space_record_unreadable' });
+    expect(calls.filter(([name]) => name === 'setWrites')).toEqual([]);
+  });
+
+  it('takes answers back while stopped, but never adds a denial there', async () => {
+    const { journey, records, calls, id } = await ready();
+    await journey.approveWrites(id, { host: 'api.github.com', methods: ['PUT'] });
+    await journey.denyWrites(id, { host: 'api.github.com', methods: ['POST', 'PATCH'] });
+    await journey.stopSpace(id);
+    calls.splice(0);
+
+    expect(await journey.revokeWrites(id, { host: 'api.github.com', methods: [] })).toEqual({ writeAccess: [] });
+    expect(records.read(id).record.writeAccess).toEqual([]);
+    expect(await journey.denyWrites(id, { host: 'api.github.com', methods: ['PATCH'] })).toEqual({ deniedWrites: [{ host: 'api.github.com', methods: ['PATCH'] }] });
+    expect(records.read(id).record.deniedWrites).toEqual([{ host: 'api.github.com', methods: ['PATCH'] }]);
+    expect(calls.filter(([name]) => name === 'setWrites' || name === 'setDenials')).toEqual([]);
+    // A new refusal is still a gatekeeper decision, not a record-only reduction.
+    await expect(journey.denyWrites(id, { host: 'api.github.com', methods: ['DELETE'] })).rejects.toMatchObject({ code: 'space_not_running' });
+  });
+
+  it('clears a denial and leaves other approvals for that destination alone', async () => {
+    const { journey, records, calls, id } = await ready();
+    await journey.approveWrites(id, { host: 'api.github.com', methods: ['PUT'] });
+    await journey.denyWrites(id, { host: 'api.github.com', methods: ['POST'] });
+    calls.splice(0);
+
+    expect(await journey.denyWrites(id, { host: 'api.github.com', methods: [] })).toEqual({ deniedWrites: [] });
+    expect(records.read(id).record.deniedWrites).toEqual([]);
+    expect(records.read(id).record.writeAccess).toEqual([{ host: 'api.github.com', methods: ['PUT'] }]);
+    // No approval changed, so the gatekeeper is not told a new list.
+    expect(calls.filter(([name]) => name === 'setWrites')).toEqual([]);
+  });
+
+  it('keeps one answer per method: an approval lifts a denial, and a denial takes the approval back', async () => {
+    const { journey, records, calls, id } = await ready();
+    await journey.denyWrites(id, { host: 'api.github.com', methods: ['POST'] });
+    calls.splice(0);
+
+    expect(await journey.approveWrites(id, { host: 'api.github.com', methods: ['POST'] })).toEqual({ writeAccess: [{ host: 'api.github.com', methods: ['POST'] }] });
+    expect(records.read(id).record.deniedWrites).toEqual([]);
+    expect(calls).toEqual([
+      ['setWrites', id, [{ host: 'api.github.com', methods: ['POST'] }]],
+      ['setDenials', id, []],
+    ]);
+
+    calls.splice(0);
+    expect(await journey.denyWrites(id, { host: 'api.github.com', methods: ['POST'] })).toEqual({ deniedWrites: [{ host: 'api.github.com', methods: ['POST'] }] });
+    expect(records.read(id).record.writeAccess).toEqual([]);
+    expect(calls).toEqual([
+      ['setDenials', id, [{ host: 'api.github.com', methods: ['POST'] }]],
+      ['setWrites', id, []],
+    ]);
+  });
+});
+
+describe('the journey: writes waiting for the user', () => {
+  const waiting = { id: 3, host: 'api.github.com', port: 443, method: 'POST', expiresAt: '2026-09-26T10:01:00.000Z' };
+
+  it('announces a waiting write while the space runs, and answers it when the user decides', async () => {
+    const made = journeyWith({ waitingApprovals: [waiting] });
+    const { id } = await made.journey.createSpace(REQUEST);
+    expect(await until(() => made.events.some((event) => event.spaceId === id && event.requestId === 3))).toBe(true);
+    expect(made.events.find((event) => event.spaceId === id && event.requestId === 3)).toMatchObject({
+      spaceId: id,
+      requestId: 3,
+      host: 'api.github.com',
+      port: 443,
+      method: 'POST',
+      expiresAt: waiting.expiresAt,
+    });
+
+    made.calls.splice(0);
+    expect(await made.journey.decideWriteApproval(id, { requestId: 3, allowed: true })).toEqual({ settled: true });
+    expect(made.calls).toEqual([['decideApproval', id, { id: 3, allowed: true }]]);
+  });
+
+  it('keeps a denial in the record, and clears it when the dialog says so', async () => {
+    const made = journeyWith({ waitingApprovals: [waiting] });
+    const { id } = await made.journey.createSpace(REQUEST);
+    expect(await until(() => made.events.some((event) => event.spaceId === id && event.requestId === 3))).toBe(true);
+
+    expect(await made.journey.decideWriteApproval(id, { requestId: 3, allowed: false })).toEqual({ settled: true });
+    expect(made.records.read(id).record.deniedWrites).toEqual([{ host: 'api.github.com', methods: ['POST'] }]);
+
+    // The dialog gives the prompt back by clearing the destination.
+    expect(await made.journey.denyWrites(id, { host: 'api.github.com', methods: [] })).toEqual({ deniedWrites: [] });
+    expect(made.calls.find(([name]) => name === 'setDenials')).toEqual(['setDenials', id, []]);
+
+    // And the next start says an empty list too, which is what a fresh gatekeeper already is.
+    await made.journey.stopSpace(id);
+    await expect(made.journey.denyWrites(id, { host: 'api.github.com', methods: ['POST'] })).rejects.toMatchObject({ code: 'space_not_running' });
+  });
+
+  it('says a denial again at the next start, so it survives a restart', async () => {
+    const made = journeyWith();
+    const { id } = await made.journey.createSpace(REQUEST);
+    await until(() => steps(made.events, id).includes('ready'));
+    expect(await made.journey.denyWrites(id, { host: 'api.github.com', methods: ['POST'] })).toEqual({ deniedWrites: [{ host: 'api.github.com', methods: ['POST'] }] });
+
+    await made.journey.stopSpace(id);
+    made.calls.splice(0);
+    await made.journey.startSpace(id);
+    expect(made.calls.find(([name]) => name === 'setDenials')).toEqual(['setDenials', id, [{ host: 'api.github.com', methods: ['POST'] }]]);
+  });
+
+  it('refuses an answer that names nothing, and one for a stopped space', async () => {
+    const made = journeyWith();
+    const { id } = await made.journey.createSpace(REQUEST);
+    await until(() => steps(made.events, id).includes('ready'));
+    for (const request of [{}, { requestId: 0, allowed: true }, { requestId: 2 }, { requestId: 2, allowed: true, extra: 1 }]) {
+      await expect(made.journey.decideWriteApproval(id, request), JSON.stringify(request)).rejects.toMatchObject({ code: 'invalid_approval' });
+    }
+    await made.journey.stopSpace(id);
+    await expect(made.journey.decideWriteApproval(id, { requestId: 2, allowed: true })).rejects.toMatchObject({ code: 'space_not_running' });
+    expect(made.calls.filter(([name]) => name === 'decideApproval')).toEqual([]);
+  });
+
+  it('watches the spaces that are already running when the host starts', async () => {
+    const made = journeyWith({ waitingApprovals: [waiting] });
+    const { id } = await made.journey.createSpace(REQUEST);
+    await until(() => steps(made.events, id).includes('ready'));
+    made.approvalWaits.length = 0;
+    await made.journey.watchApprovalsOfRunningSpaces();
+    expect(made.approvalWaits.some((wait) => wait.spaceId === id)).toBe(true);
   });
 });
 
@@ -1185,6 +1445,22 @@ describe('the journey: grants', () => {
     calls.splice(0);
     await journey.restoreLostGrants();
     expect(calls.map(([name]) => name)).toEqual(['readPolicy']);
+  });
+
+  it('says the approved methods a running gatekeeper lost again when the host starts', async () => {
+    const { journey, calls, gatekeeper, id } = await ready();
+    await journey.approveWrites(id, { host: 'api.github.com', methods: ['POST'] });
+    // As after a host that died between the start and the setWrites, or a gatekeeper restarted alone.
+    gatekeeper.forget(id);
+    calls.splice(0);
+
+    await journey.restoreLostGrants();
+    expect(calls.filter(([name]) => name === 'setWrites')).toEqual([['setWrites', id, [{ host: 'api.github.com', methods: ['POST'] }]]]);
+
+    // A gatekeeper that holds them is asked and told nothing.
+    calls.splice(0);
+    await journey.restoreLostGrants();
+    expect(calls.filter(([name]) => name === 'setWrites')).toEqual([]);
   });
 
   it('leaves a stopped space, a space without grants and a gatekeeper that does not answer alone when the host starts', async () => {

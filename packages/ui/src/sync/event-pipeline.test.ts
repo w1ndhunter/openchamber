@@ -532,6 +532,11 @@ describe("classifyStreamPayload", () => {
       .toEqual({ kind: "space-setup", spaceId: "0123456789ab" })
     expect(classifyStreamPayload({ type: "openchamber:space-setup", properties: { spaceId: "bad" } }, undefined))
       .toEqual({ kind: "events", events: [] })
+    const approval = { spaceId: "0123456789ab", requestId: 3, host: "api.github.com", port: 443, method: "POST", url: "https://api.github.com/repos?x=1", expiresAt: "2026-11-06T10:00:00.000Z" }
+    expect(classifyStreamPayload({ type: "openchamber:space-approval", properties: approval }, undefined))
+      .toEqual({ kind: "space-approval", properties: approval })
+    expect(classifyStreamPayload({ type: "openchamber:space-approval", properties: { ...approval, requestId: 0 } }, undefined))
+      .toEqual({ kind: "events", events: [] })
     expect(classifyStreamPayload({ type: "openchamber:space-permission-stream", properties: { spaceId: "0123456789ab", status: "connected" } }, undefined))
       .toEqual({ kind: "space-permission-stream", spaceId: "0123456789ab" })
     expect(classifyStreamPayload({ type: "openchamber:space-permission-stream", properties: { spaceId: "bad", status: "connected" } }, undefined))

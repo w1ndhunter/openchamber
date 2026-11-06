@@ -92,6 +92,12 @@ export const GATEKEEPER_CONTROL_PORT = 9099;
 const GATEKEEPER_CORRIDOR_URL = `http://${GATEKEEPER_ALIAS}:${GATEKEEPER_CORRIDOR_PORT}`;
 /** The URL inside the space that reaches a grant's upstream through the window. */
 export const spaceWindowUrl = (grantId) => `http://${GATEKEEPER_ALIAS}:${GATEKEEPER_WINDOW_PORT}/model/${grantId}`;
+// The corridor reads the method of every request, which means it ends the space's TLS. The space
+// trusts the certificate the gatekeeper signs with, and fetches it from the window before its own
+// server starts. The file lives in the tmpfs: every start writes it again, and a start with no
+// way out fails closed, because nothing else in the image trusts that authority.
+const SPACE_CA_PATH = '/tmp/openchamber-ca.pem';
+const GATEKEEPER_CA_URL = `http://${GATEKEEPER_ALIAS}:${GATEKEEPER_WINDOW_PORT}/ca`;
 
 // The gatekeeper's program arrives over `exec` on stdin, into the container's tmpfs. It is far
 // larger than the tools filler, and a `node -e` argument of that size was never tried on Windows.
@@ -173,11 +179,27 @@ export const SPACE_ENVIRONMENT = Object.freeze({
   OPENCHAMBER_SPACE_PERMISSION_DEFAULT_FILE: SPACE_PERMISSION_DEFAULT_PATH,
   OPENCHAMBER_SPACE_TASK_TITLE_FILE: SPACE_AGENT_TASK_TITLE_PATH,
   OPENCHAMBER_SPACE_USER_TASK_TITLE_FILE: SPACE_USER_TASK_TITLE_PATH,
+  // The corridor ends TLS, so every program in the space that speaks TLS must trust the
+  // gatekeeper's own authority. Each variable is the spelling its program reads. A program that
+  // reads none of them does not get out, which is the safe direction.
+  NODE_EXTRA_CA_CERTS: SPACE_CA_PATH,
+  SSL_CERT_FILE: SPACE_CA_PATH,
+  CURL_CA_BUNDLE: SPACE_CA_PATH,
+  GIT_SSL_CAINFO: SPACE_CA_PATH,
+  REQUESTS_CA_BUNDLE: SPACE_CA_PATH,
+  PIP_CERT: SPACE_CA_PATH,
+  npm_config_cafile: SPACE_CA_PATH,
+  // Where the command below fetches that certificate, from the gatekeeper's window.
+  OPENCHAMBER_SPACE_CA_URL: GATEKEEPER_CA_URL,
 });
 
 // Waits for the token file, takes it as the server password, and becomes the server.
 // The password reaches the server through the environment of this one process, never through the container's.
+// The certificate the corridor signs with is fetched first: the gatekeeper runs before the space,
+// and both `NODE_EXTRA_CA_CERTS` and the programs that read the other spellings read it at start.
+// A failed fetch leaves the space with no way out, which is the safe direction.
 const SERVER_SCRIPT = [
+  `i=0; while [ "$i" -lt 5 ] && [ ! -s ${SPACE_CA_PATH} ]; do ${IMAGE_CURL} --fail --silent --show-error --max-time 5 --noproxy '*' -o ${SPACE_CA_PATH} "${GATEKEEPER_CA_URL}" && break; i=$((i+1)); ${IMAGE_SLEEP} 0.2; done;`,
   `while [ ! -s ${SPACE_TOKEN_PATH} ]; do ${IMAGE_SLEEP} 0.2; done;`,
   `OPENCHAMBER_UI_PASSWORD="$(${IMAGE_CAT} ${SPACE_TOKEN_PATH})";`,
   'export OPENCHAMBER_UI_PASSWORD;',
@@ -221,6 +243,14 @@ export const GATEKEEPER_ENVIRONMENT = Object.freeze({ HOME: '/tmp' });
 // tunnel idle limit, and for the same reason: a model answer streams, so silence is what counts.
 const GATEKEEPER_WINDOW_DEADLINE_MS = 300_000;
 
+// No byte in either direction for this long and a tunnel or a request is over. A length like the
+// window's deadline, so a test can watch it pass.
+const GATEKEEPER_TUNNEL_IDLE_MS = 300_000;
+
+// How long a write the user has not approved waits for the answer in the app before the gatekeeper
+// refuses it. Longer than a tool call usually lives would be a wedged agent, not a decision.
+const GATEKEEPER_APPROVAL_TIMEOUT_MS = 60_000;
+
 // How many connections each listener holds at once. The corridor's is twice the tunnel cap, so
 // every handshake a working space makes has room; the window serves one request per connection
 // and holds a socket out for each; only the host talks to the control channel.
@@ -243,6 +273,8 @@ const GATEKEEPER_SCRIPT = [
   String(GATEKEEPER_CORRIDOR_CONNECTIONS),
   String(GATEKEEPER_WINDOW_CONNECTIONS),
   String(GATEKEEPER_CONTROL_CONNECTIONS),
+  String(GATEKEEPER_TUNNEL_IDLE_MS),
+  String(GATEKEEPER_APPROVAL_TIMEOUT_MS),
 ].join(' ');
 
 /** The command of a gatekeeper container. Fixed, and the same for every space. */

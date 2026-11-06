@@ -573,6 +573,19 @@ export function createDockerPlace({ runCommand, openCommandStream = openCommandS
   };
 
   /**
+   * Whether the gatekeeper started after the space did. The gatekeeper's certificate authority
+   * lives in its process, so a newer gatekeeper means the server inside the space fetched the
+   * previous authority and would fail every TLS connection. Comparing start times covers a start
+   * this call made, one a previous call made and then failed, and a gatekeeper the user restarted.
+   */
+  const gatekeeperStartedAfterSpace = async (spaceId, spaceContainer) => {
+    const gatekeeper = await inspectOwnContainer(spaceId, spaceResourceName(spaceId, ROLE_GATEKEEPER));
+    const gatekeeperStarted = Date.parse(gatekeeper?.State?.StartedAt ?? '');
+    const spaceStarted = Date.parse(spaceContainer?.State?.StartedAt ?? '');
+    return Number.isFinite(gatekeeperStarted) && Number.isFinite(spaceStarted) && gatekeeperStarted > spaceStarted;
+  };
+
+  /**
    * Moves a stopped space to the current tools volume. The mounts of a container are fixed
    * at creation, so the container is made again. Everything the space owns lives in its
    * two volumes, so nothing is lost. The old container waits aside until the new one is healthy.
@@ -644,11 +657,15 @@ export function createDockerPlace({ runCommand, openCommandStream = openCommandS
       throw new SpaceError('space_not_found', `Space ${spaceId} has no container in Docker`);
     }
     if (container?.State?.Running === true) {
-      // The space runs, so its own container and its tools are left alone. Its way out is not
-      // the space's container: a gatekeeper that died, from its own memory limit or anything
-      // else, is brought back here. Otherwise the one action a user would take, "start", would
-      // skip the only step that repairs it.
+      // The space runs, so its own files and tools are left alone. Its way out is not the space's
+      // container: a gatekeeper that died, from its own memory limit or anything else, is brought
+      // back here. A gatekeeper newer than the space makes a new certificate authority, and the
+      // server inside fetched the old one when it started, so the space starts again to trust it.
       await startGatekeeper(spaceId);
+      if (await gatekeeperStartedAfterSpace(spaceId, container)) {
+        await docker(['restart', name], CHANGE_TIMEOUT_MS);
+        await server.waitUntilReady(spaceId);
+      }
       return;
     }
     if (waiting) {
@@ -657,8 +674,13 @@ export function createDockerPlace({ runCommand, openCommandStream = openCommandS
       // in the meantime, Docker refuses, and a running container is a space that is already started.
       const problem = container ? await removeStoppedContainer(container.Id) : null;
       if (problem) {
-        if ((await inspectOwnContainer(spaceId, name))?.State?.Running === true) {
+        const running = await inspectOwnContainer(spaceId, name);
+        if (running?.State?.Running === true) {
           await startGatekeeper(spaceId);
+          if (await gatekeeperStartedAfterSpace(spaceId, running)) {
+            await docker(['restart', name], CHANGE_TIMEOUT_MS);
+            await server.waitUntilReady(spaceId);
+          }
           return;
         }
         throw new SpaceError('space_recreate_failed', `Could not remove the unfinished container ${name}: ${problem.message}`);
@@ -685,9 +707,11 @@ export function createDockerPlace({ runCommand, openCommandStream = openCommandS
   };
 
   /**
-   * A running space is never touched. A stopped one picks up the current tools here, and a
-   * half-done move is repaired here and nowhere else. Calls for one space share one run in this
-   * process, so two starts never move the same container at once.
+   * A running space's files and tools are never touched. A stopped one picks up the current tools
+   * here, and a half-done move is repaired here and nowhere else. A running space whose gatekeeper
+   * had to start is restarted itself, because the new gatekeeper makes a new certificate authority
+   * and the server inside fetched the old one. Calls for one space share one run in this process,
+   * so two starts never move the same container at once.
    */
   const start = async (spaceId) => {
     requireSpaceId(spaceId);

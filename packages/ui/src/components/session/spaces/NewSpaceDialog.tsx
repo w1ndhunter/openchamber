@@ -101,6 +101,9 @@ export const NewSpaceDialog: React.FC<NewSpaceDialogProps> = ({ open, onOpenChan
   const [start, setStart] = React.useState<SpaceStart | null>(null);
   const [showFiles, setShowFiles] = React.useState(false);
   const [mode, setMode] = React.useState<'allowlist' | 'open' | null>(null);
+  // Beside the destinations: whether writes go out on their own. Chosen with the two open-internet
+  // options, and asking by default.
+  const [writesAllowed, setWritesAllowed] = React.useState(false);
   const [domains, setDomains] = React.useState<string[]>([]);
   const [domainInput, setDomainInput] = React.useState('');
   const [domainError, setDomainError] = React.useState(false);
@@ -218,7 +221,7 @@ export const NewSpaceDialog: React.FC<NewSpaceDialogProps> = ({ open, onOpenChan
       await startSpaceCreation({
         projectId: project.id,
         setup,
-        request: { projectDirectory: project.path, placeId: place.id, name: name.trim(), start: effectiveStart, network: { mode: effectiveMode, domains: effectiveMode === 'allowlist' ? domains : [] } },
+        request: { projectDirectory: project.path, placeId: place.id, name: name.trim(), start: effectiveStart, network: { mode: effectiveMode, domains: effectiveMode === 'allowlist' ? domains : [], writes: effectiveMode === 'open' && writesAllowed ? 'allow' : 'ask' } },
         access: grants,
         refusalMessage: t('spaces.create.queueRefused'),
       });
@@ -346,7 +349,7 @@ export const NewSpaceDialog: React.FC<NewSpaceDialogProps> = ({ open, onOpenChan
         <SettingsRadioOption
           ariaLabel={t('spaces.create.network.allowlist')}
           selected={effectiveMode === 'allowlist'}
-          onSelect={() => setMode('allowlist')}
+          onSelect={() => { setMode('allowlist'); setWritesAllowed(false); }}
           disabled={!canRestrict}
           label={t('spaces.create.network.allowlist')}
           description={canRestrict ? undefined : t('spaces.create.network.cannotRestrict')}
@@ -378,12 +381,19 @@ export const NewSpaceDialog: React.FC<NewSpaceDialogProps> = ({ open, onOpenChan
           {domainError ? <p className="typography-meta text-status-error">{t('spaces.create.network.domainInvalid')}</p> : null}
         </div>
         <SettingsRadioOption
+          ariaLabel={t('spaces.create.network.openAsk')}
+          selected={effectiveMode === 'open' && !writesAllowed}
+          onSelect={() => { setMode('open'); setWritesAllowed(false); }}
+          label={t('spaces.create.network.openAsk')}
+          description={<span className={cn(effectiveMode === 'open' && !writesAllowed && 'text-status-warning')}>{t('spaces.create.network.openAskWarning')}</span>}
+        />
+        <SettingsRadioOption
           ariaLabel={t('spaces.create.network.open')}
-          selected={effectiveMode === 'open'}
-          onSelect={() => setMode('open')}
+          selected={effectiveMode === 'open' && writesAllowed}
+          onSelect={() => { setMode('open'); setWritesAllowed(true); }}
           label={t('spaces.create.network.open')}
           // What it risks is said in the warning colour once it is the choice.
-          description={<span className={cn(effectiveMode === 'open' && 'text-status-warning')}>{t('spaces.create.network.openWarning')}</span>}
+          description={<span className={cn(effectiveMode === 'open' && writesAllowed && 'text-status-warning')}>{t('spaces.create.network.openWarning')}</span>}
         />
       </SettingsRadioGroup>
     </div>

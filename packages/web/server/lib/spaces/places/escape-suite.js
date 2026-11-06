@@ -599,13 +599,10 @@ export function runEscapeSuite(title, { enabled = true, setup }) {
 
       // There is no live "carries ten megabytes" test here, and that is deliberate. It pulled a
       // published tarball from the npm registry, so a bad minute at somebody else's service made a
-      // run inconclusive, which is a failed run with no evidence in it. What it was for — that a
-      // large transfer arrives whole — is proved better without a network: `joinSockets` in
-      // `gatekeeper-program.test.js` carries four megabytes full duplex while the space is still
-      // uploading and compares sha256, it is byte-exact, and it fails when the teardown goes back.
-      // The live half of the claim, that the corridor carries to a real host through a real
-      // container, is the positive control above. Do not add a large download back thinking this
-      // path is uncovered.
+      // run inconclusive, which is a failed run with no evidence in it. The corridor forwards a
+      // body and an answer with `pipe` on the decrypted connection, and the live check in the
+      // module documentation fetched a real page through it. The live half of the claim, that the
+      // corridor reaches a real host through a real container, is the positive control above.
 
       it('cannot reach auth.openai.com in allowlist mode, even with it on the list', async () => {
         await allow(['auth.openai.com', 'example.com']);

@@ -26,8 +26,8 @@ animation. Do not restore separate draft and session composer branches:
 remounting the editor loses focus and interrupts the transition. Keep the
 existing mobile fixed-position rules unchanged.
 
-`ComposerFloatingPanel` is the shared frame for `BtwPanel`, `PermissionDock`
-and `FormDock`. They mount inside the composer form, outside both the
+`ComposerFloatingPanel` is the shared frame for `BtwPanel`, `PermissionDock`,
+`FormDock` and `SpaceApprovalDock`. They mount inside the composer form, outside both the
 full editor and collapsed mobile pill, with one absolute `bottom-full`
 anchor, input-column width, gap, and glass surface. Appearing, disappearing,
 or collapsing a panel does not resize the transcript or composer.
@@ -104,6 +104,14 @@ directory, not to a turn. `useScopedBlockingForms` appends the directory's
 sheet's inline card) offer it from every session of that directory, and the
 reply resolves its directory from the store that holds the form.
 
+`SpaceApprovalDock` is a write an isolated space is holding for the user's
+answer, in the same frame and place as a permission request: the URL the
+space wrote (path and query), the space's name, and Allow once / Deny. A
+write belongs to the space and not to a turn, so the dock shows it in every
+chat of that space, and the space's row in the sidebar carries a count while
+no chat of it is open. The gatekeeper keeps the socket, so the dock must not
+be the only trace of a wait.
+
 `PermissionDock` is the agent's permission requests for the composer's
 session, its subagents' included, in the same frame: one dot per pending
 request with the current one solid, the request's tool in the header, and
@@ -118,8 +126,8 @@ requests; both render the request through `PermissionRequestContent` and
 `PermissionActions`.
 
 A read-only chat (a subagent session, an archived space) mounts no composer,
-so `ChatContainer` mounts `PermissionDock` and `FormDock` itself above the
-read-only banner. A subagent's requests then show in its own chat and in its
+so `ChatContainer` mounts `PermissionDock`, `FormDock` and
+`SpaceApprovalDock` itself above the read-only banner. A subagent's requests then show in its own chat and in its
 parent's; both read the same store entries, so answering in one clears the
 other. The parent finds the subagent through the directory store's session
 list, which is why trimming that list never drops a session with a pending

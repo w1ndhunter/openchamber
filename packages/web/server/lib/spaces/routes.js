@@ -42,6 +42,9 @@ const STATUS_BY_CODE = new Map([
   ['provider_not_supported', 400],
   ['provider_not_found', 404],
   ['invalid_domain', 400],
+  ['invalid_write_access', 400],
+  ['invalid_approval', 400],
+  ['too_many_write_access', 409],
   ['invalid_idle_stop', 400],
   ['network_is_open', 409],
   ['too_many_domains', 409],
@@ -354,6 +357,28 @@ export function registerSpaceRoutes(app, { getJourney, getPlaces = () => [], get
   // A domain added to the allowlist of a running space, live; the record keeps it for the next start.
   app.post(`${SPACES_ROUTE}/:id/network/domains`, withJourney(async (journey, req, res) => {
     res.json(await journey.openDomain(spaceIdOf(req), requireBody(req)));
+  }));
+
+  // A method the user approves for one destination, live; the record keeps it for the next start.
+  app.post(`${SPACES_ROUTE}/:id/writes`, withJourney(async (journey, req, res) => {
+    res.json(await journey.approveWrites(spaceIdOf(req), requireBody(req)));
+  }));
+
+  // A method the user takes back, live, and kept for the next start; an empty `methods` takes
+  // back every method for the destination. The next write asks again.
+  app.delete(`${SPACES_ROUTE}/:id/writes`, withJourney(async (journey, req, res) => {
+    res.json(await journey.revokeWrites(spaceIdOf(req), requireBody(req)));
+  }));
+
+  // A method the user denies for a destination, live, and kept for the next start; an empty
+  // `methods` clears it, which is how the access dialog gives the prompt back.
+  app.post(`${SPACES_ROUTE}/:id/denials`, withJourney(async (journey, req, res) => {
+    res.json(await journey.denyWrites(spaceIdOf(req), requireBody(req)));
+  }));
+
+  // The user's answer for a write that is waiting: allowed sends it on, anything else refuses it.
+  app.post(`${SPACES_ROUTE}/:id/approvals`, withJourney(async (journey, req, res) => {
+    res.json(await journey.decideWriteApproval(spaceIdOf(req), requireBody(req)));
   }));
 
   // The project's setup commands, again: answers once they began; each step follows as an event.

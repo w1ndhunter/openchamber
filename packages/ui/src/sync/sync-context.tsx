@@ -95,6 +95,7 @@ import { useMcpStore } from "@/stores/useMcpStore"
 import { resolveGlobalSessionDirectory, useGlobalSessionsStore } from "@/stores/useGlobalSessionsStore"
 import { spaceIdOfDirectory } from "@/lib/spaces/space-route"
 import { isDirectoryOfKnownSpace, isSpaceDirectoryStopped, isSpaceStopped, knownSpaceIds, refreshSpacesJourney, spaceIdsGone, spacesRuntimeGeneration, useSpacesStore } from "@/lib/spaces/spaces-store"
+import { useSpaceApprovalsStore } from "@/lib/spaces/space-approvals"
 import { cleanupPersistedSessionState } from "./session-deletion-cleanup"
 import { toast } from "@/components/ui"
 import { appendErrorNotification, markSessionViewed } from "./notification-store"
@@ -3193,6 +3194,8 @@ export function SyncProvider(props: {
       previous = next
       if (gone.length === 0) return
       const goneIds = new Set(gone)
+      // A write waiting there went with the space's gatekeeper; its prompt must not stay.
+      for (const spaceId of goneIds) useSpaceApprovalsStore.getState().forgetSpace(spaceId)
       for (const directory of Array.from(childStores.children.keys())) {
         const spaceId = spaceIdOfDirectory(directory)
         if (spaceId !== null && goneIds.has(spaceId)) childStores.forgetDirectory(directory)
@@ -3340,6 +3343,11 @@ export function SyncProvider(props: {
       onSpaceSetup: () => {
         // The setup commands of a space moved on; what they do now is in the list.
         void refreshSpacesJourney().catch(() => undefined)
+      },
+      onSpaceApproval: (request) => {
+        if (runtimeKey !== getRuntimeKey()) return
+        // A write is held until the user answers; the prompt is the only place it can be seen.
+        useSpaceApprovalsStore.getState().note(request)
       },
       onSpacePermissionStream: (spaceId) => {
         if (runtimeKey !== getRuntimeKey()) return

@@ -11,6 +11,7 @@ import React from 'react';
 import { Icon } from '@/components/icon/Icon';
 import { useI18n } from '@/lib/i18n';
 import type { SpaceEntry } from '@/lib/spaces/spaces-api';
+import { useSpaceApprovalsStore } from '@/lib/spaces/space-approvals';
 import { useSpacesStore } from '@/lib/spaces/spaces-store';
 import { cn, formatPathForDisplay } from '@/lib/utils';
 import { useDirectoryStore } from '@/stores/useDirectoryStore';
@@ -46,7 +47,9 @@ const NetworkBadge: React.FC<{ network: SpaceEntry['network'] }> = ({ network })
     return <span className={cn(BADGE_CLASS, 'text-muted-foreground bg-[var(--surface-subtle)]')}>{t('spaces.row.network.unknown')}</span>;
   }
   if (network.mode === 'open') {
-    return <span className={cn(BADGE_CLASS, 'text-[var(--status-warning)] bg-[var(--status-warning)]/10')}>{t('spaces.create.network.open')}</span>;
+    // Two open networks: one still asks before a write leaves, the other does not.
+    const key = network.writes === 'allow' ? 'spaces.create.network.open' : 'spaces.create.network.openAsk';
+    return <span className={cn(BADGE_CLASS, 'text-[var(--status-warning)] bg-[var(--status-warning)]/10')}>{t(key)}</span>;
   }
   return <span className={cn(BADGE_CLASS, 'text-[var(--status-success)] bg-[var(--status-success)]/10')}>{t('spaces.row.network.allowlist')}</span>;
 };
@@ -74,6 +77,8 @@ export const SpaceRow: React.FC<{
 }> = ({ entry, actions, showFolder = false }) => {
   const { t } = useI18n();
   const bytes = useSpaceDiskBytes(entry.placeId, entry.id);
+  const approvals = useSpaceApprovalsStore((state) => state.requests);
+  const waiting = approvals.filter((request) => request.spaceId === entry.id).length;
   const { actions: available, applicable, busy, unavailable } = useSpaceActions(entry.id);
   // What a space is mostly opened here for stays in sight: its work back to the project, and
   // Start or Stop. The rest, rarer, is in the menu beside them.
@@ -89,6 +94,14 @@ export const SpaceRow: React.FC<{
           <p className="typography-ui-label min-w-0 max-w-full truncate text-foreground">{entry.name}</p>
           <span className="typography-meta text-muted-foreground">{meta}</span>
           <NetworkBadge network={entry.network} />
+          {/* A write the gatekeeper is holding; the prompt itself sits in that space's chat. */}
+          {waiting > 0 ? (
+            <span className={cn(BADGE_CLASS, 'text-[var(--status-warning)] bg-[var(--status-warning)]/10')}>
+              {waiting === 1
+                ? t('spaces.row.approvalWaitingOne')
+                : t('spaces.row.approvalWaitingMany', { count: String(waiting) })}
+            </span>
+          ) : null}
         </div>
         {showFolder ? <FolderLine folder={entry.projectFolder} /> : null}
         <SpaceStatusLines spaceId={entry.id} className="pt-1" hideStopped />
