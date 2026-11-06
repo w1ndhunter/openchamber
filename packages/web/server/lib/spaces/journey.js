@@ -173,6 +173,9 @@ const applyRequestSchema = z.discriminatedUnion('as', [
 // requests inside, well under this.
 const REPAIR_BUSY_ATTEMPTS = 40;
 const REPAIR_BUSY_PAUSE_MS = 250;
+// How long the watch for waiting writes rests after a failed look, doubling to the cap.
+const APPROVAL_WATCH_RETRY_MS = 1_000;
+const APPROVAL_WATCH_RETRY_CAP_MS = 30_000;
 const pause = (milliseconds) => new Promise((resolve) => { setTimeout(resolve, milliseconds); });
 
 const failureOf = (error) => ({
@@ -968,10 +971,12 @@ export function createSpaceJourney({
     approvalWatches.set(spaceId, watch);
     const loop = async () => {
       let since = 0;
+      let retryMs = APPROVAL_WATCH_RETRY_MS;
       while (!watch.stopped) {
         try {
           const answer = await gatekeeper.waitForApprovals(spaceId, { since });
           since = answer.since;
+          retryMs = APPROVAL_WATCH_RETRY_MS;
           for (const waiting of answer.requests) {
             if (watch.stopped) return;
             announce(spaceId, {
@@ -991,7 +996,10 @@ export function createSpaceJourney({
           if (watch.stopped) return;
           // A gatekeeper that is gone or restarting is not an error of the space: the next look
           // finds it or the space stops. Logged once per attempt would be noise, so it is not.
-          await pause(1_000);
+          // The pause doubles while it keeps failing: a Docker that is off would otherwise cost a
+          // failing `docker exec` every second for every space, for as long as the host runs.
+          await pause(retryMs);
+          retryMs = Math.min(retryMs * 2, APPROVAL_WATCH_RETRY_CAP_MS);
         }
       }
     };
@@ -1016,8 +1024,7 @@ export function createSpaceJourney({
    * The user's answer for one write that is waiting: allowed sends it on, anything else refuses
    * it. A wait that is already gone is not an error: it answers `settled: false`, because the
    * prompt arrived after the gatekeeper's limit. The gatekeeper is answered without waiting for
-   * an apply in progress; the record is written inside the space's turn, because it is a
-   * read-modify-write that another grant or domain change must not race.
+   * an apply in progress, and nothing is written to the record.
    */
   const decideWriteApproval = async (spaceId, request) => {
     requireNotPending(spaceId);
@@ -1025,25 +1032,8 @@ export function createSpaceJourney({
     if (!parsed.success) throw new SpaceError('invalid_approval', 'An answer names the waiting write and whether it is allowed.');
     const space = await requireListed(spaceId);
     if (space.state !== 'running') throw new SpaceError('space_not_running', 'A write waits for the user only in a running space.');
-    const answer = await gatekeeper.decideApproval(spaceId, { id: parsed.data.requestId, allowed: parsed.data.allowed });
-    // A denial stands for that destination: the gatekeeper holds it from now on, and the record
-    // keeps it for the next start. Read back rather than guessed here, so the destination is the
-    // one the gatekeeper actually refused and the host never names it in an answer.
-    if (parsed.data.allowed === false) await exclusive(spaceId, () => rememberDenials(spaceId));
-    return answer;
-  };
-
-  /** What the gatekeeper refuses without asking, written into the record; a failure only logs. */
-  const rememberDenials = async (spaceId) => {
-    try {
-      const policy = await gatekeeper.readPolicy(spaceId);
-      const denials = writeAccessSchema.parse(policy.denials);
-      if (records.update(spaceId, { deniedWrites: denials }).status !== 'ok') {
-        logger.warn?.(`[spaces] the denied methods of space ${spaceId} could not be remembered, so they close at the next start`);
-      }
-    } catch (error) {
-      logger.warn?.(`[spaces] the denied methods of space ${spaceId} were not read back: ${error?.code ?? error?.message ?? error}`);
-    }
+    // Either answer covers this one request; a standing denial comes from the access dialog.
+    return gatekeeper.decideApproval(spaceId, { id: parsed.data.requestId, allowed: parsed.data.allowed });
   };
 
   /**

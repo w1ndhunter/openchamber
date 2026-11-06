@@ -72,15 +72,6 @@ const journeyWith = ({ readHostLogin = null, hostProviders = undefined, failAt =
     decideApproval: async (spaceId, decision) => {
       calls.push(['decideApproval', spaceId, decision]);
       fail('decideApproval');
-      // A refusal stands for its destination, as the gatekeeper records it.
-      const refused = decision.allowed === false ? waitingApprovals.find((request) => request.id === decision.id) : undefined;
-      if (refused) {
-        const denials = heldDenials.get(spaceId) ?? [];
-        const known = denials.find((entry) => entry.host === refused.host);
-        if (known) { if (!known.methods.includes(refused.method)) known.methods.push(refused.method); }
-        else denials.push({ host: refused.host, methods: [refused.method] });
-        heldDenials.set(spaceId, denials);
-      }
       return { settled: true };
     },
     addGrant: async (spaceId, grant) => { calls.push(['addGrant', spaceId, grant]); fail('addGrant'); if (!held.has(spaceId)) held.set(spaceId, new Set()); held.get(spaceId).add(grant.id); },
@@ -939,15 +930,26 @@ describe('the journey: writes waiting for the user', () => {
     expect(made.calls).toEqual([['decideApproval', id, { id: 3, allowed: true }]]);
   });
 
-  it('keeps a denial in the record, and clears it when the dialog says so', async () => {
+  it('takes a no in the prompt for that one write, and keeps nothing in the record', async () => {
     const made = journeyWith({ waitingApprovals: [waiting] });
     const { id } = await made.journey.createSpace(REQUEST);
     expect(await until(() => made.events.some((event) => event.spaceId === id && event.requestId === 3))).toBe(true);
 
+    made.calls.splice(0);
     expect(await made.journey.decideWriteApproval(id, { requestId: 3, allowed: false })).toEqual({ settled: true });
+    expect(made.calls).toEqual([['decideApproval', id, { id: 3, allowed: false }]]);
+    expect(made.records.read(id).record.deniedWrites).toEqual([]);
+  });
+
+  it('keeps a denial from the dialog in the record, and clears it when the dialog says so', async () => {
+    const made = journeyWith();
+    const { id } = await made.journey.createSpace(REQUEST);
+    await until(() => steps(made.events, id).includes('ready'));
+    expect(await made.journey.denyWrites(id, { host: 'api.github.com', methods: ['POST'] })).toEqual({ deniedWrites: [{ host: 'api.github.com', methods: ['POST'] }] });
     expect(made.records.read(id).record.deniedWrites).toEqual([{ host: 'api.github.com', methods: ['POST'] }]);
 
     // The dialog gives the prompt back by clearing the destination.
+    made.calls.splice(0);
     expect(await made.journey.denyWrites(id, { host: 'api.github.com', methods: [] })).toEqual({ deniedWrites: [] });
     expect(made.calls.find(([name]) => name === 'setDenials')).toEqual(['setDenials', id, []]);
 

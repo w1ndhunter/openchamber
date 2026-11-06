@@ -720,7 +720,13 @@ async function openTunnel(request, clientSocket, head) {
       secure.destroy();
       return;
     }
-    secure.openchamberTarget = { host: name, port, address: resolved.address, family: resolved.family };
+    // One keep-alive pool per decrypted connection, so the space's own reuse of its connection
+    // carries through to the upstream: without it every request of an `npm install` paid its own
+    // TCP and TLS handshake. It only ever reaches the address checked above, and goes with the
+    // connection that owns it.
+    const agent = new https.Agent({ keepAlive: true });
+    secure.on('close', () => agent.destroy());
+    secure.openchamberTarget = { host: name, port, address: resolved.address, family: resolved.family, agent };
     guardTunnelIdle(secure);
     decrypted.emit('connection', secure);
   });
@@ -774,16 +780,27 @@ function requestPathOf(request, target) {
  * a GET, while anything that could mutate (or that this cannot read with certainty) still waits
  * for the user. `application/graphql` carries the document itself; everything else is the JSON
  * envelope the guide at graphql.org describes.
+ *
+ * Only the path makes a request GraphQL. The media type is the space's to choose, and a server
+ * that ignores it would take `{ x }` sent as `application/graphql` to any URL as a plain write.
  */
 const GRAPHQL_BODY_LIMIT = 1024 * 1024;
 const GRAPHQL_PATH_PATTERN = /\/graphql(\.json)?\/?$/i;
 const GRAPHQL_MEDIA_TYPE = 'application/graphql';
 
-function isGraphqlRequest(request, path) {
-  if (GRAPHQL_PATH_PATTERN.test(path.split('?')[0])) return true;
-  const type = String(request.headers['content-type'] ?? '').toLowerCase().split(';')[0].trim();
-  return type === GRAPHQL_MEDIA_TYPE;
+function isGraphqlRequest(path) {
+  return GRAPHQL_PATH_PATTERN.test(path.split('?')[0]);
 }
+
+// A `POST` that only reads, by its path: git's fetch and clone (smart HTTP sends the wants as a
+// POST to `git-upload-pack`, on every git host) and npm's audit after an install. Both would
+// otherwise wait for the user on every clone and every install. A push is `git-receive-pack`.
+const READ_ONLY_POST_PATTERNS = [
+  /\/git-upload-pack$/,
+  /\/-\/npm\/v1\/security\/(advisories\/bulk|audits\/quick)$/,
+];
+
+const isReadOnlyPost = (method, path) => method === 'POST' && READ_ONLY_POST_PATTERNS.some((pattern) => pattern.test(path.split('?')[0]));
 
 function isRawGraphqlRequest(request) {
   return String(request.headers['content-type'] ?? '').toLowerCase().split(';')[0].trim() === GRAPHQL_MEDIA_TYPE;
@@ -1001,7 +1018,7 @@ function forwardRequest(request, response, target, path, buffered) {
     headers,
     servername: target.host,
     lookup: fixedLookup(target.address, target.family),
-    agent: false,
+    agent: target.agent,
   }, (answer) => {
     clearTimeout(connectTimer);
     const answerHeaders = {};
@@ -1025,7 +1042,9 @@ function forwardRequest(request, response, target, path, buffered) {
     outgoing.destroy();
   }, CONNECT_TIMEOUT_MS);
   outgoing.on('socket', (socket) => {
-    socket.once(socket.encrypted ? 'secureConnect' : 'connect', () => clearTimeout(connectTimer));
+    // A socket from the pool is already connected and will not say so again.
+    if (outgoing.reusedSocket) clearTimeout(connectTimer);
+    else socket.once(socket.encrypted ? 'secureConnect' : 'connect', () => clearTimeout(connectTimer));
   });
   outgoing.setTimeout(TUNNEL_IDLE_MS, () => {
     given = true;
@@ -1119,23 +1138,12 @@ function wakeApprovalWaiters() {
   }
 }
 
-/** A destination and method the user refused, kept within the list the host can read back. */
-function rememberDeniedWrite(host, method) {
-  const known = deniedWrites.get(host);
-  if (known) {
-    known.add(method);
-    return;
-  }
-  if (deniedWrites.size >= MAX_WRITE_ENTRIES) return;
-  deniedWrites.set(host, new Set([method]));
-}
-
 /**
- * The outcome of a wait: the request goes out, or it is refused with the reason. `rememberDeny`
- * is set only for the user's own answer: a wait that ran out of time is refused, not decided, and
- * must not silence that destination for the rest of the process.
+ * The outcome of a wait: the request goes out, or it is refused with the reason. Either answer
+ * covers this one request: a standing denial is set from the access dialog, never from a prompt,
+ * so one "no" to one URL does not silently refuse every later write to that destination.
  */
-function settleApproval(entry, allow, { rememberDeny = false } = {}) {
+function settleApproval(entry, allow) {
   if (pendingApprovals.get(entry.id) !== entry) return;
   pendingApprovals.delete(entry.id);
   clearTimeout(entry.timer);
@@ -1144,8 +1152,6 @@ function settleApproval(entry, allow, { rememberDeny = false } = {}) {
     forwardRequest(entry.request, entry.response, entry.target, entry.path, entry.buffered);
     return;
   }
-  // The answer stands for the destination: the next identical write is refused without asking.
-  if (rememberDeny) rememberDeniedWrite(entry.target.host, entry.method);
   // Nothing of a refused write has been read: a request the user did not allow is not stored.
   entry.request.resume();
   record('corridor', entry.target.host, entry.target.port, 'deny:method', entry.method);
@@ -1225,7 +1231,7 @@ function decideApproval(body) {
   if (!Number.isSafeInteger(id) || id <= 0) return { status: 400, error: 'id is the number the gatekeeper gave the wait' };
   const entry = pendingApprovals.get(id);
   if (!entry) return { status: 404, error: 'no write is waiting with that id; it was answered or its time passed' };
-  settleApproval(entry, body.allow === true, { rememberDeny: body.allow !== true });
+  settleApproval(entry, body.allow === true);
   return { status: 200 };
 }
 
@@ -1263,7 +1269,7 @@ function serveDecryptedRequest(request, response) {
     refuseDecrypted(response, 403, REFUSED, 'the gatekeeper does not take this destination');
     return;
   }
-  if (SAFE_METHODS.has(method)) {
+  if (SAFE_METHODS.has(method) || isReadOnlyPost(method, path)) {
     forwardRequest(request, response, target, path);
     return;
   }
@@ -1274,33 +1280,29 @@ function serveDecryptedRequest(request, response) {
     return;
   }
   // A method the user already denied there is refused at once: the answer stands until cleared.
-  // One record a minute for the destination: a retrying agent would otherwise fill the journal.
-  if (deniedWrites.get(target.host)?.has(method)) {
-    // The denial covers writes there, not reads that arrive as one: a GraphQL document that
-    // only queries is classified as usual and goes out; a mutation is refused without asking.
-    if ((method === 'POST' || method === 'PUT') && isGraphqlRequest(request, path)) {
-      decideGraphqlRequest(request, response, target, path, method, { denied: true });
-      return;
-    }
+  const denied = deniedWrites.get(target.host)?.has(method) === true;
+  // The user chose an open internet whose writes go out on their own: no wait, no prompt.
+  if (!denied && writePolicy === 'allow' && WRITABLE_METHODS.includes(method)) {
+    record('corridor', target.host, target.port, 'allow', method);
+    forwardRequest(request, response, target, path);
+    return;
+  }
+  // A GraphQL document that can only read is a GET in a POST's clothing (GitHub and most servers
+  // take reads this way), so it is read and sent on, at a denied destination too: the denial is
+  // about writes. A mutation, or anything the classifier cannot read with certainty, still waits
+  // for the user, or is refused without asking where the method is denied.
+  if ((method === 'POST' || method === 'PUT') && isGraphqlRequest(path)) {
+    decideGraphqlRequest(request, response, target, path, method, { denied });
+    return;
+  }
+  if (denied) {
+    // One record a minute for the destination: a retrying agent would otherwise fill the journal.
     request.resume();
     noteStandingDenial(target.host, target.port, method);
     refuseDecrypted(response, 403, REFUSED, 'the user did not allow this write');
     return;
   }
-  // The user chose an open internet whose writes go out on their own: no wait, no prompt.
-  if (writePolicy === 'allow' && WRITABLE_METHODS.includes(method)) {
-    record('corridor', target.host, target.port, 'allow', method);
-    forwardRequest(request, response, target, path);
-    return;
-  }
   if (WRITABLE_METHODS.includes(method)) {
-    // A GraphQL document that can only read is a GET in a POST's clothing (GitHub and most
-    // servers take reads this way), so it is read and sent on; a mutation, or anything the
-    // classifier cannot read with certainty, still waits for the user.
-    if ((method === 'POST' || method === 'PUT') && isGraphqlRequest(request, path)) {
-      decideGraphqlRequest(request, response, target, path, method);
-      return;
-    }
     // The user decides, and the request waits for the answer: see "Waiting for the user".
     holdForApproval(request, response, target, path, method);
     return;
@@ -1442,7 +1444,7 @@ async function serveWindow(request, response) {
   request.on('error', () => {});
   // The space fetches the certificate the corridor signs with, before its own server starts. It
   // is public, and the path is reserved: no grant id may be `ca`.
-  if (request.method === 'GET' && (request.url === '/ca' || request.url === '/ca.pem')) {
+  if (request.method === 'GET' && request.url === '/ca') {
     if (!authorityCertificatePem) {
       answerJson(response, 503, { error: 'the gatekeeper has no certificate yet' });
       return;
@@ -1711,16 +1713,6 @@ async function serveControl(request, response) {
       writes: Array.from(writeAccess, ([host, methods]) => ({ host, methods: Array.from(methods).sort() })),
       denials: Array.from(deniedWrites, ([host, methods]) => ({ host, methods: Array.from(methods).sort() })),
     });
-    return;
-  }
-  if (request.method === 'GET' && path === '/ca') {
-    // The certificate the space trusts. It is public: only the gatekeeper's memory holds the key.
-    if (!authorityCertificatePem) {
-      answerJson(response, 503, { error: 'the gatekeeper has no certificate yet' });
-      return;
-    }
-    response.writeHead(200, { 'content-type': 'application/x-pem-file', 'cache-control': 'no-store' });
-    response.end(authorityCertificatePem);
     return;
   }
   if (request.method === 'GET' && path === '/pending') {

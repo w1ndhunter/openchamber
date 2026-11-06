@@ -242,7 +242,7 @@ describe('gatekeeper program', () => {
       head += chunk;
       if (!head.includes('\r\n\r\n')) return;
       socket.removeListener('data', onHead);
-      control('GET', '/ca').then(({ body: ca }) => {
+      throughWindow('/ca').then(({ body: ca }) => {
         const secure = tls.connect({ socket, servername, ca }, () => {
           secure.write(`${method} ${path} HTTP/1.1\r\nHost: ${hostHeader}\r\n${extra}Connection: close\r\nContent-Length: ${payload === null ? 0 : payload.length}\r\n\r\n`);
           if (payload !== null) secure.write(payload);
@@ -554,7 +554,7 @@ describe('gatekeeper program', () => {
 
     afterEach(async () => {
       await clearPending();
-      // A refusal now stands for its destination; each test starts from asking again.
+      // A denial from the dialog stands for its destination; each test starts from asking again.
       expect((await control('POST', '/denials', { entries: [] })).status).toBe(200);
     });
 
@@ -611,18 +611,28 @@ describe('gatekeeper program', () => {
       expect((await recordsSince(at)).some((record) => record.decision === 'deny:method' && record.method === 'PUT')).toBe(true);
     });
 
-    it('stands a denial for the destination, and asks again once it is cleared', async () => {
-      const at = await journalMark();
+    it('takes a no in the prompt for that one write, and asks again for the next', async () => {
       const held = secureRequest('POST', '/');
       const [waiting] = await waitForPending();
       expect((await answerPending(waiting.id, false)).status).toBe(200);
       expect((await held).status).toMatch(/403/);
+      expect((await control('GET', '/policy').then((answer) => JSON.parse(answer.body))).denials).toEqual([]);
 
-      // The same write again: refused at once, and nothing starts waiting.
+      const again = secureRequest('POST', '/');
+      const [second] = await waitForPending();
+      expect(second.id).toBeGreaterThan(waiting.id);
+      expect((await answerPending(second.id, false)).status).toBe(200);
+      expect((await again).status).toMatch(/403/);
+    });
+
+    it('stands a denial from the dialog for the destination, and asks again once it is cleared', async () => {
+      const at = await journalMark();
+      expect((await control('POST', '/denials', { entries: [{ host: 'example.com', methods: ['POST'] }] })).status).toBe(200);
+
+      // The write is refused at once, and nothing starts waiting.
       expect((await secureRequest('POST', '/')).status).toMatch(/403/);
       expect(await pendingNow()).toEqual([]);
-      expect((await recordsSince(at)).filter((record) => record.decision === 'deny:method' && record.method === 'POST')).toHaveLength(2);
-      expect((await control('GET', '/policy').then((answer) => JSON.parse(answer.body))).denials).toEqual([{ host: 'example.com', methods: ['POST'] }]);
+      expect((await recordsSince(at)).filter((record) => record.decision === 'deny:method' && record.method === 'POST')).toHaveLength(1);
 
       // Clearing it gives the prompt back.
       expect((await control('POST', '/denials', { entries: [] })).status).toBe(200);
@@ -658,6 +668,27 @@ describe('gatekeeper program', () => {
       expect((await recordsSince(at)).some((record) => record.decision === 'deny:method')).toBe(false);
     });
 
+    it('asks for a write that only calls itself GraphQL by its media type', async () => {
+      // A server that ignores the media type takes this body as a plain write, so the path decides.
+      const held = secureRequest('POST', '/paste', { body: '{ hi }', headers: { 'content-type': 'application/graphql' } });
+      const [waiting] = await waitForPending();
+      expect(waiting).toMatchObject({ method: 'POST', url: 'https://example.com/paste' });
+      expect((await answerPending(waiting.id, false)).status).toBe(200);
+      expect((await held).status).toMatch(/403/);
+    });
+
+    it('sends git\'s fetch and npm\'s audit on without asking, and still asks for a push', async () => {
+      for (const path of ['/owner/repo.git/git-upload-pack', '/-/npm/v1/security/advisories/bulk', '/-/npm/v1/security/audits/quick']) {
+        const answer = await secureRequest('POST', path, { body: '0000' });
+        expect(answer.status).not.toMatch(/403/);
+        expect(await pendingNow()).toEqual([]);
+      }
+      const held = secureRequest('POST', '/owner/repo.git/git-receive-pack', { body: '0000' });
+      const [waiting] = await waitForPending();
+      expect((await answerPending(waiting.id, false)).status).toBe(200);
+      expect((await held).status).toMatch(/403/);
+    });
+
     it('asks for a GraphQL mutation, and sends it on only after the user allows it', async () => {
       const mutation = JSON.stringify({ query: 'mutation AddStar { addStar(input: {}) { clientMutationId } }' });
       const held = secureRequest('POST', '/graphql', { body: mutation, headers: { 'content-type': 'application/json' } });
@@ -668,11 +699,10 @@ describe('gatekeeper program', () => {
     });
 
     it('keeps a denial for the write, and still lets that host\'s GraphQL reads through', async () => {
+      expect((await control('POST', '/denials', { entries: [{ host: 'example.com', methods: ['POST'] }] })).status).toBe(200);
       const mutation = JSON.stringify({ query: 'mutation { evil }' });
-      const held = secureRequest('POST', '/graphql', { body: mutation, headers: { 'content-type': 'application/json' } });
-      const [waiting] = await waitForPending();
-      expect((await answerPending(waiting.id, false)).status).toBe(200);
-      expect((await held).status).toMatch(/403/);
+      expect((await secureRequest('POST', '/graphql', { body: mutation, headers: { 'content-type': 'application/json' } })).status).toMatch(/403/);
+      expect(await pendingNow()).toEqual([]);
 
       // The denial stands for the mutation; a query at the same destination is not that write.
       const query = JSON.stringify({ query: 'query { viewer { login } }' });
