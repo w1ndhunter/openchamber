@@ -568,8 +568,10 @@ describe('gatekeeper program', () => {
 
     afterEach(async () => {
       await clearPending();
-      // A refusal now stands for its destination; each test starts from asking again.
+      // A refusal now stands for its destination, or for the turn; each test starts from asking again.
       expect((await control('POST', '/denials', { entries: [] })).status).toBe(200);
+      expect((await control('POST', '/writes', { entries: [] })).status).toBe(200);
+      expect((await control('POST', '/turn-end', {})).status).toBe(200);
     });
 
     it('carries a GET without any approval', async () => {
@@ -644,6 +646,156 @@ describe('gatekeeper program', () => {
       const [second] = await waitForPending();
       expect((await answerPending(second.id, true)).status).toBe(200);
       expect((await again).status).not.toMatch(/403/);
+    });
+
+    it('stands a deny once for the rest of the turn, and asks again once the turn ends', async () => {
+      const held = secureRequest('POST', '/');
+      const [waiting] = await waitForPending();
+      expect((await control('POST', '/approvals', { id: waiting.id, allow: false, remember: false })).status).toBe(200);
+      const refused = await held;
+      expect(refused.status).toMatch(/403/);
+      // The body tells the agent it is a decision, so a retry is not worth another round.
+      expect(refused.body).toContain('do not retry');
+      // Not a standing answer: the dialog has nothing to clear, and the record keeps nothing.
+      expect((await control('GET', '/policy').then((answer) => JSON.parse(answer.body))).denials).toEqual([]);
+
+      // The agent's retry in the same turn meets the refusal at once, without a prompt.
+      const retry = await secureRequest('POST', '/');
+      expect(retry.status).toMatch(/403/);
+      expect(await pendingNow()).toEqual([]);
+
+      // The turn ends: the next try waits for the user again.
+      expect((await control('POST', '/turn-end', {})).status).toBe(200);
+      const again = secureRequest('POST', '/');
+      const [second] = await waitForPending();
+      expect(second.id).not.toBe(waiting.id);
+      expect((await answerPending(second.id, true)).status).toBe(200);
+      expect((await again).status).not.toMatch(/403/);
+    });
+
+    it('stands a deny once for the path or the host the space chose', async () => {
+      // The space's scope is the path: only that path stops asking for the turn.
+      const heldA = secureRequest('POST', '/a');
+      const [waitingA] = await waitForPending();
+      expect((await control('POST', '/approvals', { id: waitingA.id, allow: false, remember: false, scope: 'path' })).status).toBe(200);
+      expect((await heldA).status).toMatch(/403/);
+      expect((await secureRequest('POST', '/a')).status).toMatch(/403/);
+      const heldB = secureRequest('POST', '/b');
+      const [waitingB] = await waitForPending();
+      expect(waitingB.path).toBe('/b');
+      expect((await answerPending(waitingB.id, true)).status).toBe(200);
+      expect((await heldB).status).not.toMatch(/403/);
+
+      // The host scope: one path refused, every path of the host refused for the turn.
+      expect((await control('POST', '/turn-end', {})).status).toBe(200);
+      const heldC = secureRequest('POST', '/c');
+      const [waitingC] = await waitForPending();
+      expect((await control('POST', '/approvals', { id: waitingC.id, allow: false, remember: false, scope: 'host' })).status).toBe(200);
+      expect((await heldC).status).toMatch(/403/);
+      expect((await secureRequest('POST', '/d')).status).toMatch(/403/);
+      expect(await pendingNow()).toEqual([]);
+    });
+
+    it('keeps a deny once on its own write when the path is too long to remember', async () => {
+      // A target the space can write but this gatekeeper cannot store as a rule. The refusal must
+      // cover that write only: widening it to the whole host refuses paths the user never saw.
+      const longPath = `/${'a'.repeat(4096)}`;
+      const held = secureRequest('POST', longPath);
+      const [waiting] = await waitForPending();
+      expect(waiting.path).toBeUndefined();
+      expect((await control('POST', '/approvals', { id: waiting.id, allow: false, remember: false, scope: 'path' })).status).toBe(200);
+      expect((await held).status).toMatch(/403/);
+
+      const other = secureRequest('POST', '/a');
+      const [second] = await waitForPending();
+      expect((await answerPending(second.id, true)).status).toBe(200);
+      expect((await other).status).not.toMatch(/403/);
+    });
+
+    it('lets a standing approval lift the write it refused once for the turn', async () => {
+      const held = secureRequest('POST', '/a');
+      const [waiting] = await waitForPending();
+      expect((await control('POST', '/approvals', { id: waiting.id, allow: false, remember: false, scope: 'path' })).status).toBe(200);
+      expect((await held).status).toMatch(/403/);
+      expect((await secureRequest('POST', '/a')).status).toMatch(/403/);
+
+      // The user then approves the same rule: a newer decision, and the way out of the refusal.
+      expect((await control('POST', '/writes', { entries: [{ host: 'example.com', path: '/a', methods: ['POST'] }] })).status).toBe(200);
+      expect((await secureRequest('POST', '/a')).status).not.toMatch(/403/);
+    });
+
+    it('ends a deny once with the turn and leaves a standing answer alone', async () => {
+      const held = secureRequest('POST', '/');
+      const [waiting] = await waitForPending();
+      expect((await control('POST', '/approvals', { id: waiting.id, allow: false })).status).toBe(200);
+      expect((await held).status).toMatch(/403/);
+      expect((await control('POST', '/turn-end', {})).status).toBe(200);
+
+      // The turn ending says nothing about the user's standing denial.
+      expect((await secureRequest('POST', '/')).status).toMatch(/403/);
+      expect((await control('GET', '/policy').then((answer) => JSON.parse(answer.body))).denials).toEqual([{ host: 'example.com', methods: ['POST'] }]);
+    });
+
+    it('approves only the exact path, query aside, and keeps near-miss paths asking', async () => {
+      expect((await control('POST', '/writes', { entries: [{ host: 'example.com', path: '/a', methods: ['POST'] }] })).status).toBe(200);
+      expect((await secureRequest('POST', '/a?next=1')).status).not.toMatch(/403/);
+      for (const otherPath of ['/b', '/a/../b', '/%61', '/a/']) {
+        const held = secureRequest('POST', otherPath);
+        const [waiting] = await waitForPending();
+        expect(waiting.path).toBe(otherPath);
+        expect((await answerPending(waiting.id, true)).status).toBe(200);
+        expect((await held).status).not.toMatch(/403/);
+      }
+      expect((await control('GET', '/policy').then((answer) => JSON.parse(answer.body))).writes).toEqual([{ host: 'example.com', path: '/a', methods: ['POST'] }]);
+    });
+
+    it('uses the path answer before the host, and a denial before an approval at the same level', async () => {
+      const allowHost = () => control('POST', '/writes', { entries: [{ host: 'example.com', methods: ['POST'] }] });
+      expect((await allowHost()).status).toBe(200);
+      expect((await control('POST', '/denials', { entries: [{ host: 'example.com', path: '/admin', methods: ['POST'] }] })).status).toBe(200);
+      // The host-wide approval survives; the more specific path is refused.
+      expect((await secureRequest('POST', '/ordinary')).status).not.toMatch(/403/);
+      expect((await secureRequest('POST', '/admin')).status).toMatch(/403/);
+      // A path approval beats the host-wide denial, but not a denial for that same path.
+      expect((await control('POST', '/denials', { entries: [{ host: 'example.com', methods: ['POST'] }] })).status).toBe(200);
+      expect((await control('POST', '/writes', { entries: [{ host: 'example.com', path: '/one', methods: ['POST'] }] })).status).toBe(200);
+      expect((await secureRequest('POST', '/one')).status).not.toMatch(/403/);
+      expect((await control('POST', '/denials', { entries: [{ host: 'example.com', path: '/one', methods: ['POST'] }] })).status).toBe(200);
+      expect((await secureRequest('POST', '/one')).status).toMatch(/403/);
+    });
+
+    it('settles only the waiting writes a path approval covers', async () => {
+      const first = secureRequest('PUT', '/a');
+      const second = secureRequest('PUT', '/b');
+      const waits = await waitForPending(2);
+      expect((await control('POST', '/writes', { entries: [{ host: 'example.com', path: '/a', methods: ['PUT'] }] })).status).toBe(200);
+      expect((await first).status).not.toMatch(/403/);
+      expect((await pendingNow()).map((entry) => entry.path)).toEqual(['/b']);
+      const [remaining] = await pendingNow();
+      expect((await answerPending(remaining.id, false)).status).toBe(200);
+      expect((await second).status).toMatch(/403/);
+      expect(waits).toHaveLength(2);
+    });
+
+    it('remembers an always denial for the path the space chose', async () => {
+      const held = secureRequest('DELETE', '/only-this');
+      const [waiting] = await waitForPending();
+      expect((await control('POST', '/approvals', { id: waiting.id, allow: false, scope: 'path' })).status).toBe(200);
+      expect((await held).status).toMatch(/403/);
+      expect((await control('GET', '/policy').then((answer) => JSON.parse(answer.body))).denials).toEqual([{ host: 'example.com', path: '/only-this', methods: ['DELETE'] }]);
+      expect((await secureRequest('DELETE', '/only-this')).status).toMatch(/403/);
+      const other = secureRequest('DELETE', '/elsewhere');
+      const [next] = await waitForPending();
+      expect((await answerPending(next.id, false)).status).toBe(200);
+      expect((await other).status).toMatch(/403/);
+    });
+
+    it('refuses a path that is no exact request path, and never reads it as host-wide', async () => {
+      const before = (await control('GET', '/policy').then((answer) => JSON.parse(answer.body))).writes;
+      for (const bad of ['relative', '/has space', '/query?x=1', '/fragment#x']) {
+        expect((await control('POST', '/writes', { entries: [{ host: 'example.com', path: bad, methods: ['POST'] }] })).status).toBe(400);
+      }
+      expect((await control('GET', '/policy').then((answer) => JSON.parse(answer.body))).writes).toEqual(before);
     });
 
     it('refuses a denial list that names a method nobody can deny', async () => {

@@ -3237,6 +3237,14 @@ export function SyncProvider(props: {
     })
   }, [childStores])
 
+  // A wait the gatekeeper refused at its limit is announced no end for, and nothing else would
+  // ever take its prompt or its row badge away. One timer for all spaces, whether a chat is open
+  // or not; the dock no longer keeps its own.
+  useEffect(() => {
+    const interval = setInterval(() => useSpaceApprovalsStore.getState().pruneExpired(), 1_000)
+    return () => clearInterval(interval)
+  }, [])
+
   // Bootstrap global state — set bootingRoot/bootedAt to suppress
   // redundant refresh events during startup
   useEffect(() => {

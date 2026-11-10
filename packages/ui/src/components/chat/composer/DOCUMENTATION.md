@@ -106,11 +106,28 @@ reply resolves its directory from the store that holds the form.
 
 `SpaceApprovalDock` is a write an isolated space is holding for the user's
 answer, in the same frame and place as a permission request: the URL the
-space wrote (path and query), the space's name, and Allow once / Deny. A
-write belongs to the space and not to a turn, so the dock shows it in every
-chat of that space, and the space's row in the sidebar carries a count while
-no chat of it is open. The gatekeeper keeps the socket, so the dock must not
-be the only trace of a wait.
+space wrote (path and query), the space's name with the method in bold, and
+four answers in the permission request's order and words: Deny once and
+Always deny at the start, Always allow and Allow once, filled, at the end.
+"Always" stands for the destination and method, on the exact request path or on
+every path of the host as the space's Writes choice says, which the button's
+tooltip names. It is offered only for a domain name and one of POST, PUT,
+PATCH and DELETE, the answers the host can keep, and on the path scope only
+when the wait carries its exact path. The tooltips read the scope from the
+app's copy of the space, but the answer does not: every answer goes to the
+host, which takes the scope from its record and says it back, and the dock
+settles the other waits by that answer. An "always"
+answer settles every wait it covers, so the dock drops them all at once. Deny
+once does the same for its scope but keeps nothing: the refusal stands for the
+rest of the space's chat turn, so the agent's retry meets it instead of another
+prompt, which its tooltip says. `ChatContainer` tells the host when the shown chat stops working, which
+is what makes the next turn ask again; a chat that was already idle when it was
+shown says nothing, so switching to another chat of the same space does not
+hand a running turn's retry a new prompt. Until then the dock is not involved. A write belongs to the space and not to a turn, so the dock shows
+it in every chat of that space, and the space's row in the sidebar carries a
+count while no chat of it is open. The gatekeeper keeps the socket, so the dock
+must not be the only trace of a wait. The dock binds no shortcuts: a permission
+request can be open at the same time, and one key must not answer both.
 
 `PermissionDock` is the agent's permission requests for the composer's
 session, its subagents' included, in the same frame: one dot per pending

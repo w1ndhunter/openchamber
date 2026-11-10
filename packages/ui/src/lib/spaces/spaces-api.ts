@@ -91,15 +91,141 @@ const networkSchema = z.object({
   mode: z.enum(['allowlist', 'open']),
   domains: z.array(z.string()),
   writes: z.enum(['ask', 'allow']).default('ask'),
+  writesScope: z.enum(['path', 'host']).default('path'),
 });
 
 export type SpaceNetwork = z.infer<typeof networkSchema>;
+export type SpaceWriteScope = SpaceNetwork['writesScope'];
+
+/** The integrations a user ticked beyond the standard passive set, item by item. */
+const environmentOptInsSchema = z.object({
+  agents: z.array(z.string()).default([]),
+  mcp: z.array(z.string()).default([]),
+  plugins: z.array(z.string()).default([]),
+  commands: z.array(z.string()).default([]),
+  skills: z.array(z.string()).default([]),
+  formatter: z.boolean().default(false),
+  skillSources: z.array(z.string()).default([]),
+});
+
+export type SpaceEnvironmentOptIns = z.infer<typeof environmentOptInsSchema>;
+
+/** A shared folder or Git repository of passive OpenCode assets and optional shared memory. */
+const environmentSourceSchema = z.object({
+  kind: z.enum(['git', 'folder']),
+  location: z.string().min(1),
+  ref: z.string().default(''),
+  memory: z.enum(['off', 'read', 'write']).default('off'),
+  delivery: z.enum(['snapshot', 'mount']).default('snapshot'),
+  optIns: environmentOptInsSchema.default({ agents: [], mcp: [], plugins: [], commands: [], skills: [], formatter: false, skillSources: [] }),
+});
+
+export type SpaceEnvironmentSource = z.infer<typeof environmentSourceSchema>;
+export type SpaceEnvironmentSourceRequest = z.input<typeof environmentSourceSchema>;
+
+const environmentAssetsSchema = z.object({
+  agents: z.array(z.string()).default([]),
+  commands: z.array(z.string()).default([]),
+  skills: z.array(z.string()).default([]),
+  instructions: z.array(z.string()).default([]),
+  references: z.number().int().min(0).default(0),
+  plugins: z.array(z.string()).default([]),
+  mcp: z.array(z.string()).default([]),
+  agentsFile: z.boolean().default(false),
+  preferences: z.array(z.string()).default([]),
+});
+
+
+const environmentFailureSchema = z.object({
+  code: z.string(),
+  message: z.string(),
+  reason: z.string().nullable().default(null),
+  at: z.string(),
+});
+
+const memoryStatusSchema = z.object({
+  state: z.enum(['synced', 'pending', 'read_only', 'offline', 'needs_auth', 'conflicted']),
+  at: z.string(),
+  pending: z.number().int().min(0),
+  conflicts: z.number().int().min(0),
+  revision: z.string().nullable().default(null),
+});
+
+const environmentStatusSchema = z.object({
+  state: z.enum(['ready', 'blocked', 'off']).default('ready'),
+  kind: z.enum(['git', 'folder']),
+  location: z.string(),
+  ref: z.string().default(''),
+  memory: z.enum(['off', 'read', 'write']),
+  delivery: z.enum(['snapshot', 'mount']).default('snapshot'),
+  revision: z.string().optional(),
+  commit: z.string().nullable().optional(),
+  included: z.number().int().min(0),
+  omitted: z.array(z.object({ path: z.string(), reason: z.string() })).default([]),
+  assets: environmentAssetsSchema.optional(),
+  instructions: z.array(z.string()).default([]),
+  appliedAt: z.string(),
+  lastFailure: environmentFailureSchema.optional(),
+  memoryStatus: memoryStatusSchema.optional(),
+  detachedAt: z.string().optional(),
+  mountRemains: z.boolean().optional(),
+  pendingChange: z.object({ memory: z.enum(['off', 'read', 'write']) }).optional(),
+});
+
+export type SpaceEnvironmentStatus = z.infer<typeof environmentStatusSchema>;
+
+/** What a source would bring, before a space has it: no file contents. */
+const environmentPlanSchema = z.object({
+  location: z.string(),
+  revision: z.string(),
+  commit: z.string().nullable().default(null),
+  assets: environmentAssetsSchema,
+  offers: environmentOptInsSchema,
+  omitted: z.array(z.object({ path: z.string(), reason: z.string() })).default([]),
+  memory: z.object({
+    declared: z.boolean(),
+    format: z.enum(['none', 'v1', 'v2']),
+    entries: z.number().int().min(0),
+    legacy: z.number().int().min(0),
+    flagged: z.number().int().min(0),
+  }),
+});
+
+export type SpaceEnvironmentPlan = z.infer<typeof environmentPlanSchema>;
+
+const syncConflictSchema = z.object({
+  operationId: z.string(),
+  memoryId: z.string(),
+  kind: z.string(),
+  reason: z.string(),
+  base: z.number(),
+  sourceRevision: z.number(),
+});
+
+const memorySyncSchema = z.object({
+  state: z.enum(['synced', 'read_only', 'offline', 'needs_auth', 'conflicted']),
+  at: z.string(),
+  pending: z.number().int().min(0),
+  published: z.boolean(),
+  conflicts: z.array(syncConflictSchema).default([]),
+  message: z.string().optional(),
+});
+
+
+const liveMemorySchema = z.union([
+  z.object({ available: z.literal(true), state: z.string(), pending: z.number().int().min(0), conflicts: z.number().int().min(0), entries: z.number().int().min(0), at: z.string().nullable() }),
+  z.object({ available: z.literal(false), reason: z.enum(['off', 'stopped']), last: memoryStatusSchema.nullable().optional() }),
+]);
+
+export type SpaceLiveMemory = z.infer<typeof liveMemorySchema>;
 
 // A method the user approved for one destination: GET, HEAD and OPTIONS need none, and the rest
 // of the methods are not approvable at all.
 const writeAccessSchema = z.object({
   host: z.string(),
   methods: z.array(z.enum(['DELETE', 'PATCH', 'POST', 'PUT'])),
+  // Without a path the rule is host-wide; with one it is exactly this request path.
+  path: z.string().optional(),
 });
 
 type SpaceWriteAccess = z.infer<typeof writeAccessSchema>;
@@ -134,7 +260,7 @@ export const providerGrantOf = (grants: readonly SpaceGrant[], providerId: strin
 /** The steps of a creation, in order, as `openchamber:space-progress` announces them. */
 // `downloading_image` and `preparing_tools` come inside `creating`, only when the place does that slow
 // part now, and `creating` follows them again.
-const SPACE_CREATION_STEPS = ['checking_place', 'creating', 'downloading_image', 'preparing_tools', 'setting_network', 'bringing_code', 'giving_access', 'ready'] as const;
+const SPACE_CREATION_STEPS = ['checking_place', 'creating', 'downloading_image', 'preparing_tools', 'setting_network', 'bringing_code', 'preparing_environment', 'giving_access', 'ready'] as const;
 
 export type SpaceCreationStep = (typeof SPACE_CREATION_STEPS)[number];
 
@@ -183,6 +309,8 @@ const spaceEntrySchema = z.object({
   writeAccess: z.array(writeAccessSchema).default([]),
   // The methods the user denied there: refused without a prompt until cleared.
   deniedWrites: z.array(writeAccessSchema).default([]),
+  environment: environmentSourceSchema.nullish(),
+  environmentStatus: environmentStatusSchema.nullish(),
   grants: z.array(grantSchema),
   access: z.enum(['granted', 'needs_access', 'unknown']).nullable(),
   needsAccess: z.array(z.string()),
@@ -245,6 +373,8 @@ export type CreateSpaceRequest = {
   network: SpaceNetwork;
   /** The project's setup commands, resolved as for a new worktree, trust included. */
   setupCommands: string[];
+  /** A shared folder or Git repository of passive agent assets and optional shared memory. */
+  environment?: SpaceEnvironmentSourceRequest | null;
   /** The model access chosen in the dialog; the host gives it before the space is ready. */
   grants: Extract<GrantRequest, { kind: 'model' | 'login' | 'custom' }>[];
 };
@@ -379,6 +509,51 @@ export const listSpaces = async (signal?: AbortSignal): Promise<SpaceEntry[]> =>
 export const createSpace = (body: CreateSpaceRequest): Promise<SpaceEntry> =>
   request(SPACES_ROUTE, spaceEntrySchema, { method: 'POST', body: JSON.stringify(body) });
 
+const environmentAnswerSchema = z.object({ environment: environmentSourceSchema.nullable(), status: environmentStatusSchema });
+
+/** What a source would bring into a new space; nothing is copied. A source that cannot be read throws. */
+export const checkEnvironmentSource = async (source: SpaceEnvironmentSourceRequest, signal?: AbortSignal): Promise<SpaceEnvironmentPlan> =>
+  (await request(`${SPACES_ROUTE}/environment/check`, z.object({ plan: environmentPlanSchema }), { method: 'POST', body: JSON.stringify(source), signal })).plan;
+
+/** Applies the recorded shared environment source again, at its current revision; assets only. */
+export const refreshSpaceEnvironment = (spaceId: string) =>
+  request(`${SPACES_ROUTE}/${spaceId}/environment/refresh`, environmentAnswerSchema, { method: 'POST' });
+
+/** Whether the source moved since the space took it. A source that cannot be read answers `failure`. */
+export const checkSpaceEnvironment = (spaceId: string) =>
+  request(`${SPACES_ROUTE}/${spaceId}/environment/check`, z.object({
+    plan: environmentPlanSchema.nullable(),
+    current: z.string().nullable(),
+    changed: z.boolean(),
+    failure: environmentFailureSchema.nullable().default(null),
+  }));
+
+/** A change of the memory mode, the branch or the ticked items, applied now. */
+export const configureSpaceEnvironment = (spaceId: string, change: { memory?: 'off' | 'read' | 'write'; ref?: string; optIns?: SpaceEnvironmentOptIns }) =>
+  request(`${SPACES_ROUTE}/${spaceId}/environment`, environmentAnswerSchema, { method: 'POST', body: JSON.stringify(change) });
+
+/** Takes the source out of the space's OpenCode; what was copied stays in the space. */
+export const detachSpaceEnvironment = (spaceId: string, body: { discardPending: boolean }) =>
+  request(`${SPACES_ROUTE}/${spaceId}/environment/detach`, environmentAnswerSchema, { method: 'POST', body: JSON.stringify(body) });
+
+/** Replays the space's memory changes at the source and brings the source's state back. */
+export const syncSpaceEnvironmentMemory = (spaceId: string): Promise<z.infer<typeof memorySyncSchema>> =>
+  request(`${SPACES_ROUTE}/${spaceId}/environment/memory/sync`, memorySyncSchema, { method: 'POST' });
+
+/** What the space's shared memory holds that the source does not have yet, read now. */
+export const readSpaceEnvironmentMemory = (spaceId: string, signal?: AbortSignal): Promise<SpaceLiveMemory> =>
+  request(`${SPACES_ROUTE}/${spaceId}/environment/memory`, liveMemorySchema, { signal });
+
+const legacyEntrySchema = z.object({ id: z.string(), title: z.string(), body: z.string(), type: z.string(), flagged: z.boolean() });
+
+/** The reviewed import of a version 1 memory file: without `confirm` a preview with the threat scan. */
+export const importSpaceEnvironmentMemory = (spaceId: string, body: { confirm: boolean; memoryIds?: string[] | null }) =>
+  request(`${SPACES_ROUTE}/${spaceId}/environment/memory/import`, z.object({
+    entries: z.array(legacyEntrySchema).optional(),
+    imported: z.number().int().min(0),
+    conflicts: z.array(syncConflictSchema).optional(),
+  }), { method: 'POST', body: JSON.stringify(body) });
+
 /** The host's browser logins a space can be given, by provider; a host that cannot be asked throws. */
 export const readSpaceHostLogins = async (signal?: AbortSignal): Promise<SpaceHostLogin[]> =>
   (await request(`${SPACES_ROUTE}/logins`, z.object({ logins: z.array(hostLoginSchema) }), { signal })).logins;
@@ -394,30 +569,56 @@ export const grantSpaceAccess = async (spaceId: string, body: GrantRequest): Pro
 export const openSpaceDomain = async (spaceId: string, domain: string): Promise<SpaceNetwork> =>
   (await request(`${SPACES_ROUTE}/${spaceId}/network/domains`, z.object({ network: networkSchema }), { method: 'POST', body: JSON.stringify({ domain }) })).network;
 
+/** A write rule as the host reads it: the path only for a rule of one path. */
+const writeRuleBody = (host: string, methods: readonly SpaceWriteMethod[], path?: string): string => {
+  return JSON.stringify(path === undefined ? { host, methods } : { host, methods, path });
+};
+
 /**
  * Approves one or more methods for one destination, live; answers every approval the space holds
  * now. The gatekeeper refuses the method until this call, and the record keeps it for the next start.
  */
-export const approveSpaceWrites = async (spaceId: string, host: string, methods: readonly SpaceWriteMethod[]): Promise<SpaceWriteAccess[]> =>
-  (await request(`${SPACES_ROUTE}/${spaceId}/writes`, z.object({ writeAccess: z.array(writeAccessSchema) }), { method: 'POST', body: JSON.stringify({ host, methods }) })).writeAccess;
+export const approveSpaceWrites = async (spaceId: string, host: string, methods: readonly SpaceWriteMethod[], path?: string): Promise<SpaceWriteAccess[]> =>
+  (await request(`${SPACES_ROUTE}/${spaceId}/writes`, z.object({ writeAccess: z.array(writeAccessSchema) }), { method: 'POST', body: writeRuleBody(host, methods, path) })).writeAccess;
+
+/** Changes what an open space does with writes, or the scope later "always" answers save. */
+export const changeSpaceNetwork = async (spaceId: string, change: { writes?: SpaceNetwork['writes']; writesScope?: SpaceWriteScope }): Promise<SpaceNetwork> =>
+  (await request(`${SPACES_ROUTE}/${spaceId}/network`, z.object({ network: networkSchema }), { method: 'POST', body: JSON.stringify(change) })).network;
 
 /**
  * Takes back approvals for a destination, live: the listed methods, or every method for it with
  * an empty list. The next write asks again; the record keeps the change for the next start.
  */
-export const revokeSpaceWrites = async (spaceId: string, host: string, methods: readonly SpaceWriteMethod[]): Promise<SpaceWriteAccess[]> =>
-  (await request(`${SPACES_ROUTE}/${spaceId}/writes`, z.object({ writeAccess: z.array(writeAccessSchema) }), { method: 'DELETE', body: JSON.stringify({ host, methods }) })).writeAccess;
+export const revokeSpaceWrites = async (spaceId: string, host: string, methods: readonly SpaceWriteMethod[], path?: string): Promise<SpaceWriteAccess[]> =>
+  (await request(`${SPACES_ROUTE}/${spaceId}/writes`, z.object({ writeAccess: z.array(writeAccessSchema) }), { method: 'DELETE', body: writeRuleBody(host, methods, path) })).writeAccess;
 
 /** Denies methods for a destination, clears them with an empty list, or replaces its list. */
-export const denySpaceWrites = async (spaceId: string, host: string, methods: readonly SpaceWriteMethod[]): Promise<SpaceWriteAccess[]> =>
-  (await request(`${SPACES_ROUTE}/${spaceId}/denials`, z.object({ deniedWrites: z.array(writeAccessSchema) }), { method: 'POST', body: JSON.stringify({ host, methods }) })).deniedWrites;
+export const denySpaceWrites = async (spaceId: string, host: string, methods: readonly SpaceWriteMethod[], path?: string): Promise<SpaceWriteAccess[]> =>
+  (await request(`${SPACES_ROUTE}/${spaceId}/denials`, z.object({ deniedWrites: z.array(writeAccessSchema) }), { method: 'POST', body: writeRuleBody(host, methods, path) })).deniedWrites;
 
 /**
  * The answer for a write that is waiting in the gatekeeper: `allowed` sends it on, anything else
- * refuses it. `settled` is false when the wait was already gone, which is not a failure.
+ * refuses it; `remember` makes the answer stand for that destination and method. The host picks
+ * the scope from its record and says it back with any answer but an approval of one write.
+ * A standing approval names the write the prompt `shown`, so it never approves another write that
+ * holds the same id. `settled` is false when the wait was already gone, which is not a failure.
  */
-export const decideSpaceApproval = async (spaceId: string, requestId: number, allowed: boolean): Promise<boolean> =>
-  (await request(`${SPACES_ROUTE}/${spaceId}/approvals`, z.object({ settled: z.boolean() }), { method: 'POST', body: JSON.stringify({ requestId, allowed }) })).settled;
+export const decideSpaceApproval = async (
+  spaceId: string,
+  requestId: number,
+  allowed: boolean,
+  remember: boolean,
+  shown?: { host: string; method: string; path?: string },
+): Promise<{ settled: boolean; scope?: SpaceWriteScope }> =>
+  request(`${SPACES_ROUTE}/${spaceId}/approvals`, z.object({ settled: z.boolean(), scope: z.enum(['path', 'host']).optional() }), { method: 'POST', body: JSON.stringify({ requestId, allowed, remember, shown }) });
+
+/**
+ * Says the chat's turn is over, so a "Deny once" answer stops standing: the agent's next turn asks
+ * again. The space's standing answers and anything waiting stay as they are.
+ */
+export const endSpaceTurn = async (spaceId: string): Promise<void> => {
+  await request(`${SPACES_ROUTE}/${spaceId}/turn-end`, z.object({ ended: z.boolean() }), { method: 'POST' });
+};
 
 // One attempt the gatekeeper recorded: never a path, a body or a secret. `host` is what the agent
 // asked for, so it is data to show, never to act on without the user.

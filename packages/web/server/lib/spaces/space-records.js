@@ -11,6 +11,7 @@ import path from 'node:path';
 
 import { z } from 'zod';
 
+import { environmentSourceSchema } from './environment-source.js';
 import { requireSpaceId } from './labels.js';
 import { MAX_KEPT_OUTPUT_CHARACTERS, MAX_SETUP_COMMAND_LENGTH, MAX_SETUP_COMMANDS } from './space-setup.js';
 import { sanitizeSpaceTaskTitle, spaceTaskTitleSchema } from './task-title.js';
@@ -33,6 +34,9 @@ export const networkSchema = z.object({
   mode: z.enum(NETWORK_MODES),
   domains: z.array(domainSchema).max(MAX_DOMAINS).default([]),
   writes: z.enum(['ask', 'allow']).default('ask'),
+  // The scope an "always" answer saves: the exact request path, or the whole host. A record from
+  // before the choice saves paths from now on; its existing host-wide entries remain unchanged.
+  writesScope: z.enum(['path', 'host']).default('path'),
 });
 
 const historySchema = z.enum(['pending', 'sent', 'already_complete', 'host_shallow', 'failed']);
@@ -42,9 +46,14 @@ const historySchema = z.enum(['pending', 'sent', 'already_complete', 'host_shall
 export const WRITABLE_METHODS = Object.freeze(['DELETE', 'PATCH', 'POST', 'PUT']);
 const MAX_WRITE_DESTINATIONS = 200;
 
+export const writePathSchema = z.string().startsWith('/').max(2048).regex(/^[^\u0000-\u0020\u007f?#]*$/);
+
 const writeAccessEntrySchema = z.object({
   host: domainSchema,
   methods: z.array(z.enum(WRITABLE_METHODS)).min(1).max(WRITABLE_METHODS.length),
+  // An optional exact request path, without a query or fragment. No path means every path of the
+  // host. Never normalized: two different strings are two rules.
+  path: z.string().startsWith('/').max(2048).regex(/^[^\u0000-\u0020\u007f?#]*$/).optional(),
 }).strict();
 
 export const writeAccessSchema = z.array(writeAccessEntrySchema).max(MAX_WRITE_DESTINATIONS).default([]);
@@ -124,8 +133,53 @@ const setupSchema = z.discriminatedUnion('state', [
   }).strict(),
 ]);
 
+const failureSchema = z.object({
+  code: z.string(),
+  message: z.string(),
+  reason: z.string().nullable().default(null),
+  at: z.string(),
+}).strict();
+
+const environmentStatusSchema = z.object({
+  // `ready` delivered, `blocked` never arrived, `off` detached; the copied files stay in the space either way.
+  state: z.enum(['ready', 'blocked', 'off']).default('ready'),
+  kind: z.enum(['git', 'folder']),
+  location: z.string().min(1),
+  ref: z.string().default(''),
+  memory: z.enum(['off', 'read', 'write']),
+  delivery: z.enum(['snapshot', 'mount']).default('snapshot'),
+  revision: z.string().min(1).optional(),
+  // A Git source's commit; the revision is the hash of its assets, which a memory commit does not move.
+  commit: z.string().nullable().optional(),
+  included: z.number().int().min(0),
+  omitted: z.array(z.object({ path: z.string(), reason: z.string() })).default([]),
+  assets: z.record(z.string(), z.unknown()).optional(),
+  instructions: z.array(z.string()).default([]),
+  // The preferences and ticked items the configuration beside the project takes, as data.
+  config: z.record(z.string(), z.unknown()).default({}),
+  appliedAt: z.string(),
+  lastFailure: failureSchema.optional(),
+  memoryStatus: z.object({
+    state: z.enum(['synced', 'pending', 'read_only', 'offline', 'needs_auth', 'conflicted']),
+    at: z.string(),
+    pending: z.number().int().min(0),
+    conflicts: z.number().int().min(0),
+    revision: z.string().nullable().default(null),
+  }).strict().optional(),
+  detachedAt: z.string().optional(),
+  mountRemains: z.boolean().optional(),
+  // A change made while the space was stopped, applied at its next start; the mode it had before.
+  pendingChange: z.object({ memory: z.enum(['off', 'read', 'write']) }).strict().optional(),
+}).strict();
+
 const recordSchema = z.object({
   version: z.literal(1),
+  /** A shared folder or Git repository of passive OpenCode assets and optional shared memory. */
+  environment: environmentSourceSchema.nullable().optional(),
+  /** The canonical host folder bound read-only into the container at creation, or null. */
+  environmentMount: z.string().min(2).nullable().optional(),
+  /** What was last delivered, never a claim that a host source is still at that revision. */
+  environmentStatus: environmentStatusSchema.nullable().optional(),
   /** The place the space was made on. A record from before there were two names the local Docker place. */
   placeId: z.string().min(1).default('docker'),
   /** The display name and the creation time, as the labels hold them, for a list while the place cannot be asked. */
@@ -203,6 +257,25 @@ export function createSpaceRecords({ dataDir, logger = console }) {
       logger.warn?.(`[spaces] the record of space ${spaceId} holds a network write choice this host cannot read; the space asks`);
       next = { ...next, network: { ...next.network, writes: 'ask' } };
     }
+    if (next.network instanceof Object && next.network.writesScope !== undefined && next.network.writesScope !== 'path' && next.network.writesScope !== 'host') {
+      logger.warn?.(`[spaces] the record of space ${spaceId} holds a write answer scope this host cannot read; answers save the exact path`);
+      next = { ...next, network: { ...next.network, writesScope: 'path' } };
+    }
+    return next;
+  };
+
+  /** An environment this host cannot read is forgotten without losing network, grants or setup. */
+  const withReadableEnvironment = (spaceId, raw) => {
+    if (!(raw instanceof Object)) return raw;
+    let next = raw;
+    if (next.environment !== undefined && next.environment !== null && !environmentSourceSchema.safeParse(next.environment).success) {
+      logger.warn?.(`[spaces] the record of space ${spaceId} holds an environment source this host cannot read; it is left out`);
+      next = { ...next, environment: null };
+    }
+    if (next.environmentStatus !== undefined && next.environmentStatus !== null && !environmentStatusSchema.safeParse(next.environmentStatus).success) {
+      logger.warn?.(`[spaces] the record of space ${spaceId} holds an environment status this host cannot read; it is left out`);
+      next = { ...next, environmentStatus: null };
+    }
     return next;
   };
 
@@ -214,14 +287,14 @@ export function createSpaceRecords({ dataDir, logger = console }) {
   const withOneWriteAnswer = (raw) => {
     if (!(raw instanceof Object) || !Array.isArray(raw.writeAccess) || !Array.isArray(raw.deniedWrites)) return raw;
     if (raw.writeAccess.length === 0 || raw.deniedWrites.length === 0) return raw;
-    const approvals = new Map(raw.writeAccess.map((entry) => [entry.host, new Set(entry.methods)]));
+    const approvals = new Map(raw.writeAccess.map((entry) => [`${entry.host}\u0000${entry.path ?? ''}`, new Set(entry.methods)]));
     let changed = false;
     const deniedWrites = [];
     for (const entry of raw.deniedWrites) {
-      const approved = approvals.get(entry.host);
+      const approved = approvals.get(`${entry.host}\u0000${entry.path ?? ''}`);
       const methods = approved ? entry.methods.filter((method) => !approved.has(method)) : [...entry.methods];
       if (methods.length !== entry.methods.length) changed = true;
-      if (methods.length > 0) deniedWrites.push({ host: entry.host, methods });
+      if (methods.length > 0) deniedWrites.push({ ...entry, methods });
     }
     return changed ? { ...raw, deniedWrites } : raw;
   };
@@ -237,7 +310,7 @@ export function createSpaceRecords({ dataDir, logger = console }) {
       return { status: 'unreadable', record: null };
     }
     try {
-      const raw = withOneWriteAnswer(withReadableWrites(spaceId, withReadableSetup(spaceId, withReadableGrants(spaceId, JSON.parse(text)))));
+      const raw = withOneWriteAnswer(withReadableEnvironment(spaceId, withReadableWrites(spaceId, withReadableSetup(spaceId, withReadableGrants(spaceId, JSON.parse(text))))));
       // A display name must not make the network choice or grants unreadable.
       if (raw instanceof Object && raw.taskTitle != null && !spaceTaskTitleSchema.safeParse(raw.taskTitle).success) {
         logger.warn?.(`[spaces] the record of space ${spaceId} holds a task title this host cannot read; it is left out`);

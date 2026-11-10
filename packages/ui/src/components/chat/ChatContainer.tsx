@@ -127,6 +127,8 @@ import { SpaceApprovalDock } from './SpaceApprovalDock';
 import { FormDock } from './FormDock';
 import { ensureSpaceArchives, useSpaceArchiveOf } from '@/lib/spaces/space-archives';
 import { useSpaceDirectoryStopped } from '@/lib/spaces/spaces-store';
+import { spaceIdOfDirectory } from '@/lib/spaces/space-route';
+import { endSpaceTurn } from '@/lib/spaces/spaces-api';
 import { SpaceChatPlaceholder } from '@/components/session/spaces/SpaceChatPlaceholder';
 import { getRuntimeKey } from '@/lib/runtime-switch';
 import { isMobileSurfaceRuntime } from '@/lib/runtimeSurface';
@@ -1102,6 +1104,22 @@ export const ChatContainer: React.FC<ChatContainerProps> = ({
         // turn is still running only per the last conversation message.
         return isIncompleteAssistantTurn(getLastConversationRecord(sessionMessages)?.info);
     }, [currentSessionId, sessionMessages, sessionPermissions.length, sessionForms.length, sessionStatusForCurrent, statusSnapshotReady]);
+
+    // A space's "Deny once" stands for the rest of that turn, so the agent's retry meets the
+    // refusal instead of a new prompt. When the shown chat stops working its turn is over and the
+    // space asks again. Only a working chat that stopped counts: a chat that was already idle
+    // when it was shown says nothing about the turn that was refused, and clearing there would
+    // hand the retry a new prompt while its own chat still runs. The gatekeeper bounds the rest.
+    const workingBefore = React.useRef<{ sessionId: string | null; working: boolean }>({ sessionId: null, working: false });
+    React.useEffect(() => {
+        const previous = workingBefore.current;
+        workingBefore.current = { sessionId: currentSessionId, working: sessionIsWorking };
+        if (!active || sessionIsWorking) return;
+        if (previous.sessionId !== currentSessionId || !previous.working) return;
+        const spaceId = spaceIdOfDirectory(effectiveSessionDirectory);
+        if (spaceId === null) return;
+        void endSpaceTurn(spaceId).catch(() => undefined);
+    }, [active, currentSessionId, effectiveSessionDirectory, sessionIsWorking]);
 
     const latestCompletedReply = React.useMemo(
         () => findLatestCompletedReply(sessionMessages),

@@ -58,6 +58,7 @@ const MEMORY_TYPES = new Set(['fact', 'preference', 'reference']);
 import { asNonEmptyString, isRecord as isObjectRecord } from '../shared/guards.js';
 import { projectConfigFileStemOf } from '../projects/project-id.js';
 import { findThreatPattern } from './threat-patterns.js';
+import { createSharedMemoryStore, SHARED_MEMORY_LIMITS } from './shared-store.js';
 import { z } from 'zod';
 
 const count = z.number().int().nonnegative().catch(0);
@@ -189,7 +190,11 @@ const clampLength = (value, maxLength) => {
  */
 const bodyFitsLimit = (value) => (asNonEmptyString(value)?.length ?? 0) <= MEMORY_BODY_MAX_LENGTH;
 
-const limitForScope = (scope) => (scope === 'global' ? GLOBAL_MEMORY_MAX_ITEMS : PROJECT_MEMORY_MAX_ITEMS);
+const limitForScope = (scope) => {
+  if (scope === 'global') return GLOBAL_MEMORY_MAX_ITEMS;
+  if (scope === 'shared') return SHARED_MEMORY_LIMITS.entries;
+  return PROJECT_MEMORY_MAX_ITEMS;
+};
 
 const sanitizeEntries = (value, now, scope) => {
   if (!Array.isArray(value)) return [];
@@ -224,6 +229,8 @@ const sanitizeEntries = (value, now, scope) => {
       ...(findThreatPattern(`${title}\n${body}`) ? { flagged: true } : {}),
       ...(sessionId ? { sessionId } : {}),
     });
+    const sanitized = result.at(-1);
+    if (Number.isSafeInteger(entry.revision) && entry.revision > 0) sanitized.revision = entry.revision;
   }
 
   return result.sort((a, b) => b.updatedAt - a.updatedAt);
@@ -233,6 +240,12 @@ const createEmptyMemory = () => ({ version: MEMORY_VERSION, entries: [] });
 
 export const createAgentMemoryRuntime = (deps) => {
   const { fsPromises, path, projectsDirPath, userConfigRoot, createId } = deps;
+  // A space with an attached environment source receives this folder from the host. The mode is
+  // `read` or `write`; the source never becomes a second private global store.
+  const sharedRoot = String(deps.sharedRoot ?? process.env.OPENCHAMBER_SPACE_SHARED_MEMORY_DIR ?? '').trim();
+  const sharedMode = String(deps.sharedMode ?? process.env.OPENCHAMBER_SPACE_SHARED_MEMORY_MODE ?? '').trim();
+  // Every change is recorded as an operation the host replays against the source on a sync.
+  const sharedStore = sharedRoot ? createSharedMemoryStore({ root: sharedRoot, mode: sharedMode, recordOperations: true }) : null;
 
   const idFactory = typeof createId === 'function'
     ? createId
@@ -266,6 +279,9 @@ export const createAgentMemoryRuntime = (deps) => {
         // Same bounded folder name as `project-context` and the config file.
         filePath: path.join(projectsDirPath, projectConfigFileStemOf(projectId), 'memory.json'),
       };
+    }
+    if (target?.scope === 'shared' && sharedStore) {
+      return { scope: 'shared', key: 'shared', root: sharedStore.root, filePath: null };
     }
     throw new Error('scope is required');
   };
@@ -323,6 +339,15 @@ export const createAgentMemoryRuntime = (deps) => {
    */
   const read = async (target) => {
     const resolved = resolveTarget(target);
+    if (resolved.scope === 'shared') {
+      // Detached is not empty: a caller must not read "no shared memory" as authoritative.
+      if (await sharedStore.mode() === 'off') throw new Error('Shared memory is detached from this space');
+      const stored = await sharedStore.read();
+      return {
+        version: MEMORY_VERSION,
+        entries: sanitizeEntries(stored.entries, Date.now(), 'shared'),
+      };
+    }
     const stored = await readJson(resolved.filePath);
 
     if (!stored.missing && !stored.value) {
@@ -338,8 +363,36 @@ export const createAgentMemoryRuntime = (deps) => {
     };
   };
 
-  const write = async (resolved, entries) => {
+  // For shared memory only `removed` deletes: an entry missing from `entries` for any other reason,
+  // one the read could not take, is never turned into a deletion everybody would receive.
+  const write = async (resolved, entries, { removed = [] } = {}) => {
+    if (resolved.scope === 'shared') {
+      await sharedStore.writeEntries(entries, { removed });
+      return;
+    }
     await writeJsonAtomic(resolved.filePath, { version: MEMORY_VERSION, entries });
+  };
+
+  const withStoreLock = (resolved, work) => (resolved.scope === 'shared'
+    ? sharedStore.withLock(work)
+    : withWriteLock(resolved.key, work));
+
+  const requireSharedWrite = async (resolved) => {
+    if (resolved.scope !== 'shared') return;
+    const mode = await sharedStore.mode();
+    if (mode === 'write') return;
+    const error = new Error(mode === 'read' ? 'Shared memory is read-only in this space' : 'Shared memory is not writable in this space');
+    error.status = 403;
+    throw error;
+  };
+
+  const requireRevision = (resolved, value) => {
+    if (resolved.scope !== 'shared') return;
+    if (!Number.isSafeInteger(value) || value < 1) {
+      const error = new Error('A shared memory update needs the revision returned by memory.list or memory.read');
+      error.status = 400;
+      throw error;
+    }
   };
 
   const create = async (target, value) => {
@@ -355,18 +408,21 @@ export const createAgentMemoryRuntime = (deps) => {
     const body = clampLength(typeof value?.body === 'string' ? value.body : '', MEMORY_BODY_MAX_LENGTH).trim();
     if (!title) throw new Error('title is required');
     if (!body) throw new Error('body is required');
+    await requireSharedWrite(resolved);
 
-    return withWriteLock(resolved.key, async () => {
+    return withStoreLock(resolved, async () => {
       const now = Date.now();
       const current = await read(target);
 
       // A restatement of something already stored is an update, not a second
       // copy: an agent re-learning a fact each session would otherwise fill the
-      // store with near-duplicates and contradict itself.
+      // store with near-duplicates and contradict itself. Shared memory merges
+      // by id instead: a wording match there could belong to another writer, and
+      // revisioned rewriting is what keeps that safe.
       //
       // Checked before the capacity limit, because replacing an entry does not
       // grow the store — a full store must still be able to correct itself.
-      const existing = findSupersededEntry(current.entries, title, body);
+      const existing = resolved.scope === 'shared' ? null : findSupersededEntry(current.entries, title, body);
       if (existing) {
         const updated = {
           ...existing,
@@ -406,6 +462,7 @@ export const createAgentMemoryRuntime = (deps) => {
         ...(findThreatPattern(`${title}\n${body}`) ? { flagged: true } : {}),
         ...(sessionId ? { sessionId } : {}),
       };
+      if (resolved.scope === 'shared') entry.revision = 1;
       const related = findRelatedEntries(current.entries, title, body);
       const entries = [entry, ...current.entries];
       await write(resolved, entries);
@@ -436,12 +493,20 @@ export const createAgentMemoryRuntime = (deps) => {
     const body = hasBody ? clampLength(patch.body, MEMORY_BODY_MAX_LENGTH).trim() : null;
     if (hasTitle && !title) throw new Error('title is required');
     if (hasBody && !body) throw new Error('body is required');
+    await requireSharedWrite(resolved);
+    requireRevision(resolved, patch?.expectedRevision);
 
-    return withWriteLock(resolved.key, async () => {
+    return withStoreLock(resolved, async () => {
       const current = await read(target);
       const existing = current.entries.find((entry) => entry.id === id);
       if (!existing) {
         return null;
+      }
+      if (resolved.scope === 'shared' && existing.revision !== patch.expectedRevision) {
+        const error = new Error('This shared memory changed since it was read; read it again and retry');
+        error.status = 409;
+        error.code = 'memory_conflict';
+        throw error;
       }
 
       const updated = {
@@ -451,6 +516,7 @@ export const createAgentMemoryRuntime = (deps) => {
         ...(hasType ? { type: patch.type } : {}),
         updatedAt: Date.now(),
       };
+      if (resolved.scope === 'shared') updated.revision = (existing.revision ?? 0) + 1;
       // Judged on the new text, as a read would judge it.
       delete updated.flagged;
       if (findThreatPattern(`${updated.title}\n${updated.body}`)) updated.flagged = true;
@@ -460,18 +526,27 @@ export const createAgentMemoryRuntime = (deps) => {
     });
   };
 
-  const remove = async (target, memoryId) => {
+  const remove = async (target, memoryId, expectedRevision) => {
     const resolved = resolveTarget(target);
     const id = asNonEmptyString(memoryId);
     if (!id) throw new Error('memoryId is required');
+    await requireSharedWrite(resolved);
+    requireRevision(resolved, expectedRevision);
 
-    return withWriteLock(resolved.key, async () => {
+    return withStoreLock(resolved, async () => {
       const current = await read(target);
-      if (!current.entries.some((entry) => entry.id === id)) {
+      const existing = current.entries.find((entry) => entry.id === id);
+      if (!existing) {
         return { deleted: false, entries: current.entries };
       }
+      if (resolved.scope === 'shared' && existing.revision !== expectedRevision) {
+        const error = new Error('This shared memory changed since it was read; read it again and retry');
+        error.status = 409;
+        error.code = 'memory_conflict';
+        throw error;
+      }
       const entries = current.entries.filter((entry) => entry.id !== id);
-      await write(resolved, entries);
+      await write(resolved, entries, { removed: [id] });
       return { deleted: true, entries };
     });
   };
@@ -482,17 +557,44 @@ export const createAgentMemoryRuntime = (deps) => {
    * agent knows about the user.
    */
   const readAll = async (projectId) => {
+    const sharedStatus = sharedStore ? await readSharedStatus().catch(() => null) : null;
+    // Memory off, or detached, is no shared memory at all: not a failed read, and not empty either.
+    const sharedOn = sharedStore !== null && sharedStatus?.mode !== 'off';
     const settled = await Promise.allSettled([
       read({ scope: 'global' }),
       projectId ? read({ scope: 'project', projectId }) : Promise.resolve(createEmptyMemory()),
+      sharedOn ? read({ scope: 'shared' }) : Promise.resolve(createEmptyMemory()),
     ]);
 
     return {
+      sharedStatus,
       global: settled[0].status === 'fulfilled' ? settled[0].value.entries : [],
       project: settled[1].status === 'fulfilled' ? settled[1].value.entries : [],
+      shared: settled[2].status === 'fulfilled' ? settled[2].value.entries : [],
       globalFailed: settled[0].status === 'rejected',
       projectFailed: settled[1].status === 'rejected',
+      sharedFailed: sharedOn && settled[2].status === 'rejected',
+      sharedAvailable: sharedOn,
+      sharedReadOnly: sharedStore !== null && sharedStatus?.mode !== 'write',
     };
+  };
+
+  /**
+   * Where shared memory stands, as the agent should say it: the mode, the changes that wait for a
+   * sync, and what the host reported at the last one (synced, offline, conflicted).
+   */
+  const readSharedStatus = async () => {
+    if (!sharedStore) return null;
+    const [mode, pending, reported] = await Promise.all([sharedStore.mode(), sharedStore.pendingOperations(), sharedStore.status()]);
+    const conflicts = Array.isArray(reported?.conflicts) ? reported.conflicts.length : 0;
+    let state = 'synced';
+    if (mode === 'off') state = 'off';
+    else if (conflicts > 0) state = 'conflicted';
+    else if (reported?.state === 'offline') state = 'offline';
+    else if (pending.length > 0) state = 'pending';
+    else if (mode === 'read') state = 'read_only';
+    else if (!reported) state = 'pending';
+    return { mode, state, pending: pending.length, conflicts, syncedAt: asNonEmptyString(reported?.at) };
   };
 
   /**
@@ -588,5 +690,5 @@ export const createAgentMemoryRuntime = (deps) => {
     });
   };
 
-  return { read, readAll, create, update, remove, resolveTarget, readDreamState, recordDream, undoDream };
+  return { read, readAll, readSharedStatus, create, update, remove, resolveTarget, readDreamState, recordDream, undoDream, sharedAvailable: sharedStore !== null };
 };

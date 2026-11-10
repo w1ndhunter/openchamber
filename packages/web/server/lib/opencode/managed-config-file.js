@@ -111,7 +111,8 @@ export const createManagedConfigRuntime = ({
     const includeControl = settings?.agentControlToolEnabled !== false;
     const includeSchedule = settings?.agentScheduleToolEnabled !== false;
     const includeWeb = settings?.agentWebToolEnabled !== false;
-    const includeMemory = settings?.agentMemoryToolEnabled === true;
+    const includeMemory = settings?.agentMemoryToolEnabled === true
+      || String(process.env.OPENCHAMBER_SPACE_SHARED_MEMORY_DIR ?? '').trim() !== '';
     const includeKnowledge = settings?.agentKnowledgeToolEnabled !== false;
     const includeNotify = settings?.agentNotifyToolEnabled === true;
     const includeRender = settings?.agentRenderToolEnabled !== false;

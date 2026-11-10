@@ -250,6 +250,8 @@ const openchamberSpaceApprovalSchema = z.object({
     method: z.string(),
     // The destination and the path the space wrote, so the prompt can show what is being approved.
     url: z.string().optional(),
+    // The exact path an "always" answer can cover; a gatekeeper before path rules has none.
+    path: z.string().optional(),
     expiresAt: z.string(),
   }),
 })

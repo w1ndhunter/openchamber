@@ -56,7 +56,7 @@ describe('the journey list and creation progress', () => {
     stoppedIdle: false,
     step: 'checking_place',
     failure: null,
-    network: { mode: 'allowlist', domains: [], writes: 'ask' },
+    network: { mode: 'allowlist', domains: [], writes: 'ask', writesScope: 'path' },
     grants: [],
     writeAccess: [],
     deniedWrites: [],
@@ -182,7 +182,7 @@ describe('the grant dialog and access given through it', () => {
     const grant = { kind: 'model' as const, id: 'openai', provider: 'openai', upstream: 'https://api.openai.com/v1', source: { kind: 'typed' as const }, url: 'http://gatekeeper:8080/model/openai' };
     const running: SpaceEntry = {
       id: ID, name: 'One', placeId: 'docker', machine: null, projectDirectory: '/home/me/app', directory: `/spaces/${ID}/app`, projectFolder: { path: '/home/me/app', found: true }, state: 'running', stoppedIdle: false, step: null,
-      failure: null, network: { mode: 'allowlist', domains: [], writes: 'ask' }, grants: [], writeAccess: [], deniedWrites: [], access: 'needs_access', needsAccess: ['openai'], accessFailures: [], damage: null, setup: null,
+      failure: null, network: { mode: 'allowlist', domains: [], writes: 'ask', writesScope: 'path' }, grants: [], writeAccess: [], deniedWrites: [], access: 'needs_access', needsAccess: ['openai'], accessFailures: [], damage: null, setup: null,
     };
     useSpacesStore.getState().applyJourney([running], 0);
     const before = useSpacesStore.getState().progressRevision;
@@ -200,7 +200,7 @@ describe('the grant dialog and access given through it', () => {
     const failure = (provider: string) => ({ provider, code: 'secret_source_missing', message: 'not set' });
     const running: SpaceEntry = {
       id: ID, name: 'One', placeId: 'docker', machine: null, projectDirectory: '/home/me/app', directory: `/spaces/${ID}/app`, projectFolder: { path: '/home/me/app', found: true }, state: 'running', stoppedIdle: false, step: null,
-      failure: null, network: { mode: 'allowlist', domains: [], writes: 'ask' }, grants: [], writeAccess: [], deniedWrites: [], access: null, needsAccess: [], accessFailures: [failure('openai'), failure('anthropic')], damage: null, setup: null,
+      failure: null, network: { mode: 'allowlist', domains: [], writes: 'ask', writesScope: 'path' }, grants: [], writeAccess: [], deniedWrites: [], access: null, needsAccess: [], accessFailures: [failure('openai'), failure('anthropic')], damage: null, setup: null,
     };
     useSpacesStore.getState().applyJourney([running], 0);
     useSpacesStore.getState().noteGrantGiven(ID, { kind: 'login', id: 'openai', provider: 'openai', method: 'chatgpt-browser', url: 'http://gatekeeper:8080/model/openai' });

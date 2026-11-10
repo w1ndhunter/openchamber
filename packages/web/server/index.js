@@ -762,6 +762,10 @@ const agentMemoryRuntime = createAgentMemoryRuntime({
  * tool, which only an OpenCode we launched has.
  */
 const isAgentMemoryEnabled = async () => {
+  // A space with shared memory attached carries the tool: the source and its mode are the user's
+  // decision. A source with memory off, or detached, leaves the setting to decide as before.
+  const shared = await agentMemoryRuntime.readSharedStatus().catch(() => null);
+  if (shared && shared.mode !== 'off') return true;
   const settings = await readSettingsFromDiskMigrated().catch(() => null);
   return settings?.agentMemoryToolEnabled === true;
 };

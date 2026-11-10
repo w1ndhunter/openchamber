@@ -32,7 +32,13 @@ const isValidationError = (error) => {
 
 const respondWithError = (res, error, fallbackMessage) => {
   const message = error instanceof Error ? error.message : fallbackMessage;
-  if (isValidationError(error)) {
+  if (error?.status === 409) {
+    return res.status(409).json({ error: message, code: error.code ?? 'memory_conflict' });
+  }
+  if (error?.status === 403) {
+    return res.status(403).json({ error: message, code: 'memory_read_only' });
+  }
+  if (isValidationError(error) || error?.status === 400) {
     return res.status(400).json({ error: message });
   }
   return res.status(500).json({ error: message || fallbackMessage });
@@ -53,7 +59,10 @@ const resolveScope = (query) => {
     }
     return { target: { scope: 'project', projectId: query.projectId } };
   }
-  return { error: 'scope must be global or project' };
+  if (query.scope === 'shared') {
+    return { target: { scope: 'shared' } };
+  }
+  return { error: 'scope must be global, project or shared' };
 };
 
 export const registerAgentMemoryRoutes = (app, dependencies) => {
@@ -157,13 +166,17 @@ export const registerAgentMemoryRoutes = (app, dependencies) => {
     if (body.type !== undefined && !MEMORY_TYPES.has(body.type)) {
       return res.status(400).json({ error: 'type must be fact, preference, or reference' });
     }
+    if (body.revision !== undefined && (!Number.isSafeInteger(body.revision) || body.revision < 1)) {
+      return res.status(400).json({ error: 'revision must be a positive whole number' });
+    }
 
     try {
-      const result = await agentMemoryRuntime.update(target, req.params.memoryId, {
-        ...(body.title !== undefined ? { title: body.title } : {}),
-        ...(body.body !== undefined ? { body: body.body } : {}),
-        ...(body.type !== undefined ? { type: body.type } : {}),
-      });
+      const patch = {};
+      if (body.title !== undefined) patch.title = body.title;
+      if (body.body !== undefined) patch.body = body.body;
+      if (body.type !== undefined) patch.type = body.type;
+      if (body.revision !== undefined) patch.expectedRevision = body.revision;
+      const result = await agentMemoryRuntime.update(target, req.params.memoryId, patch);
       if (!result) {
         return res.status(404).json({ error: 'Memory not found' });
       }
@@ -180,7 +193,8 @@ export const registerAgentMemoryRoutes = (app, dependencies) => {
     }
 
     try {
-      const result = await agentMemoryRuntime.remove(target, req.params.memoryId);
+      const revision = req.query.revision !== undefined ? Number(req.query.revision) : undefined;
+      const result = await agentMemoryRuntime.remove(target, req.params.memoryId, revision);
       if (!result.deleted) {
         return res.status(404).json({ error: 'Memory not found' });
       }

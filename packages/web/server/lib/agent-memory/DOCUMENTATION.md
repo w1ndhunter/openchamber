@@ -8,6 +8,21 @@ folder belongs to (`project-resolution.js`), and dreaming (`dreaming.js`), the
 pass that tidies the store on its own. What a session is told about memory is
 `../session-knowledge`; the panel is `packages/ui/src/components/session/project-context`.
 
+It also owns the shared domain (`shared-store.js`): memory a space reads and
+writes through an environment source its user attached. What that source is and
+how its operations reach it is `../spaces`, not this module.
+
+What the agent chooses to remember, in three domains:
+
+| Domain | Store | Boundary |
+|---|---|---|
+| global | `<OPENCHAMBER_DATA_DIR>/memory.json` | one user, every project |
+| project | `<OPENCHAMBER_DATA_DIR>/projects/<project-id>/memory.json` | one project, every worktree |
+| shared | the folder named by `OPENCHAMBER_SPACE_SHARED_MEMORY_DIR` | only a space whose environment source declares it |
+
+The panel, tool, HTTP routes and session index read the same runtime. No domain is
+derived from a model-supplied path or project id.
+
 ## Invariants
 
 - A store that cannot be read is a failure, never an empty store (`read`).
@@ -21,6 +36,34 @@ pass that tidies the store on its own. What a session is told about memory is
   the pass ran cannot be told from the pass's own and is undone with it.
 - A pass's session carries `metadata.hidden: true` and is deleted when the pass
   ends, so no client or server-side consumer ever sees it.
+- A missing store is authoritative empty; a malformed store is a failure, never
+  an empty store. A failed domain does not hide a healthy one.
+- `global` and `project` keep the version-1 single-document format and its
+  process-local writer lock.
+- Shared memory is one file per entry plus a tombstone file per deletion. A
+  directory lock serialises writers across processes and containers.
+- Inside a space every shared change is also recorded as an operation with a
+  stable id and the revision it was based on (`operations/`). The host replays
+  them against the source (`integrateOperations`); a replay of an id the entry
+  remembers changes nothing, so a sync after a crash is idempotent. Conflicted
+  operations are kept in `conflicts/`.
+- The shared mode is `off`, `read` or `write`: the container's variable,
+  overridden by a `.mode` file the host writes. `off` reads as unavailable, never
+  as empty. `memory.list` carries `sharedSync`: the mode, the state (`synced`,
+  `pending`, `read_only`, `offline`, `needs_auth`, `conflicted`, `off`) and the
+  counts, so an agent never takes a local change for a shared one.
+- Every shared entry has a stable id and a revision. An update or delete names
+  the revision it read; a stale revision is `memory_conflict`, not last-writer
+  wins. Wall-clock timestamps order display only.
+- Titles, bodies, types, capacities and threat scans apply in every domain.
+  Automatic session context carries titles only, never bodies.
+- `scope: shared` exists only while the space carries a shared store.
+  `scope: both` keeps its pre-shared meaning: private global and project only.
+  An omitted list/read scope searches every available domain.
+- Read-only shared memory can be read but not mutated. The check is in the
+  store boundary, not only in UI visibility.
+- Host global and project memory is never imported or mounted into a space by
+  this module. A shared domain is a separate source the user attached.
 
 ## Dreaming
 
@@ -87,3 +130,23 @@ deleted on the first look that reaches OpenCode, dreaming on or off.
 A pass is recorded when it ends, and the agent or the user may save or correct
 entries before anyone looks at the panel. Restoring the snapshot alone would
 undo that work too.
+
+### Why shared entries are files rather than a second memory.json
+
+A source can be written by several OpenChamber installations and spaces.
+Whole-file read-modify-write with process-local locks loses updates. Per-entry
+files let unrelated ids merge, and revisions plus tombstones give conflict and
+deletion semantics without trusting clocks or a single JSON rewrite.
+
+### Why the shared lock is a directory
+
+The same folder may be seen by independent server processes and containers.
+`mkdir` is an atomic claim on the supported filesystems, and a stale lock is
+removed by age. A process-local promise lock remains correct for the private
+single-file stores.
+
+### Why updates require a revision
+
+An agent may hold a title and body from an earlier turn while a teammate changed
+the entry. Accepting the write without the revision would silently erase one
+side. A conflict tells the agent to read again; the UI route answers 409.

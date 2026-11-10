@@ -16,6 +16,7 @@ import { getProviderAuth, getStoredLogin, renewStoredLogin } from '../opencode/a
 import { createCodeIn } from './code-in.js';
 import { createCodeOut } from './code-out.js';
 import { createSpaceDispatcher } from './dispatcher.js';
+import { createEnvironmentService } from './environment-service.js';
 import { SpaceError } from './errors.js';
 import { createGatekeeperChannel } from './gatekeeper-channel.js';
 import { createHostGit } from './host-git.js';
@@ -187,6 +188,7 @@ export function createSpacesHost({
   const git = createHostGit({ runCommand, gitPath, environment: hostEnvironment });
   const codeIn = createCodeIn({ git, place: manager });
   const codeOut = createCodeOut({ git, place: manager });
+  const environment = createEnvironmentService({ git, exec: manager.exec });
 
   const listSpaces = async () => (await manager.listAllSpaces()).spaces;
   /** The spaces whose place cannot be asked right now, from the last list; nothing is asked of them. */
@@ -314,6 +316,7 @@ export function createSpacesHost({
     gatekeeper,
     codeIn,
     codeOut,
+    environment,
     records,
     spaceOpenCode,
     serverInside,

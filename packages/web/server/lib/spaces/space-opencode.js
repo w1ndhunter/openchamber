@@ -13,10 +13,14 @@
 
 import { z } from 'zod';
 
+import { isRecord } from '../shared/guards.js';
 import { SpaceError } from './errors.js';
 import { tail } from './exec-http.js';
 import { IMAGE_ONLY_PATH, IMAGE_SH, LEGACY_SPACE_OPENCODE_CONFIG_PATH, spaceOpenCodeConfigDirectory, spaceOpenCodeConfigPath, spaceWindowUrl } from './layout.js';
 import { providerIdSchema } from './space-records.js';
+
+// No environment source: nothing beside the providers.
+const NO_ENVIRONMENT = Object.freeze({ instructions: Object.freeze([]), config: Object.freeze({}) });
 
 // OpenCode takes a key from this option and its auth plugins stay out of the way; the window
 // throws it away and puts the real one in its place. It is not a secret and never was one.
@@ -38,7 +42,8 @@ const writeConfigScriptOf = (spaceId) => {
  * composer offers the host's catalog, and the same provider id inside is what makes that choice
  * work in the space unchanged. Decided with the maintainer on 2026-09-26.
  */
-export function buildProviderConfig(grants, customProviders = new Map()) {
+export function buildProviderConfig(grants, customProviders = new Map(), environment = NO_ENVIRONMENT) {
+  if (!isRecord(environment.config) || !Array.isArray(environment.instructions)) throw new TypeError('An environment configuration is instructions and a config object');
   const provider = {};
   const providers = {};
   for (const grant of grants) {
@@ -59,8 +64,12 @@ export function buildProviderConfig(grants, customProviders = new Map()) {
       if (definition) providers[grant.provider] = { name: definition.name, package: definition.package, settings: { baseURL: spaceWindowUrl(grant.id), apiKey: WINDOW_PLACEHOLDER_KEY }, models: definition.models };
     }
   }
-  const config = { $schema: 'https://opencode.ai/config.json', provider };
+  // The environment source's preferences and ticked items go first: the entries the host writes
+  // for the providers always win, and a source never names a provider at all.
+  const config = { ...environment.config, $schema: 'https://opencode.ai/config.json', provider };
+  delete config.providers;
   if (Object.keys(providers).length > 0) config.providers = providers;
+  if (environment.instructions.length > 0) config.instructions = environment.instructions;
   return config;
 }
 
@@ -321,8 +330,8 @@ export function createSpaceOpenCode({ exec, requestInside, chatMaxBytes = CHAT_E
    * Writes the whole configuration beside the project from the model grants the record holds;
    * `customProviders` holds the host's definition of each custom provider among them, by id.
    */
-  const writeProviderConfig = async (spaceId, grants, customProviders = new Map()) => {
-    const text = `${JSON.stringify(buildProviderConfig(grants, customProviders), null, 2)}\n`;
+  const writeProviderConfig = async (spaceId, grants, customProviders = new Map(), environment = NO_ENVIRONMENT) => {
+    const text = `${JSON.stringify(buildProviderConfig(grants, customProviders, environment), null, 2)}\n`;
     const result = await exec(spaceId, [IMAGE_SH, '-c', writeConfigScriptOf(spaceId)], { stdin: text });
     if (result.code !== 0) {
       throw new SpaceError('space_setup_failed', `Could not write the provider configuration inside the space: ${tail(result.stderr) || `exit code ${result.code}`}`);

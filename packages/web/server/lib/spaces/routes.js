@@ -47,6 +47,7 @@ const STATUS_BY_CODE = new Map([
   ['too_many_write_access', 409],
   ['invalid_idle_stop', 400],
   ['network_is_open', 409],
+  ['network_not_open', 409],
   ['too_many_domains', 409],
   ['secret_source_missing', 409],
   ['login_not_found', 409],
@@ -76,6 +77,18 @@ const STATUS_BY_CODE = new Map([
   ['space_remove_incomplete', 502],
   ['gatekeeper_missing', 409],
   ['invalid_setup_commands', 400],
+  ['invalid_environment_source', 400],
+  ['environment_source_unsafe', 400],
+  ['environment_source_too_large', 400],
+  ['environment_source_unavailable', 502],
+  ['environment_source_missing', 404],
+  ['environment_memory_unavailable', 502],
+  ['environment_memory_off', 409],
+  ['environment_memory_read_only', 409],
+  ['environment_memory_conflict', 409],
+  ['environment_memory_needs_import', 409],
+  ['environment_memory_pending', 409],
+  ['environment_mount_unavailable', 409],
   ['space_setup_running', 409],
   ['chats_not_saved', 409],
   ['invalid_machine', 400],
@@ -261,6 +274,11 @@ export function registerSpaceRoutes(app, { getJourney, getPlaces = () => [], get
 
   // The places funnel: each place asked what it can do, now, because the user is looking. This
   // computer's place also says what gets Docker going there, see `places/docker-setup.js`.
+  // What a source would bring into a new space, before it is made: assets, offers, memory. Nothing is copied.
+  app.post(`${SPACES_ROUTE}/environment/check`, withJourney(async (journey, req, res) => {
+    res.json(await journey.checkEnvironmentSource(requireBody(req)));
+  }));
+
   app.get(`${SPACES_ROUTE}/places`, withJourney(async (_journey, _req, res) => {
     const local = getDockerSetup();
     const places = await Promise.all(getPlaces().map(async (place) => {
@@ -359,6 +377,11 @@ export function registerSpaceRoutes(app, { getJourney, getPlaces = () => [], get
     res.json(await journey.openDomain(spaceIdOf(req), requireBody(req)));
   }));
 
+  // Whether writes in an open space go out on their own; live, and kept for the next start.
+  app.post(`${SPACES_ROUTE}/:id/network`, withJourney(async (journey, req, res) => {
+    res.json(await journey.changeWritePolicy(spaceIdOf(req), requireBody(req)));
+  }));
+
   // A method the user approves for one destination, live; the record keeps it for the next start.
   app.post(`${SPACES_ROUTE}/:id/writes`, withJourney(async (journey, req, res) => {
     res.json(await journey.approveWrites(spaceIdOf(req), requireBody(req)));
@@ -381,6 +404,11 @@ export function registerSpaceRoutes(app, { getJourney, getPlaces = () => [], get
     res.json(await journey.decideWriteApproval(spaceIdOf(req), requireBody(req)));
   }));
 
+  // The chat's turn is over: a "deny once" answer stood only for that turn, so its writes ask again.
+  app.post(`${SPACES_ROUTE}/:id/turn-end`, withJourney(async (journey, req, res) => {
+    res.json(await journey.endSpaceTurn(spaceIdOf(req)));
+  }));
+
   // The project's setup commands, again: answers once they began; each step follows as an event.
   app.post(`${SPACES_ROUTE}/:id/setup`, withJourney(async (journey, req, res) => {
     res.json(await journey.runSetup(spaceIdOf(req), requireBody(req)));
@@ -389,6 +417,41 @@ export function registerSpaceRoutes(app, { getJourney, getPlaces = () => [], get
   // How the last run went, with the end of the output of the command that failed.
   app.get(`${SPACES_ROUTE}/:id/setup`, withJourney(async (journey, req, res) => {
     res.json(await journey.readSetup(spaceIdOf(req)));
+  }));
+
+  // Applies the recorded environment source at its current revision; assets only.
+  app.post(`${SPACES_ROUTE}/:id/environment/refresh`, withJourney(async (journey, req, res) => {
+    res.json(await journey.refreshEnvironment(spaceIdOf(req)));
+  }));
+
+  // Whether the source moved since the space took it; changes nothing.
+  app.get(`${SPACES_ROUTE}/:id/environment/check`, withJourney(async (journey, req, res) => {
+    res.json(await journey.checkEnvironment(spaceIdOf(req)));
+  }));
+
+  // The memory mode, the branch or the ticked items, applied now.
+  app.post(`${SPACES_ROUTE}/:id/environment`, withJourney(async (journey, req, res) => {
+    res.json(await journey.configureEnvironment(spaceIdOf(req), requireBody(req)));
+  }));
+
+  // Takes the source out of the space's OpenCode; what was copied stays.
+  app.post(`${SPACES_ROUTE}/:id/environment/detach`, withJourney(async (journey, req, res) => {
+    res.json(await journey.detachEnvironment(spaceIdOf(req), req.body ?? {}));
+  }));
+
+  // Replays the space's shared memory changes at the source and brings the source's state back.
+  app.post(`${SPACES_ROUTE}/:id/environment/memory/sync`, withJourney(async (journey, req, res) => {
+    res.json(await journey.syncEnvironmentMemory(spaceIdOf(req)));
+  }));
+
+  // What the space's shared memory holds that the source does not have yet, read now.
+  app.get(`${SPACES_ROUTE}/:id/environment/memory`, withJourney(async (journey, req, res) => {
+    res.json(await journey.readEnvironmentMemory(spaceIdOf(req)));
+  }));
+
+  // The reviewed one-time import of a version 1 memory file: a preview, then a confirmation.
+  app.post(`${SPACES_ROUTE}/:id/environment/memory/import`, withJourney(async (journey, req, res) => {
+    res.json(await journey.importEnvironmentMemory(spaceIdOf(req), requireBody(req)));
   }));
 
   app.get(`${SPACES_ROUTE}/:id/journal`, withJourney(async (journey, req, res) => {

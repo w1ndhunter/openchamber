@@ -64,6 +64,7 @@ const journeyOf = (overrides = {}) => {
     approveWrites: record('approveWrites', { writeAccess: [{ host: 'api.github.com', methods: ['POST'] }] }),
     revokeWrites: record('revokeWrites', { writeAccess: [] }),
     decideWriteApproval: record('decideWriteApproval', { settled: true }),
+    endSpaceTurn: record('endSpaceTurn', { ended: true }),
     readJournal: record('readJournal', { records: [], dropped: 0, since: 'now' }),
     previewApply: record('previewApply', { changedPaths: 2 }),
     applySpace: record('applySpace', { applied: { status: 'applied' } }),
@@ -72,6 +73,13 @@ const journeyOf = (overrides = {}) => {
     changeIdleStop: record('changeIdleStop', { enabled: false, hours: 8 }),
     runSetup: record('runSetup', { id: ID, state: 'running', setup: { state: 'running', index: 0, total: 1, command: 'npm ci' } }),
     readSetup: record('readSetup', { setup: null, output: null }),
+    refreshEnvironment: record('refreshEnvironment', { environment: { kind: 'folder', location: '/shared/env', ref: '', memory: 'read' }, status: { revision: 'abc' } }),
+    syncEnvironmentMemory: record('syncEnvironmentMemory', { pushed: true, conflicts: [] }),
+    checkEnvironment: record('checkEnvironment', { plan: null, current: 'abc', changed: false, failure: null }),
+    checkEnvironmentSource: record('checkEnvironmentSource', { plan: { revision: 'abc' } }),
+    configureEnvironment: record('configureEnvironment', { environment: { memory: 'off' } }),
+    detachEnvironment: record('detachEnvironment', { environment: null, status: { state: 'off' } }),
+    importEnvironmentMemory: record('importEnvironmentMemory', { entries: [], imported: 0 }),
     readHostLogins: record('readHostLogins', { logins: [{ provider: 'openai', method: 'chatgpt-token-sharing', expires: '2026-09-26T11:00:00.000Z', state: 'usable' }] }),
     readHostCustomProviders: record('readHostCustomProviders', { providers: [{ id: 'ollama-local', name: 'Ollama (local)', hasKey: false }] }),
     readDisk: record('readDisk', { imageBytes: null, toolsBytes: 0, spacesBytes: 0, freeBytes: 0, freesImage: false }),
@@ -94,7 +102,7 @@ describe('space routes', () => {
   });
   it('answers every journey route with 404 and isolated_spaces_off while the feature is off, and the switch still works', async () => {
     const { call, calls } = await serve({ journey: null, switchState: { enabled: false } });
-    for (const [method, path] of [['GET', ''], ['POST', ''], ['GET', '/places'], ['POST', `/${ID}/start`], ['POST', `/${ID}/stop`], ['POST', `/${ID}/restart`], ['POST', `/${ID}/restart-opencode`], ['POST', `/${ID}/grants`], ['POST', `/${ID}/writes`], ['DELETE', `/${ID}/writes`], ['POST', `/${ID}/approvals`], ['GET', '/logins'], ['GET', '/custom-providers'], ['DELETE', `/${ID}`], ['GET', `/${ID}/journal`], ['GET', `/${ID}/apply`], ['POST', `/${ID}/apply`], ['GET', '/idle-stop'], ['PUT', '/idle-stop'], ['POST', `/${ID}/setup`], ['GET', `/${ID}/setup`], ['GET', '/places/docker/disk'], ['POST', '/places/docker/clean-up'], ['POST', '/places/docker/image'], ['GET', '/places/local/setup'], ['POST', '/places/local/setup']]) {
+    for (const [method, path] of [['GET', ''], ['POST', ''], ['GET', '/places'], ['POST', `/${ID}/start`], ['POST', `/${ID}/stop`], ['POST', `/${ID}/restart`], ['POST', `/${ID}/restart-opencode`], ['POST', `/${ID}/grants`], ['POST', `/${ID}/writes`], ['DELETE', `/${ID}/writes`], ['POST', `/${ID}/approvals`], ['POST', `/${ID}/turn-end`], ['GET', '/logins'], ['GET', '/custom-providers'], ['DELETE', `/${ID}`], ['GET', `/${ID}/journal`], ['GET', `/${ID}/apply`], ['POST', `/${ID}/apply`], ['GET', '/idle-stop'], ['PUT', '/idle-stop'], ['POST', `/${ID}/setup`], ['GET', `/${ID}/setup`], ['POST', `/${ID}/environment/refresh`], ['POST', `/${ID}/environment/memory/sync`], ['GET', `/${ID}/environment/check`], ['POST', `/${ID}/environment`], ['POST', `/${ID}/environment/detach`], ['POST', `/${ID}/environment/memory/import`], ['POST', '/environment/check'], ['GET', '/places/docker/disk'], ['POST', '/places/docker/clean-up'], ['POST', '/places/docker/image'], ['GET', '/places/local/setup'], ['POST', '/places/local/setup']]) {
       expect(await call(method, `${SPACES_ROUTE}${path}`, method === 'GET' || method === 'DELETE' ? undefined : {}), `${method} ${path}`).toEqual({ status: 404, body: { code: 'isolated_spaces_off', message: 'Isolated spaces are turned off.', details: null } });
     }
     expect(await call('GET', `${SPACES_ROUTE}/switch`)).toEqual({ status: 200, body: { enabled: false, spaces: [] } });
@@ -176,6 +184,7 @@ describe('space routes', () => {
     expect(await call('POST', `${SPACES_ROUTE}/${ID}/writes`, { host: 'api.github.com', methods: ['POST'] })).toEqual({ status: 200, body: { writeAccess: [{ host: 'api.github.com', methods: ['POST'] }] } });
     expect(await call('DELETE', `${SPACES_ROUTE}/${ID}/writes`, { host: 'api.github.com', methods: ['POST'] })).toEqual({ status: 200, body: { writeAccess: [] } });
     expect(await call('POST', `${SPACES_ROUTE}/${ID}/approvals`, { requestId: 3, allowed: true })).toEqual({ status: 200, body: { settled: true } });
+    expect(await call('POST', `${SPACES_ROUTE}/${ID}/turn-end`)).toEqual({ status: 200, body: { ended: true } });
     expect(await call('GET', `${SPACES_ROUTE}/logins`)).toEqual({ status: 200, body: { logins: [{ provider: 'openai', method: 'chatgpt-token-sharing', expires: '2026-09-26T11:00:00.000Z', state: 'usable' }] } });
     expect(await call('GET', `${SPACES_ROUTE}/custom-providers?directory=%2Fhome%2Fme%2Fproject`)).toEqual({ status: 200, body: { providers: [{ id: 'ollama-local', name: 'Ollama (local)', hasKey: false }] } });
     expect(await call('GET', `${SPACES_ROUTE}/${ID}/journal`)).toEqual({ status: 200, body: { records: [], dropped: 0, since: 'now' } });
@@ -183,9 +192,18 @@ describe('space routes', () => {
     expect(await call('POST', `${SPACES_ROUTE}/${ID}/apply`, { as: 'branch', branch: 'b' })).toEqual({ status: 200, body: { applied: { status: 'applied' } } });
     expect(await call('POST', `${SPACES_ROUTE}/${ID}/setup`, { commands: ['npm ci'] })).toEqual({ status: 200, body: { id: ID, state: 'running', setup: { state: 'running', index: 0, total: 1, command: 'npm ci' } } });
     expect(await call('GET', `${SPACES_ROUTE}/${ID}/setup`)).toEqual({ status: 200, body: { setup: null, output: null } });
+    expect(await call('POST', `${SPACES_ROUTE}/${ID}/environment/refresh`)).toEqual({ status: 200, body: { environment: { kind: 'folder', location: '/shared/env', ref: '', memory: 'read' }, status: { revision: 'abc' } } });
+    expect(await call('POST', `${SPACES_ROUTE}/${ID}/environment/memory/sync`)).toEqual({ status: 200, body: { pushed: true, conflicts: [] } });
+    expect(await call('GET', `${SPACES_ROUTE}/${ID}/environment/check`)).toEqual({ status: 200, body: { plan: null, current: 'abc', changed: false, failure: null } });
+    expect(await call('POST', `${SPACES_ROUTE}/environment/check`, { kind: 'folder', location: '/x' })).toEqual({ status: 200, body: { plan: { revision: 'abc' } } });
+    expect(journey.calls.at(-1)).toEqual(['checkEnvironmentSource', { kind: 'folder', location: '/x' }]);
+    expect(await call('POST', `${SPACES_ROUTE}/${ID}/environment`, { memory: 'off' })).toEqual({ status: 200, body: { environment: { memory: 'off' } } });
+    expect(journey.calls.at(-1)).toEqual(['configureEnvironment', ID, { memory: 'off' }]);
+    expect(await call('POST', `${SPACES_ROUTE}/${ID}/environment/detach`)).toEqual({ status: 200, body: { environment: null, status: { state: 'off' } } });
+    expect(await call('POST', `${SPACES_ROUTE}/${ID}/environment/memory/import`, { confirm: false })).toEqual({ status: 200, body: { entries: [], imported: 0 } });
     expect(await call('DELETE', `${SPACES_ROUTE}/${ID}`)).toEqual({ status: 200, body: { id: ID, removed: true } });
     expect(journey.calls).toEqual([
-      ['listSpaces', { access: true }], ['readDisk', 'docker'], ['cleanUpDisk', 'docker'], ['pullImage', 'docker'], ['createSpace', request], ['startSpace', ID], ['stopSpace', ID], ['restartSpace', ID], ['restartOpenCode', ID], ['grantAccess', ID, { kind: 'domain', upstream: 'https://registry.example.com/' }], ['openDomain', ID, { domain: 'registry.npmjs.org' }], ['approveWrites', ID, { host: 'api.github.com', methods: ['POST'] }], ['revokeWrites', ID, { host: 'api.github.com', methods: ['POST'] }], ['decideWriteApproval', ID, { requestId: 3, allowed: true }], ['readHostLogins'], ['readHostCustomProviders', '/home/me/project'], ['readJournal', ID], ['previewApply', ID], ['applySpace', ID, { as: 'branch', branch: 'b' }], ['runSetup', ID, { commands: ['npm ci'] }], ['readSetup', ID], ['removeSpace', ID, { allowUnsaved: false }],
+      ['listSpaces', { access: true }], ['readDisk', 'docker'], ['cleanUpDisk', 'docker'], ['pullImage', 'docker'], ['createSpace', request], ['startSpace', ID], ['stopSpace', ID], ['restartSpace', ID], ['restartOpenCode', ID], ['grantAccess', ID, { kind: 'domain', upstream: 'https://registry.example.com/' }], ['openDomain', ID, { domain: 'registry.npmjs.org' }], ['approveWrites', ID, { host: 'api.github.com', methods: ['POST'] }], ['revokeWrites', ID, { host: 'api.github.com', methods: ['POST'] }], ['decideWriteApproval', ID, { requestId: 3, allowed: true }], ['endSpaceTurn', ID], ['readHostLogins'], ['readHostCustomProviders', '/home/me/project'], ['readJournal', ID], ['previewApply', ID], ['applySpace', ID, { as: 'branch', branch: 'b' }], ['runSetup', ID, { commands: ['npm ci'] }], ['readSetup', ID], ['refreshEnvironment', ID], ['syncEnvironmentMemory', ID], ['checkEnvironment', ID], ['checkEnvironmentSource', { kind: 'folder', location: '/x' }], ['configureEnvironment', ID, { memory: 'off' }], ['detachEnvironment', ID, {}], ['importEnvironmentMemory', ID, { confirm: false }], ['removeSpace', ID, { allowUnsaved: false }],
     ]);
   });
 
@@ -220,6 +238,8 @@ describe('space routes', () => {
       ['space_busy', 409], ['space_creation_failed', 409], ['invalid_grant_request', 400], ['secret_source_missing', 409], ['login_not_found', 409], ['login_not_supported', 409], ['login_expired', 409], ['space_record_unreadable', 409], ['invalid_domain', 400], ['network_is_open', 409], ['too_many_domains', 409],
       ['branch_exists', 409], ['changes_do_not_apply', 409], ['changes_route_closed', 409], ['nothing_to_apply', 409], ['place_cannot_restrict_network', 409],
       ['invalid_setup_commands', 400], ['space_setup_running', 409],
+      ['invalid_environment_source', 400], ['environment_source_unsafe', 400], ['environment_source_too_large', 400], ['environment_source_unavailable', 502],
+      ['environment_source_missing', 404], ['environment_memory_unavailable', 502], ['environment_memory_off', 409], ['environment_memory_read_only', 409], ['environment_memory_conflict', 409],
       ['space_remove_incomplete', 502], ['docker_command_failed', 502], ['code_out_failed', 502],
     ];
     for (const [code, status] of cases) {

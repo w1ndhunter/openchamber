@@ -2,7 +2,7 @@
 // host answers with the gatekeeper's own view: which provider has a key, which needs it again after
 // a restart, and what a blocked attempt in the gatekeeper's journal was refused for.
 
-import { providerGrantOf, type SpaceEntry, type SpaceJournalRecord } from './spaces-api';
+import { providerGrantOf, type SpaceEntry, type SpaceJournalRecord, type SpaceWriteMethod } from './spaces-api';
 
 // The allowlist's rule for a name, the server's own (`space-records.js`): labels of letters,
 // digits and hyphens, with a real last label.
@@ -10,6 +10,17 @@ const DOMAIN_PATTERN = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)
 
 /** Whether a lower-case value is a name the allowlist takes. */
 export const isDomainName = (value: string): boolean => DOMAIN_PATTERN.test(value);
+
+const WRITE_METHODS: ReadonlySet<string> = new Set(['DELETE', 'PATCH', 'POST', 'PUT']);
+// A method from the journal or a waiting write is text the gatekeeper wrote, so it is checked
+// against the set before it is used as one of the four: anything else is not approvable.
+export const isWriteMethod = (value: string): value is SpaceWriteMethod => WRITE_METHODS.has(value);
+
+/**
+ * Whether an answer for this destination and method can stand: the host keeps one only for a
+ * domain name and one of the four methods, so a prompt offers "always" for nothing else.
+ */
+export const isRememberableWrite = (host: string, method: string): method is SpaceWriteMethod => isDomainName(host) && isWriteMethod(method);
 
 type ProviderAccess = 'granted' | 'needs_again' | 'none';
 

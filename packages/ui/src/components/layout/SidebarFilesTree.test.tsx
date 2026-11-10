@@ -61,7 +61,7 @@ test('a draft waiting for a new space lists nothing of this computer\'s while th
   const space: SpaceEntry = {
     id: 'a1b2c3d4e5f6', name: 'Fix login', placeId: 'docker', machine: null,
     projectDirectory: PROJECT, projectFolder: { path: PROJECT, found: null }, directory: SPACE,
-    state: 'preparing', stoppedIdle: false, step: 'creating', failure: null, network: { mode: 'allowlist', domains: [], writes: 'ask' },
+    state: 'preparing', stoppedIdle: false, step: 'creating', failure: null, network: { mode: 'allowlist', domains: [], writes: 'ask', writesScope: 'path' },
     grants: [], writeAccess: [], deniedWrites: [], access: null, needsAccess: [], accessFailures: [], damage: null, setup: null,
   };
   // As "Create space" leaves it: the draft stays on the project's folder while it waits for the space.

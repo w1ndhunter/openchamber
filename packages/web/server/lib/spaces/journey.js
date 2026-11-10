@@ -42,13 +42,15 @@ import path from 'node:path';
 import { z } from 'zod';
 
 import { SpaceError } from './errors.js';
+import { environmentOptInsSchema, environmentSourceSchema } from './environment-source.js';
+import { isEnvironmentMountPath } from './layout.js';
 import { DEFAULT_IDLE_STOP, idleStopSchema } from './idle-stop.js';
 import { headerOfPackage, windowUpstreamOf } from './host-providers.js';
 import { permissionDefaultOf } from './space-permission-default.js';
 import { ROLE_GATEKEEPER, createSpaceId, hashProjectDirectory, spaceResourceName } from './labels.js';
 import { spaceProjectPath, spaceWindowUrl } from './layout.js';
 import { LOGIN_PROVIDERS, buildStartConfig, loginEndOf, loginEnded, loginGrantOf } from './space-opencode.js';
-import { WRITABLE_METHODS, domainSchema, grantSchema, networkSchema, providerIdSchema, secretSourceSchema, writeAccessSchema } from './space-records.js';
+import { WRITABLE_METHODS, domainSchema, grantSchema, networkSchema, providerIdSchema, secretSourceSchema, writeAccessSchema, writePathSchema } from './space-records.js';
 import { createSpaceToken } from './space-server.js';
 import { createSpaceSetup, setupCommandsSchema } from './space-setup.js';
 
@@ -64,6 +66,8 @@ const createRequestSchema = z.object({
   // The project's worktree setup commands as the client resolved them, the shared ones only when
   // the user trusted them; they run once the code arrived (5d-4).
   setupCommands: setupCommandsSchema.default([]),
+  // A shared folder or Git repository of passive OpenCode assets and optional shared memory.
+  environment: environmentSourceSchema.nullable().default(null),
   // The model access chosen in the dialog, given by the host once the space runs, before it is
   // ready: the creation carries it, so nothing depends on the window that asked staying open.
   // A typed key lives only in this request and the gatekeeper, as with the grant dialog.
@@ -79,6 +83,7 @@ const CREATE_REFUSALS = {
   start: ['invalid_snapshot_mode', 'A space starts from a clean commit or with the uncommitted changes.'],
   network: ['invalid_network', 'The network of a space is allowlist or open, with a list of domain names for the allowlist.'],
   setupCommands: ['invalid_setup_commands', 'The setup commands are a list of at most 100 commands of at most 4000 characters each.'],
+  environment: ['invalid_environment_source', 'An environment source is a Git repository or a folder, with an optional read or write shared memory.'],
   grants: ['invalid_grant_request', 'The model access of a new space is a list of model keys, the host\'s own logins and providers of your own.'],
 };
 const setupRequestSchema = z.object({ commands: setupCommandsSchema }).strict();
@@ -126,16 +131,73 @@ const openDomainRequestSchema = z.object({
   domain: z.string().trim().toLowerCase().pipe(domainSchema),
 }).strict();
 
+// The choices about writes from the access dialog: whether an open space asks, and what an "always"
+// answer remembers in either mode. The mode and the list of names are set where the space is made.
+const networkWritesRequestSchema = z.object({
+  writes: z.enum(['ask', 'allow']).optional(),
+  writesScope: z.enum(['path', 'host']).optional(),
+}).strict().refine((value) => value.writes !== undefined || value.writesScope !== undefined);
+
+// What the access dialog may change about a space's environment source. The kind, the location and
+// the delivery are what the space was made with.
+const environmentChangeSchema = z.object({
+  memory: z.enum(['off', 'read', 'write']).optional(),
+  ref: z.string().trim().max(256).optional(),
+  optIns: environmentOptInsSchema.optional(),
+}).strict();
+
+// The reviewed import of a version 1 memory file: a preview, or a confirmation of the chosen ids.
+const memoryImportSchema = z.object({
+  confirm: z.boolean().default(false),
+  memoryIds: z.array(z.string().trim().min(1).max(128)).max(2_000).nullable().default(null),
+}).strict();
+
+/** A failure as the record keeps it: the code and the sentence, never a stack. */
+// The reasons a source failure names for the user to act on; any other is none.
+const FAILURE_REASONS = ['offline', 'needs_auth', 'needs_setup', 'unavailable', 'pending'];
+const environmentFailureOf = (error) => ({
+  code: error instanceof SpaceError ? error.code : 'environment_source_failed',
+  message: String(error?.message ?? error ?? '').slice(0, 2_000),
+  reason: FAILURE_REASONS.includes(error?.details?.reason) ? error.details.reason : null,
+  at: new Date().toISOString(),
+});
+
+/** The status of a source that did not arrive, with the reason the user can act on. */
+const blockedStatus = (source, error) => {
+  const status = {
+    state: 'blocked',
+    kind: source.kind,
+    location: source.location,
+    ref: source.ref,
+    memory: source.memory,
+    delivery: source.delivery,
+    included: 0,
+    omitted: [],
+    instructions: [],
+    appliedAt: new Date().toISOString(),
+  };
+  if (error) status.lastFailure = environmentFailureOf(error);
+  return status;
+};
+
+/** What the provider configuration beside the project takes from an applied source, or null. */
+const environmentConfigOf = (status) => {
+  if (!status || status.state !== 'ready') return null;
+  return { instructions: status.instructions ?? [], config: status.config ?? {} };
+};
+
 // A method the user approves for one destination, from a blocked attempt in the journal.
 const writeAccessRequestSchema = z.object({
   host: z.string().trim().toLowerCase().pipe(domainSchema),
   methods: z.array(z.enum(WRITABLE_METHODS)).min(1).max(WRITABLE_METHODS.length),
+  path: writePathSchema.optional(),
 }).strict();
 
 // A denial, and the empty list that clears one: the dialog takes the host back to asking.
 const deniedWritesRequestSchema = z.object({
   host: z.string().trim().toLowerCase().pipe(domainSchema),
   methods: z.array(z.enum(WRITABLE_METHODS)).max(WRITABLE_METHODS.length),
+  path: writePathSchema.optional(),
 }).strict();
 
 const sameWriteEntries = (left, right) => JSON.stringify(left) === JSON.stringify(right);
@@ -144,25 +206,30 @@ const sameWriteEntries = (left, right) => JSON.stringify(left) === JSON.stringif
  * `entries` without the listed methods for `host`, in the same order. A destination left with no
  * method leaves the list: an empty entry is not a rule, and both lists need at least one method.
  */
-const withoutMethods = (entries, host, methods) => {
+const withoutMethods = (entries, host, methods, path = null) => {
   const next = [];
   for (const entry of entries) {
-    if (entry.host !== host) {
-      next.push({ host: entry.host, methods: [...entry.methods] });
+    if (entry.host !== host || (entry.path ?? null) !== path) {
+      next.push({ ...entry, methods: [...entry.methods] });
       continue;
     }
     const kept = methods.length === 0 ? [] : entry.methods.filter((method) => !methods.includes(method));
-    if (kept.length > 0) next.push({ host, methods: kept });
+    if (kept.length > 0) next.push({ ...entry, methods: kept });
   }
   return next;
 };
 
-// The user's answer for one write that is waiting: the id the gatekeeper gave it, and whether it
-// goes out. Nothing else: the host never names the destination here, the gatekeeper already has it.
+// The user's answer for one write that is waiting: the id the gatekeeper gave it, whether it goes
+// out, and whether the answer stands. A refusal stands unless `remember` is false; an approval only
+// when it is true. Nothing else: the destination and the scope come from the gatekeeper and the
+// record, never from the app. A standing approval also names the write the prompt showed, so an
+// id the gatekeeper gave again after a restart never approves a different write.
 const approvalDecisionSchema = z.object({
   requestId: z.number().int().positive(),
   allowed: z.boolean(),
-}).strict();
+  remember: z.boolean().optional(),
+  shown: z.object({ host: z.string(), method: z.string(), path: z.string().optional() }).strict().optional(),
+}).strict().refine((value) => !(value.allowed && value.remember === true) || value.shown !== undefined);
 
 const applyRequestSchema = z.discriminatedUnion('as', [
   z.object({ as: z.literal('branch'), branch: z.string(), removeAfterwards: z.boolean().default(false) }),
@@ -213,6 +280,7 @@ export function createSpaceJourney({
   gatekeeper,
   codeIn,
   codeOut,
+  environment,
   records,
   spaceOpenCode,
   serverInside,
@@ -267,6 +335,21 @@ export function createSpaceJourney({
     const place = places.get(placeId);
     if (!place) throw new SpaceError('place_not_found', `There is no place ${placeId}`);
     return place;
+  };
+
+  /**
+   * The folder to mount, as the Docker host will see it. Only the local place: on another machine
+   * the path would name a folder there that this host never inspected, so the mount is refused
+   * rather than reinterpreted. A snapshot travels to any place.
+   */
+  const requireMountablePlace = (placeId, location) => {
+    if (requirePlace(placeId).machine) {
+      throw new SpaceError('environment_mount_unavailable', 'A folder can be mounted only into a space on this computer. On another machine, use a snapshot of it.');
+    }
+    if (!isEnvironmentMountPath(location)) {
+      throw new SpaceError('environment_mount_unavailable', 'This folder\'s path cannot be mounted: it holds a comma, a quote, an equals sign or a backslash. Use a snapshot of it.');
+    }
+    return location;
   };
 
   // Which places could not be asked at the last list, so a place going away or coming back is
@@ -415,7 +498,7 @@ export function createSpaceJourney({
       });
   };
 
-  const prepare = async (entry, { placeId, projectDirectory, name, start, network, setupCommands, grants }) => {
+  const prepare = async (entry, { placeId, projectDirectory, name, start, network, setupCommands, grants, environment: source }) => {
     let created = false;
     try {
       progress(entry, 'checking_place');
@@ -424,21 +507,60 @@ export function createSpaceJourney({
       if (network.mode === 'allowlist' && check.hostIsolation !== true) {
         throw new SpaceError('place_cannot_restrict_network', 'This place cannot keep a space away from the machine it runs on, so an allowlist would not hold. Use a newer Docker engine, or choose the open network with that in mind.');
       }
+      // Read before a container exists: a bad manifest, link or size is refused without a rollback.
+      let environmentMount = null;
+      if (source !== null) {
+        const plan = await environment.inspect(source);
+        if (source.delivery === 'mount') environmentMount = requireMountablePlace(placeId, plan.location);
+      }
       progress(entry, 'creating');
       // OpenCode inside reads this over every configuration file, so a custom provider the
       // project's own `.opencode/opencode.json` defines too still goes through the window. Only
       // the providers the host defines now: the grant of any other fails below anyway.
       const startConfig = buildStartConfig([...(await customDefinitionsOf(grants, projectDirectory)).keys()]);
-      await manager.createSpace({ id: entry.id, placeId, projectDirectory, name, onStep: (step) => progress(entry, step), startConfig });
+      await manager.createSpace({
+        id: entry.id,
+        placeId,
+        projectDirectory,
+        name,
+        onStep: (step) => progress(entry, step),
+        startConfig,
+        // Set for every space with a source, so a later change of the mode needs no new container.
+        sharedMemoryMode: source === null ? null : source.memory,
+        environmentMount,
+      });
       created = true;
       // With the place, the name and the time, so the space is still listed while its place cannot be asked.
-      records.write(entry.id, { placeId, name: entry.name, created: entry.created, network, repository: projectDirectory, writeAccess: [], deniedWrites: [] });
+      records.write(entry.id, {
+        placeId,
+        name: entry.name,
+        created: entry.created,
+        network,
+        repository: projectDirectory,
+        writeAccess: [],
+        deniedWrites: [],
+        environment: source,
+      });
       progress(entry, 'setting_network');
       await gatekeeper.setNetwork(entry.id, network);
       progress(entry, 'bringing_code');
       const arrived = await codeIn.bringCodeIn({ repository: projectDirectory, spaceId: entry.id, mode: start });
       records.update(entry.id, { spacePath: arrived.spacePath, base: arrived.base });
       entry.identityCopied = arrived.identityCopied;
+      if (source !== null) {
+        progress(entry, 'preparing_environment');
+        // A source that fails here leaves a working space without it, and says so: the code,
+        // the grants and the setup are not undone for the shared assets.
+        let status;
+        try {
+          status = { state: 'ready', ...(await environment.apply(entry.id, source, { seedMemory: true })) };
+        } catch (error) {
+          status = blockedStatus(source, error);
+        }
+        records.update(entry.id, { environmentStatus: status, environmentMount });
+        entry.environmentStatus = status;
+        if (status.state === 'ready') await rewriteProviderConfig(entry.id, [], projectDirectory, status);
+      }
       await deliverSettings(entry.id);
       // The model access chosen in the dialog, before "ready", so the first message finds it. A
       // grant that fails leaves the space working and is listed with its reason until a later grant
@@ -487,7 +609,7 @@ export function createSpaceJourney({
       const [code, message] = CREATE_REFUSALS[parsed.error.issues[0]?.path?.[0]] ?? CREATE_REFUSALS.network;
       throw new SpaceError(code, message);
     }
-    const { name, start, network, setupCommands, grants } = parsed.data;
+    const { name, start, network, setupCommands, grants, environment: source } = parsed.data;
     const placeId = parsed.data.placeId ?? places.list()[0]?.id;
     requirePlace(placeId);
     const projectDirectory = await requireRegisteredProject(parsed.data.projectDirectory);
@@ -504,9 +626,11 @@ export function createSpaceJourney({
       failure: null,
       network,
       setupTotal: setupCommands.length,
+      environment: source,
+      environmentStatus: null,
     };
     pending.set(entry.id, entry);
-    void prepare(entry, { placeId, projectDirectory, name, start, network, setupCommands, grants });
+    void prepare(entry, { placeId, projectDirectory, name, start, network, setupCommands, grants, environment: source });
     return describePending(entry);
   };
 
@@ -593,10 +717,12 @@ export function createSpaceJourney({
    * stop in the home volume, but a write that failed at the grant is repaired only here. It
    * cooperates and enforces nothing, so a failure is logged and the start goes on.
    */
-  const rewriteProviderConfig = async (spaceId, grants, repository) => {
-    if (!grants.some((grant) => configuresProvider(grant))) return;
+  const rewriteProviderConfig = async (spaceId, grants, repository, environmentStatus = records.read(spaceId).record?.environmentStatus ?? null, { always = false } = {}) => {
+    const shared = environmentConfigOf(environmentStatus);
+    // `always` for a detach: the file must lose what the source put there even with no provider in it.
+    if (!always && !grants.some((grant) => configuresProvider(grant)) && shared === null) return;
     try {
-      await spaceOpenCode.writeProviderConfig(spaceId, grants, await customDefinitionsOf(grants, repository));
+      await spaceOpenCode.writeProviderConfig(spaceId, grants, await customDefinitionsOf(grants, repository), shared ?? undefined);
     } catch (error) {
       logger.warn?.(`[spaces] the provider configuration of space ${spaceId} was not written again: ${error?.code ?? error?.message ?? error}`);
     }
@@ -836,6 +962,8 @@ export function createSpaceJourney({
     grants: [],
     writeAccess: [],
     deniedWrites: [],
+    environment: records.read(entry.id).record?.environment ?? null,
+    environmentStatus: entry.environmentStatus ?? records.read(entry.id).record?.environmentStatus ?? null,
     accessFailures: [],
     access: null,
     needsAccess: [],
@@ -891,6 +1019,8 @@ export function createSpaceJourney({
         network: record?.network ?? null,
         writeAccess: record?.writeAccess ?? [],
         deniedWrites: record?.deniedWrites ?? [],
+        environment: record?.environment ?? null,
+        environmentStatus: record?.environmentStatus ?? null,
         history: record?.history ?? 'unknown',
         setup: setup.describe(space.id, record),
         grants: grants.map(describeGrant),
@@ -974,18 +1104,18 @@ export function createSpaceJourney({
           since = answer.since;
           for (const waiting of answer.requests) {
             if (watch.stopped) return;
-            announce(spaceId, {
-              type: 'openchamber:space-approval',
-              properties: {
-                spaceId,
-                requestId: waiting.id,
-                host: waiting.host,
-                port: waiting.port,
-                method: waiting.method,
-                url: waiting.url,
-                expiresAt: waiting.expiresAt,
-              },
-            });
+            const properties = {
+              spaceId,
+              requestId: waiting.id,
+              host: waiting.host,
+              port: waiting.port,
+              method: waiting.method,
+              url: waiting.url,
+              expiresAt: waiting.expiresAt,
+            };
+            // A gatekeeper from before path rules has no path to name.
+            if (waiting.path) properties.path = waiting.path;
+            announce(spaceId, { type: 'openchamber:space-approval', properties });
           }
         } catch (error) {
           if (watch.stopped) return;
@@ -1015,35 +1145,127 @@ export function createSpaceJourney({
   /**
    * The user's answer for one write that is waiting: allowed sends it on, anything else refuses
    * it. A wait that is already gone is not an error: it answers `settled: false`, because the
-   * prompt arrived after the gatekeeper's limit. The gatekeeper is answered without waiting for
-   * an apply in progress; the record is written inside the space's turn, because it is a
-   * read-modify-write that another grant or domain change must not race.
+   * prompt arrived after the gatekeeper's limit. The answer also says the `scope` the record holds,
+   * the one a standing or turn answer was given for, so the app settles the prompts it covers from
+   * the host's choice rather than its own copy. Any answer but an approval of one write takes the
+   * space's turn: it is a read-modify-write of the record, and answering it half way would leave an
+   * answer the user made unremembered, so a space that is busy refuses it before anything moves. An
+   * approval of one write changes no record and goes out at once, so a running apply never holds
+   * it past the limit.
    */
   const decideWriteApproval = async (spaceId, request) => {
     requireNotPending(spaceId);
     const parsed = approvalDecisionSchema.safeParse(request ?? {});
     if (!parsed.success) throw new SpaceError('invalid_approval', 'An answer names the waiting write and whether it is allowed.');
-    const space = await requireListed(spaceId);
-    if (space.state !== 'running') throw new SpaceError('space_not_running', 'A write waits for the user only in a running space.');
-    const answer = await gatekeeper.decideApproval(spaceId, { id: parsed.data.requestId, allowed: parsed.data.allowed });
-    // A denial stands for that destination: the gatekeeper holds it from now on, and the record
-    // keeps it for the next start. Read back rather than guessed here, so the destination is the
-    // one the gatekeeper actually refused and the host never names it in an answer.
-    if (parsed.data.allowed === false) await exclusive(spaceId, () => rememberDenials(spaceId));
-    return answer;
+    const { requestId, allowed } = parsed.data;
+    const remember = allowed ? parsed.data.remember === true : parsed.data.remember !== false;
+    const requireWaiting = async () => {
+      const space = await requireListed(spaceId);
+      if (space.state !== 'running') throw new SpaceError('space_not_running', 'A write waits for the user only in a running space.');
+    };
+    if (allowed && !remember) {
+      await requireWaiting();
+      return gatekeeper.decideApproval(spaceId, { id: requestId, allowed, remember });
+    }
+    return exclusive(spaceId, async () => {
+      await requireWaiting();
+      const current = records.read(spaceId);
+      if (current.status !== 'ok') throw new SpaceError('space_record_unreadable', 'The host\'s record of this space cannot be read, so the write answer could not be remembered.');
+      const scope = current.record.network.writesScope ?? 'path';
+      if (allowed) return { ...(await approveWaitingWrite(spaceId, requestId, parsed.data.shown, scope)), scope };
+      if (remember && scope === 'path') await requirePathRules(spaceId);
+      const answer = await gatekeeper.decideApproval(spaceId, { id: requestId, allowed, remember, scope });
+      // A remembered denial stands for that destination: the gatekeeper holds it from now on, and
+      // the record keeps it for the next start. Read back rather than guessed here, so the
+      // destination is the one the gatekeeper actually refused and the host never names it.
+      if (remember) await rememberDenials(spaceId);
+      else await keepRecordedDenials(spaceId);
+      return { ...answer, scope };
+    });
   };
 
-  /** What the gatekeeper refuses without asking, written into the record; a failure only logs. */
+  /**
+   * "Always allow" from the prompt: the destination, method and path as the gatekeeper holds the
+   * wait, saved for the record's scope. The approval itself sends this write and every other one it
+   * covers. A wait that is gone, or that is not the write the prompt showed, saves nothing, as any
+   * late answer. A path-scoped answer for a wait with no rule path (a gatekeeper from before paths,
+   * or a path too long to keep) is refused rather than widened to the host.
+   */
+  const approveWaitingWrite = async (spaceId, requestId, shown, scope) => {
+    const waiting = await gatekeeper.readWaitingWrite(spaceId, requestId);
+    const same = waiting !== null && waiting.host === shown.host && waiting.method === shown.method && waiting.path === shown.path;
+    if (!same) return { settled: false };
+    if (scope === 'path' && waiting.path === undefined) {
+      throw new SpaceError('space_gatekeeper_too_old', 'This space cannot remember answers for this path. Restart the space, or answer for this write only.');
+    }
+    const rule = { host: waiting.host, methods: [waiting.method] };
+    if (scope === 'path') rule.path = waiting.path;
+    await approveWritesUnlocked(spaceId, rule);
+    return { settled: true };
+  };
+
+  /**
+   * A gatekeeper older than path rules would treat `{ host, path, methods }` as host-wide. Never
+   * take that silently: a path-scoped answer is refused until the space is restarted.
+   */
+  const requirePathRules = async (spaceId) => {
+    const policy = await gatekeeper.readPolicy(spaceId);
+    if (policy.pathRules !== true) {
+      throw new SpaceError('space_gatekeeper_too_old', 'This space cannot remember answers for one path yet. Restart the space, then answer again.');
+    }
+  };
+
+  /**
+   * What the gatekeeper refuses without asking, written into the record and said back to it, so
+   * the other writes still waiting for that destination and method are refused now as well rather
+   * than left on screen until their time runs out. A failure only logs.
+   */
   const rememberDenials = async (spaceId) => {
     try {
       const policy = await gatekeeper.readPolicy(spaceId);
       const denials = writeAccessSchema.parse(policy.denials);
+      await gatekeeper.setDenials(spaceId, denials);
       if (records.update(spaceId, { deniedWrites: denials }).status !== 'ok') {
         logger.warn?.(`[spaces] the denied methods of space ${spaceId} could not be remembered, so they close at the next start`);
       }
     } catch (error) {
       logger.warn?.(`[spaces] the denied methods of space ${spaceId} were not read back: ${error?.code ?? error?.message ?? error}`);
     }
+  };
+
+  /**
+   * After a refusal of one write only: a gatekeeper started before that answer existed remembers
+   * every refusal, so its denials are set back to the record's whenever they differ. A failure only
+   * logs; the extra denial then lasts until the space's next start, which says the record again.
+   */
+  const keepRecordedDenials = async (spaceId) => {
+    try {
+      const current = records.read(spaceId);
+      if (current.status !== 'ok') throw new SpaceError('space_record_unreadable', 'the record cannot be read');
+      const policy = await gatekeeper.readPolicy(spaceId);
+      const denials = writeAccessSchema.parse(policy.denials);
+      if (!sameWriteEntries(denials, current.record.deniedWrites)) await gatekeeper.setDenials(spaceId, current.record.deniedWrites);
+    } catch (error) {
+      logger.warn?.(`[spaces] a write of space ${spaceId} was denied once, and the gatekeeper may keep refusing it until the next start: ${error?.code ?? error?.message ?? error}`);
+    }
+  };
+
+  /**
+   * The chat's turn is over. A "deny once" answer stood only for that turn, so the space's
+   * gatekeeper now asks again; nothing is remembered and nothing waiting changes. A stopped space
+   * has no gatekeeper to tell, and a failure only logs: the refusal then lasts until the next
+   * start, which is no worse than the standing answers the record holds.
+   */
+  const endSpaceTurn = async (spaceId) => {
+    const space = await requireListed(spaceId);
+    if (space.state === 'running') {
+      try {
+        await gatekeeper.endTurn(spaceId);
+      } catch (error) {
+        logger.warn?.(`[spaces] the turn of space ${spaceId} ended, and its gatekeeper was not told: ${error?.code ?? error?.message ?? error}`);
+      }
+    }
+    return { ended: true };
   };
 
   /**
@@ -1067,6 +1289,7 @@ export function createSpaceJourney({
       if ((record.deniedWrites ?? []).length > 0) await gatekeeper.setDenials(spaceId, record.deniedWrites);
       networkRestored = true;
       grants = await restoreGrants(spaceId, record.grants, record.repository);
+      await applyPendingEnvironment(spaceId, record);
       await rewriteProviderConfig(spaceId, record.grants, record.repository);
       if (record.grants.some((grant) => grant.kind === 'model' || grant.kind === 'login')) repairLoginRowInBackground(spaceId);
       // A history that never arrived, or that failed, is sent again: a stop right after the
@@ -1183,7 +1406,7 @@ export function createSpaceJourney({
     }
     // A failure here answers the grant with it; the key is in the gatekeeper and the record, and
     // the next start writes the configuration and the row again.
-    if (configuresProvider(grant)) await spaceOpenCode.writeProviderConfig(spaceId, grants, await customDefinitionsOf(grants, current.record.repository));
+    if (configuresProvider(grant)) await spaceOpenCode.writeProviderConfig(spaceId, grants, await customDefinitionsOf(grants, current.record.repository), environmentConfigOf(current.record.environmentStatus ?? null) ?? undefined);
     if (grant.kind === 'login') await spaceOpenCode.writeLogin(spaceId, grant.provider, login);
     return grant;
   };
@@ -1224,7 +1447,7 @@ export function createSpaceJourney({
     const { network } = current.record;
     if (network.mode === 'open') throw new SpaceError('network_is_open', 'The network of this space is open, so there is no list to add a domain to.');
     if (network.domains.includes(domain)) return { network };
-    const next = networkSchema.safeParse({ mode: network.mode, domains: [...network.domains, domain], writes: network.writes });
+    const next = networkSchema.safeParse({ ...network, domains: [...network.domains, domain] });
     if (!next.success) throw new SpaceError('too_many_domains', 'This space already has as many opened domains as a list holds.');
     await gatekeeper.setNetwork(spaceId, next.data);
     if (records.update(spaceId, { network: next.data }).status !== 'ok') {
@@ -1234,41 +1457,73 @@ export function createSpaceJourney({
   });
 
   /**
+   * The user's choice about writes in an open space: `ask` holds each one, `allow` lets it out.
+   * Kept for the next start like the network itself, and said to the gatekeeper while it runs. A
+   * space with a list of names has no such choice: its destinations are already the decision, and
+   * each method is approved there one by one.
+   */
+  const changeWritePolicy = (spaceId, request) => exclusive(spaceId, async () => {
+    requireNotPending(spaceId);
+    const parsed = networkWritesRequestSchema.safeParse(request ?? {});
+    if (!parsed.success) throw new SpaceError('invalid_network', 'A write policy is "ask" or "allow".');
+    const space = await requireListed(spaceId);
+    const current = records.read(spaceId);
+    if (current.status !== 'ok') throw new SpaceError('space_record_unreadable', 'The host\'s record of this space cannot be read, so the write policy could not be remembered. Remove the space and create it again.');
+    const { network } = current.record;
+    const writes = parsed.data.writes ?? network.writes;
+    const writesScope = parsed.data.writesScope ?? network.writesScope ?? 'path';
+    if (parsed.data.writes !== undefined && network.mode !== 'open') throw new SpaceError('network_not_open', 'Writes are approved one method at a time in a space with a list of names, not all at once.');
+    if (writes === network.writes && writesScope === (network.writesScope ?? 'path')) return { network };
+    const next = networkSchema.parse({ ...network, writes, writesScope });
+    // A stopped space keeps the choice for its next start; only a running gatekeeper is told now.
+    if (space.state === 'running') await gatekeeper.setNetwork(spaceId, next);
+    if (records.update(spaceId, { network: next }).status !== 'ok') {
+      throw new SpaceError('space_record_unreadable', 'The write policy is changed now and could not be remembered, so it comes back at the next start. Remove the space and create it again.');
+    }
+    return { network: next };
+  });
+
+  /**
    * Approves one or more methods for one destination, from a blocked attempt in the journal. The
    * user's decision; the name may have come from the journal, which the agent wrote, and the
    * name rule is what keeps it a name. The gatekeeper is told first, then the record, so a record
    * that cannot be written leaves the approval valid only until the next start, which closes it:
    * the same direction as an opened domain.
    */
-  const approveWrites = (spaceId, request) => exclusive(spaceId, async () => {
+  const approveWrites = (spaceId, request) => exclusive(spaceId, () => approveWritesUnlocked(spaceId, request));
+
+  const approveWritesUnlocked = async (spaceId, request) => {
     requireNotPending(spaceId);
     const parsed = writeAccessRequestSchema.safeParse(request ?? {});
     if (!parsed.success) throw new SpaceError('invalid_write_access', `An approval names a host and one or more of ${WRITABLE_METHODS.join(', ')}.`);
-    const { host, methods } = parsed.data;
+    const { host, methods, path = null } = parsed.data;
     const space = await requireListed(spaceId);
     if (space.state !== 'running') throw new SpaceError('space_not_running', 'A method is approved by the gatekeeper of a running space. Start the space, then approve.');
+    if (path !== null) await requirePathRules(spaceId);
     const current = records.read(spaceId);
     if (current.status !== 'ok') throw new SpaceError('space_record_unreadable', 'The host\'s record of this space cannot be read, so an approved method could not be remembered. Remove the space and create it again.');
-    const entries = current.record.writeAccess.map((entry) => ({ host: entry.host, methods: [...entry.methods] }));
-    const known = entries.find((entry) => entry.host === host);
+    const entries = current.record.writeAccess.map((entry) => ({ ...entry, methods: [...entry.methods] }));
+    const known = entries.find((entry) => entry.host === host && (entry.path ?? null) === path);
     if (known) {
       for (const method of methods) if (!known.methods.includes(method)) known.methods.push(method);
       known.methods = WRITABLE_METHODS.filter((method) => known.methods.includes(method));
     } else {
-      entries.push({ host, methods: WRITABLE_METHODS.filter((method) => methods.includes(method)) });
+      const entry = { host, methods: WRITABLE_METHODS.filter((method) => methods.includes(method)) };
+      if (path !== null) entry.path = path;
+      entries.push(entry);
     }
     if (entries.length > 200) throw new SpaceError('too_many_write_access', 'This space has as many approved destinations as a record holds.');
     const next = writeAccessSchema.parse(entries);
     // The approval is the user's latest answer for those methods, so a denial of them is lifted:
     // a method is never both allowed and denied, which would leave a Clear that changes nothing.
-    const denied = withoutMethods(current.record.deniedWrites, host, methods);
+    const denied = withoutMethods(current.record.deniedWrites, host, methods, path);
     await gatekeeper.setWrites(spaceId, next);
     if (!sameWriteEntries(denied, current.record.deniedWrites)) await gatekeeper.setDenials(spaceId, denied);
     if (records.update(spaceId, { writeAccess: next, deniedWrites: denied }).status !== 'ok') {
       throw new SpaceError('space_record_unreadable', 'The method is approved now and could not be remembered, so it closes at the next start. Remove the space and create it again.');
     }
     return { writeAccess: next };
-  });
+  };
 
   /**
    * A method the user denies, per destination, live: the gatekeeper refuses it at once from then
@@ -1279,24 +1534,29 @@ export function createSpaceJourney({
     requireNotPending(spaceId);
     const parsed = deniedWritesRequestSchema.safeParse(request ?? {});
     if (!parsed.success) throw new SpaceError('invalid_write_access', `A denial names a host and up to one of ${WRITABLE_METHODS.join(', ')} to clear it.`);
-    const { host, methods } = parsed.data;
+    const { host, methods, path = null } = parsed.data;
     const space = await requireListed(spaceId);
+    if (path !== null && space.state === 'running' && methods.length > 0) await requirePathRules(spaceId);
     const current = records.read(spaceId);
     if (current.status !== 'ok') throw new SpaceError('space_record_unreadable', 'The host\'s record of this space cannot be read, so a denial could not be remembered. Remove the space and create it again.');
-    const entries = current.record.deniedWrites.filter((entry) => entry.host !== host);
-    if (methods.length > 0) entries.push({ host, methods: WRITABLE_METHODS.filter((method) => methods.includes(method)) });
+    const entries = current.record.deniedWrites.filter((entry) => entry.host !== host || (entry.path ?? null) !== path);
+    if (methods.length > 0) {
+      const entry = { host, methods: WRITABLE_METHODS.filter((method) => methods.includes(method)) };
+      if (path !== null) entry.path = path;
+      entries.push(entry);
+    }
     if (entries.length > 200) throw new SpaceError('too_many_write_access', 'This space has as many denied destinations as a record holds.');
     const next = writeAccessSchema.parse(entries);
     // A stopped space may lose a denial, never gain one: an empty list, or the methods left after
     // one is taken back, only shortens what this host already denies. The gatekeeper needs no new
     // answer here: it is gone, and the next start gets the record.
-    const refusedBefore = current.record.deniedWrites.find((entry) => entry.host === host)?.methods ?? [];
+    const refusedBefore = current.record.deniedWrites.find((entry) => entry.host === host && (entry.path ?? null) === path)?.methods ?? [];
     const takesBack = methods.length === 0 || (refusedBefore.length > 0 && methods.every((method) => refusedBefore.includes(method)));
     if (space.state !== 'running' && !takesBack) throw new SpaceError('space_not_running', 'A method is denied by the gatekeeper of a running space. Start the space, then deny.');
     // The denial is the user's latest answer for those methods: an approval of them is taken
     // back, so the two lists describe one state per method and neither shadows the other. An
     // empty list only clears this destination's denial; its approvals are not that denial's.
-    const allowed = methods.length === 0 ? current.record.writeAccess : withoutMethods(current.record.writeAccess, host, methods);
+    const allowed = methods.length === 0 ? current.record.writeAccess : withoutMethods(current.record.writeAccess, host, methods, path);
     if (space.state === 'running') {
       await gatekeeper.setDenials(spaceId, next);
       if (!sameWriteEntries(allowed, current.record.writeAccess)) await gatekeeper.setWrites(spaceId, allowed);
@@ -1316,11 +1576,11 @@ export function createSpaceJourney({
     requireNotPending(spaceId);
     const parsed = deniedWritesRequestSchema.safeParse(request ?? {});
     if (!parsed.success) throw new SpaceError('invalid_write_access', `A revocation names a host and up to one of ${WRITABLE_METHODS.join(', ')} to take back.`);
-    const { host, methods } = parsed.data;
+    const { host, methods, path = null } = parsed.data;
     const space = await requireListed(spaceId);
     const current = records.read(spaceId);
     if (current.status !== 'ok') throw new SpaceError('space_record_unreadable', 'The host\'s record of this space cannot be read, so an approval could not be taken back. Remove the space and create it again.');
-    const next = writeAccessSchema.parse(withoutMethods(current.record.writeAccess, host, methods));
+    const next = writeAccessSchema.parse(withoutMethods(current.record.writeAccess, host, methods, path));
     // Taking an approval back is safe without a running gatekeeper: nothing becomes possible until
     // the next start, and that start reads this record. Giving one still needs the live gatekeeper.
     if (space.state === 'running') await gatekeeper.setWrites(spaceId, next);
@@ -1507,7 +1767,192 @@ export function createSpaceJourney({
     return change;
   };
 
+  const requireEnvironmentRecord = (spaceId) => {
+    const { record, status } = records.read(spaceId);
+    if (status !== 'ok') throw new SpaceError('space_record_unreadable', 'The host\'s record of this space cannot be read. Remove the space and create it again.');
+    if (!record?.environment) throw new SpaceError('environment_source_missing', 'This space has no environment source.');
+    return record;
+  };
+
+  const requireRunning = async (spaceId, doing) => {
+    const space = await requireListed(spaceId);
+    if (space.state !== 'running') throw new SpaceError('space_not_running', `The space is stopped. Start it to ${doing}.`);
+    return space;
+  };
+
+  /**
+   * Applies the recorded environment source again, at the source's current revision. Only the
+   * assets: the space's shared memory is left alone. A refresh that fails keeps the revision the
+   * space has, and the record says when it was tried and why it failed.
+   */
+  const refreshEnvironment = (spaceId) => exclusive(spaceId, async () => {
+    requireNotPending(spaceId);
+    await requireRunning(spaceId, 'refresh its environment source');
+    const record = requireEnvironmentRecord(spaceId);
+    // Memory is seeded only if it never was: a source that was blocked at creation.
+    const seedMemory = record.environmentStatus?.state === 'blocked';
+    let applied;
+    try {
+      applied = { state: 'ready', ...(await environment.apply(spaceId, record.environment, { seedMemory, mountedAt: record.environmentMount ?? null })) };
+    } catch (error) {
+      const kept = record.environmentStatus ?? blockedStatus(record.environment, error);
+      records.update(spaceId, { environmentStatus: { ...kept, lastFailure: environmentFailureOf(error) } });
+      throw error;
+    }
+    if (record.environmentStatus?.memoryStatus) applied.memoryStatus = record.environmentStatus.memoryStatus;
+    records.update(spaceId, { environmentStatus: applied });
+    await rewriteProviderConfig(spaceId, record.grants, record.repository, applied);
+    return { environment: record.environment, status: applied };
+  });
+
+  /**
+   * Whether the source moved since the space took it, without changing the space: the plan of the
+   * current revision beside the revision the space has. A source that cannot be read answers why.
+   */
+  const checkEnvironment = async (spaceId) => {
+    requireNotPending(spaceId);
+    const record = requireEnvironmentRecord(spaceId);
+    const current = record.environmentStatus?.revision ?? null;
+    try {
+      const plan = await environment.check(record.environment);
+      return { plan, current, changed: plan.revision !== current, failure: null };
+    } catch (error) {
+      return { plan: null, current, changed: false, failure: environmentFailureOf(error) };
+    }
+  };
+
+  /** The plan of a source before any space has it, for the dialog. Nothing is copied or written. */
+  const checkEnvironmentSource = async (request) => {
+    const parsed = environmentSourceSchema.safeParse(request ?? {});
+    if (!parsed.success) throw new SpaceError('invalid_environment_source', parsed.error.issues[0]?.message ?? CREATE_REFUSALS.environment[1]);
+    return { plan: await environment.check(parsed.data) };
+  };
+
+  /**
+   * A change of the memory mode, the branch or the ticked items, applied now. The kind, location
+   * and delivery stay what the space was made with: another folder or a mount is another space.
+   */
+  const configureEnvironment = (spaceId, request) => exclusive(spaceId, async () => {
+    requireNotPending(spaceId);
+    const space = await requireListed(spaceId);
+    const record = requireEnvironmentRecord(spaceId);
+    const parsed = environmentChangeSchema.safeParse(request ?? {});
+    if (!parsed.success) throw new SpaceError('invalid_environment_source', 'A change names the shared memory mode, the branch or tag, or the ticked items.');
+    const next = environmentSourceSchema.parse({ ...record.environment, ...parsed.data });
+    // A stopped space keeps the change for its next start, where it is applied before the agent works.
+    if (space.state !== 'running') {
+      // The mode the space runs with now: a second change while stopped keeps the first one's.
+      const pendingChange = record.environmentStatus?.pendingChange ?? { memory: record.environment.memory };
+      const status = { ...(record.environmentStatus ?? blockedStatus(record.environment, null)), pendingChange };
+      if (records.update(spaceId, { environment: next, environmentStatus: status }).status !== 'ok') {
+        throw new SpaceError('space_record_unreadable', 'The change could not be remembered. Remove the space and create it again.');
+      }
+      return { environment: next, status };
+    }
+    // Turning memory off strands what the source has not received; the user decides that, not a radio.
+    if (next.memory === 'off' && record.environment.memory !== 'off') await requireNoPendingMemory(spaceId, record, false);
+    const seedMemory = record.environment.memory === 'off' && next.memory !== 'off';
+    const applied = { state: 'ready', ...(await environment.apply(spaceId, next, { seedMemory, mountedAt: record.environmentMount ?? null })) };
+    if (!seedMemory && record.environmentStatus?.memoryStatus) applied.memoryStatus = record.environmentStatus.memoryStatus;
+    if (records.update(spaceId, { environment: next, environmentStatus: applied }).status !== 'ok') {
+      throw new SpaceError('space_record_unreadable', 'The change is applied now and could not be remembered. Remove the space and create it again.');
+    }
+    await rewriteProviderConfig(spaceId, record.grants, record.repository, applied);
+    return { environment: next, status: applied };
+  });
+
+  /**
+   * Refuses while the space holds memory changes its source does not have, unless the user chose
+   * to leave them behind. A space whose memory cannot be read is refused too: unknown is not zero.
+   */
+  const requireNoPendingMemory = async (spaceId, record, discardPending) => {
+    if (discardPending || record.environment.memory === 'off') return;
+    const status = await environment.memoryStatus(spaceId).catch(() => null);
+    const waiting = status === null ? null : status.pending + status.conflicts;
+    if (waiting === 0) return;
+    throw new SpaceError('environment_memory_pending', 'Shared memory has changes the source does not have yet. Sync them first, or leave them behind.', { pending: waiting });
+  };
+
+  /**
+   * At a start: a change the user made while the space was stopped, and for a mounted folder the
+   * selection again, since OpenCode reads that folder live and a file there may have changed. A
+   * failure keeps the space starting: the record says why, and the previous view stays in place.
+   */
+  const applyPendingEnvironment = async (spaceId, record) => {
+    const pendingChange = record.environmentStatus?.pendingChange;
+    if (!record.environment || (!pendingChange && record.environment.delivery !== 'mount')) return;
+    const seedMemory = pendingChange?.memory === 'off' && record.environment.memory !== 'off';
+    try {
+      const applied = { state: 'ready', ...(await environment.apply(spaceId, record.environment, { seedMemory, mountedAt: record.environmentMount ?? null })) };
+      if (!seedMemory && record.environmentStatus.memoryStatus) applied.memoryStatus = record.environmentStatus.memoryStatus;
+      records.update(spaceId, { environmentStatus: applied });
+    } catch (error) {
+      logger.warn?.(`[spaces] the environment change of space ${spaceId} was not applied at its start: ${error?.code ?? error?.message ?? error}`);
+      records.update(spaceId, { environmentStatus: { ...record.environmentStatus, lastFailure: environmentFailureOf(error) } });
+    }
+  };
+
+  /**
+   * Takes the source out of the space's OpenCode: its links go and shared memory is turned off.
+   * What was copied stays in the space; a detach never erases data. A mounted folder stays mounted,
+   * read-only and unused, until the space is made again.
+   */
+  const detachEnvironment = (spaceId, request) => exclusive(spaceId, async () => {
+    requireNotPending(spaceId);
+    await requireRunning(spaceId, 'detach its environment source');
+    const record = requireEnvironmentRecord(spaceId);
+    await requireNoPendingMemory(spaceId, record, request?.discardPending === true);
+    await environment.detach(spaceId);
+    const status = {
+      ...(record.environmentStatus ?? blockedStatus(record.environment, null)),
+      state: 'off',
+      detachedAt: new Date().toISOString(),
+      mountRemains: record.environment.delivery === 'mount',
+    };
+    records.update(spaceId, { environment: null, environmentStatus: status });
+    await rewriteProviderConfig(spaceId, record.grants, record.repository, null, { always: true });
+    return { environment: null, status };
+  });
+
+  /**
+   * Syncs the space's shared memory with its source: the operations the space recorded are
+   * replayed there and published, and the space then holds what the source holds. Conflicts,
+   * offline and a missing login are answers, never an empty success. Assets are not touched.
+   */
+  const syncEnvironmentMemory = (spaceId) => exclusive(spaceId, async () => {
+    requireNotPending(spaceId);
+    await requireRunning(spaceId, 'sync shared memory');
+    const record = requireEnvironmentRecord(spaceId);
+    const result = await environment.syncMemory(spaceId, record.environment);
+    const memoryStatus = { state: result.state, at: result.at, pending: result.pending, conflicts: result.conflicts.length, revision: result.revision ?? null };
+    records.update(spaceId, { environmentStatus: { ...(record.environmentStatus ?? blockedStatus(record.environment, null)), memoryStatus } });
+    return result;
+  });
+
+  /**
+   * What the space's shared memory holds that the source does not have yet, read from the space
+   * now. A stopped space or one without shared memory answers so, never with zero pending.
+   */
+  const readEnvironmentMemory = async (spaceId) => {
+    requireNotPending(spaceId);
+    const record = requireEnvironmentRecord(spaceId);
+    if (record.environment.memory === 'off') return { available: false, reason: 'off' };
+    const space = await requireListed(spaceId);
+    if (space.state !== 'running') return { available: false, reason: 'stopped', last: record.environmentStatus?.memoryStatus ?? null };
+    return { available: true, ...(await environment.memoryStatus(spaceId)) };
+  };
+
+  /** The reviewed one-time import of a version 1 memory file into the source, as version 2. */
+  const importEnvironmentMemory = (spaceId, request) => exclusive(spaceId, async () => {
+    requireNotPending(spaceId);
+    const record = requireEnvironmentRecord(spaceId);
+    const parsed = memoryImportSchema.safeParse(request ?? {});
+    if (!parsed.success) throw new SpaceError('invalid_environment_source', 'An import is a preview, or a confirmation with the ids to import.');
+    return environment.importMemory(record.environment, parsed.data);
+  });
+
   /** The disk the spaces take on a place, and what a clean-up would free now (journey step 9). */
+
   const readDisk = async (placeId) => requirePlace(placeId).readDisk();
 
   /**
@@ -1608,5 +2053,5 @@ export function createSpaceJourney({
     return { brought, applied, removal, kept };
   });
 
-  return { createSpace, listSpaces, setTaskTitle, startSpace, stopSpace, restartSpace, restartOpenCode, removeSpace, stopAllSpaces, reopen, isIdle, grantAccess, sayLogin, readHostLogins, readHostCustomProviders, openDomain, approveWrites, denyWrites, revokeWrites, decideWriteApproval, watchApprovalsOfRunningSpaces, restoreLostGrants, readJournal, previewApply, applySpace, readIdleStopSetting, changeIdleStop, changePermissionDefault, runSetup, readSetup, readDisk, cleanUpDisk, pullImage };
+  return { createSpace, listSpaces, setTaskTitle, startSpace, stopSpace, restartSpace, restartOpenCode, removeSpace, stopAllSpaces, reopen, isIdle, grantAccess, sayLogin, readHostLogins, readHostCustomProviders, openDomain, changeWritePolicy, approveWrites, denyWrites, revokeWrites, decideWriteApproval, endSpaceTurn, watchApprovalsOfRunningSpaces, restoreLostGrants, readJournal, previewApply, applySpace, readIdleStopSetting, changeIdleStop, changePermissionDefault, runSetup, readSetup, readDisk, cleanUpDisk, pullImage, refreshEnvironment, checkEnvironment, checkEnvironmentSource, configureEnvironment, detachEnvironment, syncEnvironmentMemory, readEnvironmentMemory, importEnvironmentMemory };
 }

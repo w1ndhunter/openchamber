@@ -23,12 +23,16 @@ import { MEMORY_BODY_MAX_LENGTH, MEMORY_TITLE_MAX_LENGTH } from './runtime.js';
 const MEMORY_TYPES = new Set(['fact', 'preference', 'reference']);
 
 /** Everything the agent is told about an entry it has not opened yet. */
-const toSummary = (entry, scope) => ({
-  memoryId: entry.id,
-  title: entry.title,
-  type: entry.type,
-  scope,
-});
+const toSummary = (entry, scope) => {
+  const summary = {
+    memoryId: entry.id,
+    title: entry.title,
+    type: entry.type,
+    scope,
+  };
+  if (scope === 'shared' && entry.revision) summary.revision = entry.revision;
+  return summary;
+};
 
 const RELATED_NOTE = 'Stored as a new entry. These stored entries share much of its wording. If it replaces or reverses one of them, rewrite that one by memoryId to what holds now, with a line on what changed and why, then delete the entry just saved. If they are about different things, leave both.';
 
@@ -79,30 +83,42 @@ export const createAgentMemoryActions = (dependencies) => {
     if (scope === 'project') {
       return { scope: 'project', projectId: await resolveProjectId(contextDirectory) };
     }
-    return fail('scope must be global or project', 400);
+    if (scope === 'shared' && agentMemoryRuntime.sharedAvailable) {
+      return { scope: 'shared' };
+    }
+    return fail(agentMemoryRuntime.sharedAvailable ? 'scope must be global, project, shared or both' : 'scope must be global or project', 400);
   };
 
-  const listBothScopes = async (contextDirectory) => {
+  const listScopes = async (contextDirectory, { includeShared = true } = {}) => {
     const directory = asNonEmptyString(contextDirectory);
     const projectId = directory ? await resolveProjectIdForDirectory(directory) : null;
     const result = await agentMemoryRuntime.readAll(projectId);
 
     // A scope that failed to load is reported, never rendered as empty: an
     // agent told it has no memories will happily store them all again.
-    return {
+    const answer = {
       memories: [
         ...result.global.map((entry) => toSummary(entry, 'global')),
         ...result.project.map((entry) => toSummary(entry, 'project')),
+        ...(includeShared && result.sharedAvailable ? result.shared.map((entry) => toSummary(entry, 'shared')) : []),
       ],
-      ...(result.globalFailed ? { globalUnavailable: true } : {}),
-      ...(result.projectFailed ? { projectUnavailable: true } : {}),
     };
+    if (result.globalFailed) answer.globalUnavailable = true;
+    if (result.projectFailed) answer.projectUnavailable = true;
+    if (includeShared && result.sharedAvailable && result.sharedFailed) answer.sharedUnavailable = true;
+    if (result.sharedAvailable) answer.sharedReadOnly = result.sharedReadOnly;
+    // Pending, offline and conflicted are said, so an agent never takes a local change for a shared one.
+    if (includeShared && result.sharedStatus) answer.sharedSync = result.sharedStatus;
+    return answer;
   };
 
   const list = async (input, contextDirectory) => {
     const scope = asNonEmptyString(input.scope);
-    if (!scope || scope === 'both') {
-      return listBothScopes(contextDirectory);
+    if (!scope) {
+      return listScopes(contextDirectory);
+    }
+    if (scope === 'both') {
+      return listScopes(contextDirectory, { includeShared: false });
     }
     const target = await resolveTarget(input, contextDirectory);
     const { entries } = await agentMemoryRuntime.read(target);
@@ -131,7 +147,7 @@ export const createAgentMemoryActions = (dependencies) => {
       : entry.title.toLowerCase() === title.toLowerCase());
 
     const requestedScope = asNonEmptyString(input.scope);
-    if (requestedScope === 'global' || requestedScope === 'project') {
+    if (requestedScope === 'global' || requestedScope === 'project' || requestedScope === 'shared') {
       const target = await resolveTarget(input, contextDirectory);
       const { entries } = await agentMemoryRuntime.read(target);
       const found = entries.find(matches);
@@ -155,7 +171,11 @@ export const createAgentMemoryActions = (dependencies) => {
     if (globalMatch) {
       return { memory: toFullEntry(globalMatch, 'global') };
     }
-    if (result.globalFailed || result.projectFailed) {
+    const sharedMatch = (result.shared ?? []).find(matches);
+    if (sharedMatch) {
+      return { memory: toFullEntry(sharedMatch, 'shared') };
+    }
+    if (result.globalFailed || result.projectFailed || result.sharedFailed) {
       // Never reported as "no such memory": a store that failed to load may well
       // hold it, and the agent would go on to store it a second time.
       fail('Stored memory could not be read; try again before assuming it is absent', 503);
@@ -188,7 +208,7 @@ export const createAgentMemoryActions = (dependencies) => {
     const memoryId = asNonEmptyString(input.memoryId);
     let saved;
     if (memoryId) {
-      const rewritten = await agentMemoryRuntime.update(target, memoryId, { title, body, type: input.type });
+      const rewritten = await agentMemoryRuntime.update(target, memoryId, { title, body, type: input.type, expectedRevision: input.revision });
       if (!rewritten) {
         fail('No memory has that id in this scope', 404);
       }
@@ -199,6 +219,7 @@ export const createAgentMemoryActions = (dependencies) => {
         body,
         type: input.type,
         sessionId: asNonEmptyString(input.sessionId),
+        expectedRevision: input.revision,
       });
     }
     announce(target.scope, target.projectId);
@@ -228,7 +249,7 @@ export const createAgentMemoryActions = (dependencies) => {
     const memoryId = asNonEmptyString(input.memoryId);
     if (!memoryId) fail('memoryId is required for memory.delete', 400);
 
-    const result = await agentMemoryRuntime.remove(target, memoryId);
+    const result = await agentMemoryRuntime.remove(target, memoryId, input.revision);
     if (!result.deleted) {
       fail('No memory has that id in this scope', 404);
     }

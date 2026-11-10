@@ -7,6 +7,7 @@ import { SpacesRequestError, type SpaceFailure } from '@/lib/spaces/spaces-api';
 
 const KNOWN: ReadonlyMap<string, I18nKey> = new Map<string, I18nKey>([
   ['docker_cli_missing', 'spaces.failure.dockerMissing'],
+  ['environment_memory_pending', 'spaces.failure.environmentMemoryPending'],
   ['docker_cli_unusable', 'spaces.failure.dockerUnusable'],
   ['docker_daemon_unreachable', 'spaces.failure.dockerNotRunning'],
   ['docker_seccomp_missing', 'spaces.failure.dockerSeccomp'],

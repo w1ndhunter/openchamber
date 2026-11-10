@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { findGatekeeperHardeningViolations, findHardeningViolations, requireMemoryBytes } from './hardening.js';
+import { buildSpaceCreateArgs, findGatekeeperHardeningViolations, findHardeningViolations, requireMemoryBytes } from './hardening.js';
 import { buildSpaceLabels, buildToolsLabels, hashProjectDirectory } from './labels.js';
 import { SPACE_ENVIRONMENT } from './layout.js';
 import { bridgeNetworkEntry, hardenedContainerEntry, internalNetworkEntry } from './places/fake-docker.js';
@@ -192,6 +192,63 @@ describe('findHardeningViolations', () => {
   it('refuses any other variable, whatever its name says', () => {
     const violations = findHardeningViolations({ spaceId: ID, owner: OWNER, container: withEnv(['NOT_OPENCHAMBER_UI_PASSWORD=x']), network: goodNetwork(), toolsVolume: goodToolsVolume() });
     expect(violations).toEqual([{ check: 'environment', message: 'The container environment holds variables nobody set for it: NOT_OPENCHAMBER_UI_PASSWORD' }]);
+  });
+
+  describe('shared memory and the environment folder', () => {
+    const FOLDER = '/Users/me/shared-environment';
+    const withEnvironmentMount = (mount, label = FOLDER) => {
+      const container = withMount(mount);
+      const labels = { ...container.Config.Labels };
+      if (label !== null) labels['openchamber.space.environment-mount'] = label;
+      return { ...container, Config: { ...container.Config, Labels: labels } };
+    };
+    const bind = (change = {}) => ({ Type: 'bind', Source: FOLDER, Destination: '/openchamber-environment', RW: false, Propagation: 'rprivate', ...change });
+
+    it.each(['off', 'read', 'write'])('accepts the memory folder with the mode %s', (mode) => {
+      expect(checksFor({ container: withEnv([`OPENCHAMBER_SPACE_SHARED_MEMORY_DIR=/spaces/${ID}/.shared/memory`, `OPENCHAMBER_SPACE_SHARED_MEMORY_MODE=${mode}`]) })).toEqual([]);
+    });
+
+    it.each([
+      ['another folder', [`OPENCHAMBER_SPACE_SHARED_MEMORY_DIR=/home/space`, 'OPENCHAMBER_SPACE_SHARED_MEMORY_MODE=write']],
+      ['another mode', [`OPENCHAMBER_SPACE_SHARED_MEMORY_DIR=/spaces/${ID}/.shared/memory`, 'OPENCHAMBER_SPACE_SHARED_MEMORY_MODE=admin']],
+    ])('refuses shared memory naming %s', (_name, env) => {
+      expect(checksFor({ container: withEnv(env) })).toEqual(['environment']);
+    });
+
+    it('accepts the folder the label names, read-only and private', () => {
+      expect(checksFor({ container: withEnvironmentMount(bind()) })).toEqual([]);
+    });
+
+    it.each([
+      ['writable', bind({ RW: true }), FOLDER],
+      ['another folder than the label', bind({ Source: '/etc' }), FOLDER],
+      ['a volume', bind({ Type: 'volume', Name: 'openchamber-space-other' }), FOLDER],
+      ['shared propagation', bind({ Propagation: 'rshared' }), FOLDER],
+      ['no label at all', bind(), null],
+      ['a label that --mount could not carry', bind({ Source: '/a,b' }), '/a,b'],
+    ])('refuses an environment mount that is %s', (_name, mount, label) => {
+      expect(checksFor({ container: withEnvironmentMount(mount, label) })).toContain('environment_mount');
+    });
+
+    it('builds the mount read-only with its label, and refuses a path --mount would split', () => {
+      const base = { spaceId: ID, containerName: 'c', labelArguments: [], network: NETWORK, workVolume: WORK, homeVolume: HOME, toolsVolume: TOOLS, memoryBytes: 1024 * 1024 * 1024, image: 'node' };
+      const args = buildSpaceCreateArgs({ ...base, environmentMount: FOLDER, sharedMemoryMode: 'off' });
+      expect(args).toEqual(expect.arrayContaining([
+        '--label', `openchamber.space.environment-mount=${FOLDER}`,
+        '--mount', `type=bind,src=${FOLDER},dst=/openchamber-environment,readonly,bind-propagation=rprivate`,
+        '--env', `OPENCHAMBER_SPACE_SHARED_MEMORY_MODE=off`,
+      ]));
+      expect(buildSpaceCreateArgs(base).join(' ')).not.toContain('environment');
+      for (const bad of ['/a,b', 'relative', '/a/../b', '/a"b', '/a=b', '/a\\b', '/a/']) {
+        expect(() => buildSpaceCreateArgs({ ...base, environmentMount: bad }), bad).toThrow();
+      }
+    });
+
+    it('refuses a label without the mount, and a host path anywhere else', () => {
+      const container = goodContainer();
+      expect(checksFor({ container: { ...container, Config: { ...container.Config, Labels: { ...container.Config.Labels, 'openchamber.space.environment-mount': FOLDER } } } })).toEqual(['environment_mount']);
+      expect(checksFor({ container: withEnvironmentMount(bind({ Destination: '/home/space/x' })) })).toEqual(expect.arrayContaining(['environment_mount', 'mounts']));
+    });
   });
 
   describe('tools mount', () => {

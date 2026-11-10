@@ -25,15 +25,15 @@ describe('space records', () => {
     const records = createSpaceRecords({ dataDir, logger: quiet });
     expect(records.read(ID)).toEqual({ status: 'missing', record: null });
 
-    const written = records.write(ID, { network: { mode: 'allowlist', domains: ['api.anthropic.com'], writes: 'ask' }, repository: '/home/me/project' });
-    expect(written).toEqual({ version: 1, placeId: 'docker', name: null, taskTitle: null, created: null, network: { mode: 'allowlist', domains: ['api.anthropic.com'], writes: 'ask' }, repository: '/home/me/project', spacePath: null, base: null, history: 'pending', grants: [], writeAccess: [], deniedWrites: [], setup: null });
+    const written = records.write(ID, { network: { mode: 'allowlist', domains: ['api.anthropic.com'], writes: 'ask', writesScope: 'path' }, repository: '/home/me/project' });
+    expect(written).toEqual({ version: 1, placeId: 'docker', name: null, taskTitle: null, created: null, network: { mode: 'allowlist', domains: ['api.anthropic.com'], writes: 'ask', writesScope: 'path' }, repository: '/home/me/project', spacePath: null, base: null, history: 'pending', grants: [], writeAccess: [], deniedWrites: [], setup: null });
     const file = path.join(dataDir, 'spaces', 'records', `${ID}.json`);
     if (process.platform !== 'win32') expect(fs.statSync(file).mode & 0o777).toBe(0o600);
     expect(fs.readdirSync(path.dirname(file))).toEqual([`${ID}.json`]);
 
     expect(records.update(ID, { spacePath: `/spaces/${ID}/project`, base: 'a'.repeat(40) }).record).toMatchObject({ spacePath: `/spaces/${ID}/project`, base: 'a'.repeat(40), history: 'pending' });
     expect(records.update(ID, { history: 'sent' }).record.history).toBe('sent');
-    expect(records.read(ID)).toEqual({ status: 'ok', record: expect.objectContaining({ history: 'sent', network: { mode: 'allowlist', domains: ['api.anthropic.com'], writes: 'ask' } }) });
+    expect(records.read(ID)).toEqual({ status: 'ok', record: expect.objectContaining({ history: 'sent', network: { mode: 'allowlist', domains: ['api.anthropic.com'], writes: 'ask', writesScope: 'path' } }) });
 
     records.remove(ID);
     expect(records.read(ID)).toEqual({ status: 'missing', record: null });
@@ -89,8 +89,8 @@ describe('space records', () => {
     const later = temporary();
     const withUnknown = createSpaceRecords({ dataDir: later, logger: quiet });
     fs.mkdirSync(path.join(later, 'spaces', 'records'), { recursive: true });
-    fs.writeFileSync(path.join(later, 'spaces', 'records', `${ID}.json`), JSON.stringify({ version: 1, network: { mode: 'allowlist', domains: ['a.example.com'], writes: 'ask' }, repository: '/home/me/project', history: 'sent', grants: [{ kind: 'git', id: 'github' }, domain] }));
-    expect(withUnknown.read(ID)).toEqual({ status: 'ok', record: expect.objectContaining({ network: { mode: 'allowlist', domains: ['a.example.com'], writes: 'ask' }, repository: '/home/me/project', history: 'sent', grants: [domain] }) });
+    fs.writeFileSync(path.join(later, 'spaces', 'records', `${ID}.json`), JSON.stringify({ version: 1, network: { mode: 'allowlist', domains: ['a.example.com'], writes: 'ask', writesScope: 'path' }, repository: '/home/me/project', history: 'sent', grants: [{ kind: 'git', id: 'github' }, domain] }));
+    expect(withUnknown.read(ID)).toEqual({ status: 'ok', record: expect.objectContaining({ network: { mode: 'allowlist', domains: ['a.example.com'], writes: 'ask', writesScope: 'path' }, repository: '/home/me/project', history: 'sent', grants: [domain] }) });
     // A malformed upstream is refused, not thrown.
     expect(() => records.write(ID, { network: { mode: 'open' }, grants: [{ ...domain, upstream: 'not a url' }] })).toThrow();
 
@@ -109,7 +109,7 @@ describe('space records', () => {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, JSON.stringify({
       version: 1,
-      network: { mode: 'allowlist', domains: ['a.example.com'], writes: 'ask' },
+      network: { mode: 'allowlist', domains: ['a.example.com'], writes: 'ask', writesScope: 'path' },
       repository: '/home/me/project',
       grants: [{ kind: 'domain', id: 'open-0a1b2c3d4e5f', upstream: 'https://registry.example.com/npm/' }],
       writeAccess: [{ host: 'a.example.com', methods: ['POST', 'PUT'] }],
@@ -120,6 +120,21 @@ describe('space records', () => {
     expect(read.record.writeAccess).toEqual([{ host: 'a.example.com', methods: ['POST', 'PUT'] }]);
     expect(read.record.deniedWrites).toEqual([{ host: 'a.example.com', methods: ['PATCH'] }, { host: 'b.example.com', methods: ['DELETE'] }]);
     expect(read.record.grants).toEqual([{ kind: 'domain', id: 'open-0a1b2c3d4e5f', upstream: 'https://registry.example.com/npm/' }]);
+  });
+
+  it('keeps path rules separate, and refuses a path with a query, fragment or control character', () => {
+    const records = createSpaceRecords({ dataDir: temporary(), logger: quiet });
+    const written = records.write(ID, {
+      network: { mode: 'allowlist', writesScope: 'path' },
+      writeAccess: [{ host: 'a.example.com', methods: ['POST'] }, { host: 'a.example.com', path: '/a', methods: ['POST'] }],
+      deniedWrites: [{ host: 'a.example.com', path: '/private', methods: ['DELETE'] }],
+    });
+    expect(written.network.writesScope).toBe('path');
+    expect(records.read(ID).record.writeAccess).toEqual(written.writeAccess);
+    expect(records.read(ID).record.deniedWrites).toEqual(written.deniedWrites);
+    for (const bad of ['/a?b', '/a#b', '/a b/', 'relative']) {
+      expect(() => records.write(ID, { network: { mode: 'open' }, writeAccess: [{ host: 'a.example.com', path: bad, methods: ['POST'] }] }), bad).toThrow();
+    }
   });
 
   it('forgets a write rule it cannot read, and keeps the rest of the record', () => {
@@ -137,7 +152,7 @@ describe('space records', () => {
     }));
     const read = records.read(ID);
     expect(read.status).toBe('ok');
-    expect(read.record.network).toEqual({ mode: 'allowlist', domains: ['a.example.com'], writes: 'ask' });
+    expect(read.record.network).toEqual({ mode: 'allowlist', domains: ['a.example.com'], writes: 'ask', writesScope: 'path' });
     expect(read.record.writeAccess).toEqual([{ host: 'a.example.com', methods: ['POST'] }]);
     expect(read.record.deniedWrites).toEqual([]);
     expect(read.record.grants).toEqual([{ kind: 'domain', id: 'open-0a1b2c3d4e5f', upstream: 'https://registry.example.com/npm/' }]);
@@ -156,8 +171,8 @@ describe('space records', () => {
 
     // A setup from a later version leaves the network and the grants readable.
     const file = path.join(dataDir, 'spaces', 'records', `${ID}.json`);
-    fs.writeFileSync(file, JSON.stringify({ version: 1, network: { mode: 'allowlist', domains: ['a.example.com'], writes: 'ask' }, setup: { state: 'paused' } }));
-    expect(records.read(ID)).toEqual({ status: 'ok', record: expect.objectContaining({ network: { mode: 'allowlist', domains: ['a.example.com'], writes: 'ask' }, setup: null }) });
+    fs.writeFileSync(file, JSON.stringify({ version: 1, network: { mode: 'allowlist', domains: ['a.example.com'], writes: 'ask', writesScope: 'path' }, setup: { state: 'paused' } }));
+    expect(records.read(ID)).toEqual({ status: 'ok', record: expect.objectContaining({ network: { mode: 'allowlist', domains: ['a.example.com'], writes: 'ask', writesScope: 'path' }, setup: null }) });
   });
 
   it('refuses a record that is not one, and an id that is not a space id', () => {
@@ -174,8 +189,8 @@ describe('space records', () => {
     for (const bad of [['localhost'], ['10.0.0.1'], ['Api.Example.com'], ['a_b.example'], ['-a.example'], ['a.example.'], ['a..example'], ['https://a.example'], ['a.example/path']]) {
       expect(accepted(bad), bad[0]).toBe(false);
     }
-    expect(networkSchema.safeParse({ mode: 'open' }).data).toEqual({ mode: 'open', domains: [], writes: 'ask' });
-    expect(networkSchema.safeParse({ mode: 'open', writes: 'allow' }).data).toEqual({ mode: 'open', domains: [], writes: 'allow' });
+    expect(networkSchema.safeParse({ mode: 'open' }).data).toEqual({ mode: 'open', domains: [], writes: 'ask', writesScope: 'path' });
+    expect(networkSchema.safeParse({ mode: 'open', writes: 'allow' }).data).toEqual({ mode: 'open', domains: [], writes: 'allow', writesScope: 'path' });
     expect(networkSchema.safeParse({ mode: 'all' }).success).toBe(false);
   });
   it('lists every readable record with its place, name and time, and reads a record from before there were two places as the local Docker place', () => {

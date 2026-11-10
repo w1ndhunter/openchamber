@@ -173,8 +173,8 @@ export const RENDER_PAGE_GUIDANCE = "The openchamber_render tool draws an HTML p
  * many titles were left out. Cutting the rendered text instead dropped the
  * newest entries, the ones most likely to matter, mid-title and unannounced.
  */
-const buildMemoryBlock = ({ global, project, enabled = false, complete = false }) => {
-  if (global.length === 0 && project.length === 0) {
+const buildMemoryBlock = ({ global, project, shared = [], enabled = false, complete = false }) => {
+  if (global.length === 0 && project.length === 0 && shared.length === 0) {
     if (!enabled) return '';
     // "Empty" only when both scopes loaded: a failed read is not an empty store.
     return complete
@@ -194,6 +194,7 @@ const buildMemoryBlock = ({ global, project, enabled = false, complete = false }
   const scopes = [
     { heading: '### About the user', lines: memoryTitleLines(global) },
     { heading: '### About this project', lines: memoryTitleLines(project) },
+    { heading: '### Shared with this environment', lines: memoryTitleLines(shared) },
   ].filter((scope) => scope.lines.length > 0);
 
   const OMITTED_NOTE_RESERVE = 120;
@@ -430,7 +431,7 @@ export const createSessionKnowledgeRuntime = (dependencies) => {
       }
     }
 
-    let memory = { global: [], project: [], enabled: false, complete: false };
+    let memory = { global: [], project: [], shared: [], enabled: false, complete: false };
     const memoryEnabled = typeof isMemoryToolAvailable === 'function'
       ? await isMemoryToolAvailable().catch(() => false)
       : true;
@@ -447,11 +448,12 @@ export const createSessionKnowledgeRuntime = (dependencies) => {
         memory = {
           global: stored.globalFailed ? [] : visible(stored.global),
           project: stored.projectFailed ? [] : visible(stored.project),
+          shared: stored.sharedFailed ? [] : visible(stored.shared ?? []),
           enabled: true,
-          complete: !stored.globalFailed && !stored.projectFailed,
+          complete: !stored.globalFailed && !stored.projectFailed && !stored.sharedFailed,
         };
       } catch {
-        memory = { global: [], project: [], enabled: true, complete: false };
+        memory = { global: [], project: [], shared: [], enabled: true, complete: false };
       }
     }
 
@@ -484,7 +486,7 @@ export const createSessionKnowledgeRuntime = (dependencies) => {
    */
   const collectSummary = async (directory, pins = { notes: [], plans: [] }) => {
     const projectId = directory ? await resolveProjectId(directory) : '';
-    const empty = { notes: [], plans: [], memory: { global: 0, project: 0 } };
+    const empty = { notes: [], plans: [], memory: { global: 0, project: 0, shared: 0 } };
     if (!projectId) return empty;
 
     let notes = [];
@@ -502,7 +504,7 @@ export const createSessionKnowledgeRuntime = (dependencies) => {
       plans = [];
     }
 
-    let memory = { global: 0, project: 0 };
+    let memory = { global: 0, project: 0, shared: 0 };
     const memoryEnabled = typeof isAgentMemoryEnabled === 'function'
       ? await isAgentMemoryEnabled().catch(() => false)
       : true;
@@ -512,9 +514,10 @@ export const createSessionKnowledgeRuntime = (dependencies) => {
         memory = {
           global: stored.globalFailed ? 0 : stored.global.length,
           project: stored.projectFailed ? 0 : stored.project.length,
+          shared: stored.sharedFailed ? 0 : (stored.shared ?? []).length,
         };
       } catch {
-        memory = { global: 0, project: 0 };
+        memory = { global: 0, project: 0, shared: 0 };
       }
     }
 

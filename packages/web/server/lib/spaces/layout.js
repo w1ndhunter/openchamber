@@ -1,6 +1,8 @@
 // What a space looks like from the inside. Every place builds its container from these
 // facts, and everything written on top of `exec` relies on them.
 
+import { z } from 'zod';
+
 import { SpaceError } from './errors.js';
 import { requireSpaceId } from './labels.js';
 
@@ -121,6 +123,26 @@ export const spaceOpenCodeConfigPath = (spaceId) => `${spaceOpenCodeConfigDirect
 // stale entry there would leak fields into the one beside the project; the write removes it.
 export const LEGACY_SPACE_OPENCODE_CONFIG_PATH = `${SPACE_HOME}/.config/opencode/opencode.json`;
 
+// A shared environment source and its optional memory. The host materialises approved files
+// under the work volume; the two variables only tell the server inside where its memory lives.
+// They are set at creation and never hold a credential.
+export const spaceSharedMemoryRoot = (spaceId) => `${spaceWorkPath(spaceId)}/.shared/memory`;
+export const SPACE_SHARED_MEMORY_DIRECTORY_VARIABLE = 'OPENCHAMBER_SPACE_SHARED_MEMORY_DIR';
+export const SPACE_SHARED_MEMORY_MODE_VARIABLE = 'OPENCHAMBER_SPACE_SHARED_MEMORY_MODE';
+
+// A folder on the Docker host the user chose as a read-only environment source. It is mounted at a
+// fixed place outside the volumes; the label on the container names the host path the checker
+// expects there, and nothing else may be bound into a space.
+export const ENVIRONMENT_MOUNT_PATH = '/openchamber-environment';
+export const LABEL_ENVIRONMENT_MOUNT = 'openchamber.space.environment-mount';
+/** A path `--mount` can carry whole: absolute, normalized, no comma, quote, equals sign, backslash or control character. */
+const environmentMountPathSchema = z.string()
+  .min(2)
+  .max(4096)
+  .startsWith('/')
+  .refine((value) => !/[,"'=\\\x00-\x1f\x7f]/.test(value) && !value.split('/').slice(1).some((part) => part === '' || part === '.' || part === '..'));
+export const isEnvironmentMountPath = (value) => environmentMountPathSchema.safeParse(value).success;
+
 const IMAGE_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
 
 // The programs of the base image that the host runs inside a container, by absolute path,
@@ -189,6 +211,8 @@ export const SPACE_ENVIRONMENT = Object.freeze({
   REQUESTS_CA_BUNDLE: SPACE_CA_PATH,
   PIP_CERT: SPACE_CA_PATH,
   npm_config_cafile: SPACE_CA_PATH,
+  // Deno's own spelling. It is here because a plain `deno run` reads none of the others.
+  DENO_CERT: SPACE_CA_PATH,
   // Where the command below fetches that certificate, from the gatekeeper's window.
   OPENCHAMBER_SPACE_CA_URL: GATEKEEPER_CA_URL,
 });

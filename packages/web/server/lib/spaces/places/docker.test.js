@@ -253,6 +253,7 @@ describe('docker place: create', () => {
       '--env', 'REQUESTS_CA_BUNDLE=/tmp/openchamber-ca.pem',
       '--env', 'PIP_CERT=/tmp/openchamber-ca.pem',
       '--env', 'npm_config_cafile=/tmp/openchamber-ca.pem',
+      '--env', 'DENO_CERT=/tmp/openchamber-ca.pem',
       '--env', 'OPENCHAMBER_SPACE_CA_URL=http://gatekeeper:8080/ca',
       SPACE_BASE_IMAGE,
       '/bin/sh', '-c',

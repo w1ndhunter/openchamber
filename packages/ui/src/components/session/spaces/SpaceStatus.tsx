@@ -37,6 +37,7 @@ const STEP_TEXT = {
   setting_network: 'spaces.group.step.settingNetwork',
   bringing_code: 'spaces.group.step.bringingCode',
   giving_access: 'spaces.group.step.givingAccess',
+  preparing_environment: 'spaces.group.step.preparingEnvironment',
 } satisfies Record<Exclude<SpaceCreationStep, 'ready'>, I18nKey>;
 
 const BUSY_TEXT = {

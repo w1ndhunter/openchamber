@@ -99,7 +99,7 @@ const AGENT_TOOL_ACTION_TITLES = Object.fromEntries(
 const WEB_PARAMETER_NAMES = ['url', 'selector', 'text', 'value', 'submit', 'direction', 'viewport', 'label', 'tabId'];
 // `title` is shared with the control tool, so it is not listed here — only the
 // names memory alone introduces are kept out of the other schemas.
-const MEMORY_ONLY_PARAMETER_NAMES = ['body', 'scope', 'memoryId', 'type'];
+const MEMORY_ONLY_PARAMETER_NAMES = ['body', 'scope', 'memoryId', 'type', 'revision'];
 const MEMORY_PARAMETER_NAMES = [...MEMORY_ONLY_PARAMETER_NAMES, 'title'];
 // The task inputs; the schedule tool shares the scope and the run settings
 // (prompt, model, agent, goal) with the control tool.
@@ -123,7 +123,8 @@ const SCHEDULE_PARAMETER_OVERRIDES = {
  */
 const MEMORY_PARAMETER_OVERRIDES = {
   title: { type: 'string', description: 'As the session index spells it; prefer it over memoryId for an entry you can see. On save: at most 60 characters, no date (the store keeps dates)' },
-  scope: { type: 'string', enum: ['global', 'project', 'both'], description: 'global: about the user, every project. project: this codebase. Required for save and delete; read and list search both when omitted' },
+  scope: { type: 'string', enum: ['global', 'project', 'shared', 'both'], description: 'global: about the user, every project. project: this codebase. shared: memory shared through the space\'s attached environment source. Required for save and delete; read and list search every available scope when omitted' },
+  revision: { type: 'number', description: 'For shared memory: the revision returned by memory.list or memory.read. Required when rewriting or deleting a shared entry' },
 };
 
 const ALL_PARAMETER_PROPERTIES = {
@@ -194,6 +195,7 @@ const ALL_PARAMETER_PROPERTIES = {
   tabId: { type: 'string', description: "From the tabs browser.snapshot lists. Default: the tab you last used; else the user's open tab, if they opened it in this project" },
   body: { type: 'string', description: 'At most 2000 characters; longer is rejected. Written to make sense without this conversation' },
   memoryId: { type: 'string', description: 'From memory.list or memory.read; on save it rewrites that entry' },
+  revision: { type: 'number', description: 'For shared memory: the revision returned by memory.list or memory.read. Required when rewriting or deleting a shared entry' },
   type: { type: 'string', enum: ['fact', 'preference', 'reference'], description: 'fact: something true. preference: how the user wants work done. reference: a resource hard to find again' },
 };
 

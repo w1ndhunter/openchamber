@@ -175,11 +175,23 @@ let networkMode = 'allowlist';
 let writePolicy = 'ask';
 let allowedDomains = new Set();
 const grants = new Map();
-// The methods the user approved for a destination. Absent means GET, HEAD and OPTIONS only.
+// The methods the user approved, per destination: `{ methods, paths }`, the methods for every path
+// of the host and the methods for one exact path. Absent means GET, HEAD and OPTIONS only.
 let writeAccess = new Map();
-// The methods the user denied for a destination. A repeat is refused at once, without a wait:
+// The methods the user denied, in the same shape. A repeat is refused at once, without a wait:
 // the answer stands until the user clears it in the access dialog.
 let deniedWrites = new Map();
+// Refusals of one write the user did not want to keep: same shape, and refused the same way, but
+// memory only and never in `/policy`. They end when the host says the chat's turn is over, so the
+// agent's next turn asks again. Kept apart from `deniedWrites` because the host reads that list
+// back and saves it for the next start.
+let turnDenials = new Map();
+// The host may never say that turn ended: the app was closed, or the chat that answered is not
+// the one shown. A refusal must not become invisible and unliftable then, so the whole list stops
+// standing after this long, longer than a turn usually runs and short enough that a forgotten
+// answer costs one prompt.
+const TURN_DENIAL_MS = 10 * 60_000;
+let turnDenialsUntil = 0;
 // The last time a standing denial was journalled, per destination and method: a retry loop is not
 // evidence, and 500 of its records would erase everything else the journal holds.
 const lastDenialNote = new Map();
@@ -370,6 +382,11 @@ const fixedLookup = (address, family) => (hostname, options, callback) => {
   else callback(null, address, family);
 };
 
+// One TLS connection is kept per destination, so a page with a dozen requests does not pay a
+// dozen handshakes and the space's own keep-alive finds its match here. The socket still goes to
+// the address each tunnel checked: `lookup` is fixed and `servername` is the checked name.
+const UPSTREAM_AGENT = new https.Agent({ keepAlive: true, maxSockets: 128, maxFreeSockets: 8 });
+
 // ---------------------------------------------------------------------------------------------
 // Certificates
 //
@@ -432,11 +449,11 @@ const derSignatureAlgorithm = () => derSequence(derOid('1.2.840.10045.4.3.2'));
 const derExtension = (id, critical, value) => derSequence(derOid(id), ...(critical ? [derBoolean(true)] : []), derOctets(value));
 const derPem = (der) => `-----BEGIN CERTIFICATE-----\n${der.toString('base64').match(/.{1,64}/g).join('\n')}\n-----END CERTIFICATE-----\n`;
 
-/** A serial number that is positive in DER: the high bit of the first byte is never used. */
+/** A serial number that is positive in DER: the high bit of the first byte is never used, and a
+ * zero first byte is raised to one, because a leading zero would not be the shortest encoding. */
 function derSerial() {
   const bytes = crypto.randomBytes(16);
-  bytes[0] &= 0x7f;
-  if (bytes.every((byte) => byte === 0)) bytes[15] = 1;
+  bytes[0] = (bytes[0] & 0x7f) || 1;
   return bytes;
 }
 
@@ -594,6 +611,12 @@ const lingeringRefusals = new Set();
 
 const REFUSED = 'refused';
 const UNREACHABLE = 'unreachable';
+// What the space reads when one of its writes is refused. A refusal is a decision, not a failure:
+// an agent that reads it as transient retries it, and each retry is another wasted round, so the
+// body says plainly that it will not change. A wait nobody answered is the exception: the user did
+// not decide, and the agent may ask again.
+const REFUSED_BY_USER = 'the user refused this write: do not retry it';
+const UNANSWERED = 'the user did not answer this write in time';
 
 /**
  * The corridor's answer to a client it will not serve. The reason header is what tells a reader
@@ -1001,7 +1024,7 @@ function forwardRequest(request, response, target, path, buffered) {
     headers,
     servername: target.host,
     lookup: fixedLookup(target.address, target.family),
-    agent: false,
+    agent: UPSTREAM_AGENT,
   }, (answer) => {
     clearTimeout(connectTimer);
     const answerHeaders = {};
@@ -1088,14 +1111,28 @@ const approvalUrlOf = (entry) => {
   return url.length > MAX_APPROVAL_URL_CHARACTERS ? `${url.slice(0, MAX_APPROVAL_URL_CHARACTERS)}…` : url;
 };
 
-const approvalOf = (entry) => ({
-  id: entry.id,
-  host: entry.target.host,
-  port: entry.target.port,
-  method: entry.method,
-  url: approvalUrlOf(entry),
-  expiresAt: entry.expiresAt,
-});
+// A write rule's path: the request's path without its query or fragment, exactly as the space wrote
+// it. Never normalized: `/a/../b`, `/%61` and `/a/` are other paths than `/a`, so a rule never covers
+// more than the user saw, and a path the space dressed up to look alike asks again.
+const MAX_RULE_PATH_CHARACTERS = 2048;
+const RULE_PATH = /^\/[\x21\x22\x24-\x3e\x40-\x7e]*$/;
+const rulePathOf = (path) => String(path ?? '').split(/[?#]/)[0];
+const isRulePath = (value) => value !== null && value !== undefined && String(value) === value && value.length <= MAX_RULE_PATH_CHARACTERS && RULE_PATH.test(value);
+
+const approvalOf = (entry) => {
+  const path = rulePathOf(entry.path);
+  const approval = {
+    id: entry.id,
+    host: entry.target.host,
+    port: entry.target.port,
+    method: entry.method,
+    url: approvalUrlOf(entry),
+    expiresAt: entry.expiresAt,
+  };
+  // What an answer for this path would name; absent when the path cannot be a rule.
+  if (isRulePath(path)) approval.path = path;
+  return approval;
+};
 
 /** The waits a host that last saw `since` has not heard of. Ids only grow while this process lives. */
 const approvalsSince = (since) => Array.from(pendingApprovals.values())
@@ -1119,23 +1156,68 @@ function wakeApprovalWaiters() {
   }
 }
 
-/** A destination and method the user refused, kept within the list the host can read back. */
-function rememberDeniedWrite(host, method) {
-  const known = deniedWrites.get(host);
-  if (known) {
-    known.add(method);
+/** The rules of one destination in a write list, made when missing. */
+const rulesOf = (list, host) => {
+  let rules = list.get(host);
+  if (!rules) {
+    rules = { methods: new Set(), paths: new Map() };
+    list.set(host, rules);
+  }
+  return rules;
+};
+
+/**
+ * What the user's standing answers say about one write: `allow`, `deny`, or null when nothing
+ * stands and the write asks. The more specific answer wins, a path before its host, and on the
+ * same level a standing denial before an approval. A refusal that ends with the turn is weaker
+ * than either standing answer: the user making "Always allow" for the same rule is a newer
+ * decision, and it must be able to lift what they refused once.
+ */
+function writeVerdict(host, requestPath, method) {
+  const path = rulePathOf(requestPath);
+  const denied = deniedWrites.get(host);
+  const turned = Date.now() < turnDenialsUntil ? turnDenials.get(host) : null;
+  const allowed = writeAccess.get(host);
+  if (denied?.paths.get(path)?.has(method)) return 'deny';
+  if (allowed?.paths.get(path)?.has(method)) return 'allow';
+  if (turned?.paths.get(path)?.has(method)) return 'deny';
+  if (denied?.methods.has(method)) return 'deny';
+  if (allowed?.methods.has(method)) return 'allow';
+  if (turned?.methods.has(method)) return 'deny';
+  return null;
+}
+
+/** A write list as the host reads it back: a host-wide entry and one per path, sorted. */
+const writeEntriesFrom = (list) => Array.from(list).flatMap(([host, rules]) => [
+  ...(rules.methods.size > 0 ? [{ host, methods: Array.from(rules.methods).sort() }] : []),
+  ...Array.from(rules.paths, ([path, methods]) => ({ host, path, methods: Array.from(methods).sort() })),
+]);
+
+/** A destination and method the user refused, for the host or one path of it, in either write
+ * list. A destination at the cap makes room for the answer just given: the newest answer is the
+ * user's, and refusing to keep it would deny a write without remembering the decision. */
+function rememberDeniedWrite(list, host, method, path = null) {
+  if (!list.has(host) && list.size >= MAX_WRITE_ENTRIES) {
+    list.delete(list.keys().next().value);
+  }
+  const rules = rulesOf(list, host);
+  if (path === null) {
+    rules.methods.add(method);
     return;
   }
-  if (deniedWrites.size >= MAX_WRITE_ENTRIES) return;
-  deniedWrites.set(host, new Set([method]));
+  const methods = rules.paths.get(path) ?? new Set();
+  methods.add(method);
+  rules.paths.set(path, methods);
 }
 
 /**
- * The outcome of a wait: the request goes out, or it is refused with the reason. `rememberDeny`
- * is set only for the user's own answer: a wait that ran out of time is refused, not decided, and
- * must not silence that destination for the rest of the process.
+ * The outcome of a wait: the request goes out, or it is refused with the reason. `rememberDeny` is
+ * set only for the user's standing answer, `turnDeny` for a refusal that ends with the chat's
+ * turn: `host` or `path` says what the refusal stands for. A wait that ran out of time is refused,
+ * not decided, and must not silence that destination for the rest of the process. A path that
+ * cannot be a rule is remembered for the host, the stricter side.
  */
-function settleApproval(entry, allow, { rememberDeny = false } = {}) {
+function settleApproval(entry, allow, { rememberDeny = null, turnDeny = null, message = UNANSWERED } = {}) {
   if (pendingApprovals.get(entry.id) !== entry) return;
   pendingApprovals.delete(entry.id);
   clearTimeout(entry.timer);
@@ -1144,12 +1226,24 @@ function settleApproval(entry, allow, { rememberDeny = false } = {}) {
     forwardRequest(entry.request, entry.response, entry.target, entry.path, entry.buffered);
     return;
   }
+  const path = rulePathOf(entry.path);
+  const rulePath = (scope) => (scope === 'path' && isRulePath(path) ? path : null);
   // The answer stands for the destination: the next identical write is refused without asking.
-  if (rememberDeny) rememberDeniedWrite(entry.target.host, entry.method);
+  if (rememberDeny !== null) rememberDeniedWrite(deniedWrites, entry.target.host, entry.method, rulePath(rememberDeny));
+  // And this one only until the turn ends: a retry inside the same turn meets this, not a prompt.
+  if (turnDeny !== null) {
+    // A path the space chose but this gatekeeper cannot store is not widened to the host: the
+    // refusal covers this write alone, which is what the prompt said it covers.
+    const turnedPath = rulePath(turnDeny);
+    if (turnDeny === 'host' || turnedPath !== null) {
+      rememberDeniedWrite(turnDenials, entry.target.host, entry.method, turnedPath);
+      turnDenialsUntil = Date.now() + TURN_DENIAL_MS;
+    }
+  }
   // Nothing of a refused write has been read: a request the user did not allow is not stored.
   entry.request.resume();
   record('corridor', entry.target.host, entry.target.port, 'deny:method', entry.method);
-  refuseDecrypted(entry.response, 403, REFUSED, 'the user did not allow this write');
+  refuseDecrypted(entry.response, 403, REFUSED, message);
 }
 
 function holdForApproval(request, response, target, path, method, buffered) {
@@ -1205,7 +1299,7 @@ function decideGraphqlRequest(request, response, target, path, method, { denied 
     if (denied) {
       request.resume();
       noteStandingDenial(target.host, target.port, method);
-      refuseDecrypted(response, 403, REFUSED, 'the user did not allow this write');
+      refuseDecrypted(response, 403, REFUSED, REFUSED_BY_USER);
       return;
     }
     if (read.body) {
@@ -1219,13 +1313,29 @@ function decideGraphqlRequest(request, response, target, path, method, { denied 
   });
 }
 
-/** The host's answer for one wait. `{ status }` is what the control listener answers with. */
+/**
+ * The host's answer for one wait. `{ status }` is what the control listener answers with. A
+ * refusal stands unless `remember` is false, when the user denied this one write: for the wait's
+ * exact path when `scope` is `path`, for the whole destination otherwise. A refusal the user did
+ * not want to keep still stands for the rest of the turn, so the agent's retry meets it rather
+ * than another prompt; `/turn-end` ends it.
+ */
 function decideApproval(body) {
   const id = Number(body.id);
   if (!Number.isSafeInteger(id) || id <= 0) return { status: 400, error: 'id is the number the gatekeeper gave the wait' };
   const entry = pendingApprovals.get(id);
   if (!entry) return { status: 404, error: 'no write is waiting with that id; it was answered or its time passed' };
-  settleApproval(entry, body.allow === true, { rememberDeny: body.allow !== true });
+  const refused = body.allow !== true;
+  const scope = body.scope === 'path' ? 'path' : 'host';
+  const remembers = refused && body.remember !== false;
+  const thisTurnOnly = refused && body.remember === false;
+  settleApproval(entry, body.allow === true, {
+    rememberDeny: remembers ? scope : null,
+    turnDeny: thisTurnOnly ? scope : null,
+    message: REFUSED_BY_USER,
+  });
+  // A refusal for this turn covers writes already waiting for the same destination and method.
+  if (thisTurnOnly) settleDecidedWaits();
   return { status: 200 };
 }
 
@@ -1267,15 +1377,15 @@ function serveDecryptedRequest(request, response) {
     forwardRequest(request, response, target, path);
     return;
   }
-  const approved = writeAccess.get(target.host);
-  if (approved && approved.has(method)) {
+  const verdict = writeVerdict(target.host, path, method);
+  if (verdict === 'allow') {
     record('corridor', target.host, target.port, 'allow', method);
     forwardRequest(request, response, target, path);
     return;
   }
   // A method the user already denied there is refused at once: the answer stands until cleared.
   // One record a minute for the destination: a retrying agent would otherwise fill the journal.
-  if (deniedWrites.get(target.host)?.has(method)) {
+  if (verdict === 'deny') {
     // The denial covers writes there, not reads that arrive as one: a GraphQL document that
     // only queries is classified as usual and goes out; a mutation is refused without asking.
     if ((method === 'POST' || method === 'PUT') && isGraphqlRequest(request, path)) {
@@ -1284,7 +1394,7 @@ function serveDecryptedRequest(request, response) {
     }
     request.resume();
     noteStandingDenial(target.host, target.port, method);
-    refuseDecrypted(response, 403, REFUSED, 'the user did not allow this write');
+    refuseDecrypted(response, 403, REFUSED, REFUSED_BY_USER);
     return;
   }
   // The user chose an open internet whose writes go out on their own: no wait, no prompt.
@@ -1591,16 +1701,16 @@ function setNetwork(body) {
 }
 
 /**
- * The methods the user approved, per destination. A name and the four methods that can change
- * something out there; anything else is refused, and a list that is not one is never read as an
- * empty one. The host sends the whole list every time, so a destination the user has not approved
- * cannot linger from an earlier request.
+ * The methods the user approved or denied, per destination and optionally per exact path. A name
+ * and the four methods that can change something out there; anything else is refused, and a list
+ * that is not one is never read as an empty one. The host sends the whole list every time, so a
+ * destination the user has not decided cannot linger from an earlier request.
  */
-/** A `{ entries }` body as a map of host to methods, or an error naming what is wrong with it. */
+/** A `{ entries }` body as a map of host to rules, or an error naming what is wrong with it. */
 function writeEntriesOf(body) {
   const entries = Array.isArray(body.entries) ? body.entries : null;
-  if (entries === null) return { problem: 'entries must be a list of { host, methods }' };
-  if (entries.length > MAX_WRITE_ENTRIES) return { problem: `at most ${MAX_WRITE_ENTRIES} destinations` };
+  if (entries === null) return { problem: 'entries must be a list of { host, methods, path? }' };
+  if (entries.length > MAX_WRITE_ENTRIES) return { problem: `at most ${MAX_WRITE_ENTRIES} rules` };
   const next = new Map();
   for (const entry of entries) {
     if (!(entry instanceof Object) || Array.isArray(entry)) return { problem: 'a destination is an object with a host and methods' };
@@ -1614,11 +1724,23 @@ function writeEntriesOf(body) {
     }
     const wrong = methods.find((method) => !WRITABLE_METHODS.includes(method));
     if (wrong !== undefined) return { problem: `'${wrong}' is not a method a user can decide. The methods are ${WRITABLE_METHODS.join(', ')}.` };
-    const known = next.get(name) ?? new Set();
+    if (entry.path !== undefined && entry.path !== null && !isRulePath(entry.path)) {
+      return { problem: `the path of '${name}' is a path as a request writes it: a /, no query, no fragment, no space, at most ${MAX_RULE_PATH_CHARACTERS} characters` };
+    }
+    const rules = rulesOf(next, name);
+    const known = entry.path === undefined || entry.path === null ? rules.methods : (rules.paths.get(entry.path) ?? new Set());
     for (const method of methods) known.add(method);
-    next.set(name, known);
+    if (known !== rules.methods) rules.paths.set(entry.path, known);
   }
   return { next };
+}
+
+/** The waits the standing answers now decide: an approval sends them, a denial refuses them. */
+function settleDecidedWaits() {
+  for (const entry of Array.from(pendingApprovals.values())) {
+    const verdict = writeVerdict(entry.target.host, entry.path, entry.method);
+    if (verdict !== null) settleApproval(entry, verdict === 'allow', { message: REFUSED_BY_USER });
+  }
 }
 
 function setWrites(body) {
@@ -1626,9 +1748,7 @@ function setWrites(body) {
   if (parsed.problem) return parsed.problem;
   writeAccess = parsed.next;
   // A standing approval from the dialog is an answer too: every wait it covers goes out now.
-  for (const entry of Array.from(pendingApprovals.values())) {
-    if (parsed.next.get(entry.target.host)?.has(entry.method)) settleApproval(entry, true);
-  }
+  settleDecidedWaits();
   return null;
 }
 
@@ -1637,9 +1757,7 @@ function setDenials(body) {
   if (parsed.problem) return parsed.problem;
   deniedWrites = parsed.next;
   // The answer now covers waits that were opened before it: they are refused, not asked again.
-  for (const entry of Array.from(pendingApprovals.values())) {
-    if (parsed.next.get(entry.target.host)?.has(entry.method)) settleApproval(entry, false);
-  }
+  settleDecidedWaits();
   return null;
 }
 
@@ -1708,8 +1826,11 @@ async function serveControl(request, response) {
       mode: networkMode,
       domains: Array.from(allowedDomains),
       grants: Array.from(grants.keys()),
-      writes: Array.from(writeAccess, ([host, methods]) => ({ host, methods: Array.from(methods).sort() })),
-      denials: Array.from(deniedWrites, ([host, methods]) => ({ host, methods: Array.from(methods).sort() })),
+      writes: writeEntriesFrom(writeAccess),
+      denials: writeEntriesFrom(deniedWrites),
+      // This program reads a path in a write rule. One from before would read such a rule as one
+      // for the whole host, so the host sends paths only where this says so.
+      pathRules: true,
     });
     return;
   }
@@ -1748,7 +1869,7 @@ async function serveControl(request, response) {
     answerJson(response, 200, { records: journal.slice(), dropped: journalDropped, since: STARTED_AT });
     return;
   }
-  if (request.method !== 'POST' || (path !== '/network' && path !== '/grants' && path !== '/writes' && path !== '/denials' && path !== '/approvals')) {
+  if (request.method !== 'POST' || (path !== '/network' && path !== '/grants' && path !== '/writes' && path !== '/denials' && path !== '/approvals' && path !== '/turn-end')) {
     answerJson(response, 404, { error: 'no such control endpoint' });
     return;
   }
@@ -1768,6 +1889,14 @@ async function serveControl(request, response) {
     const decision = decideApproval(body);
     if (decision.error) answerJson(response, decision.status, { error: decision.error });
     else answerJson(response, 200, { ok: true });
+    return;
+  }
+  if (path === '/turn-end') {
+    // The chat's turn is over, so a refusal the user did not want to keep ends here: the next
+    // turn asks again. A standing answer is untouched, and nothing waiting is affected.
+    turnDenials = new Map();
+    turnDenialsUntil = 0;
+    answerJson(response, 200, { ok: true });
     return;
   }
   const problem = path === '/network' ? setNetwork(body)

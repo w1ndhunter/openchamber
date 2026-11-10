@@ -21,7 +21,7 @@ const entry = (change: Partial<SpaceEntry> = {}): SpaceEntry => ({
   stoppedIdle: false,
   step: null,
   failure: null,
-  network: { mode: 'allowlist', domains: [], writes: 'ask' },
+  network: { mode: 'allowlist', domains: [], writes: 'ask', writesScope: 'path' },
   grants: [],
   writeAccess: [],
   deniedWrites: [],

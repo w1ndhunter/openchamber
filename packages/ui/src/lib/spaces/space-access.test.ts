@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 
-import { blockedAttemptsOf, isDomainName, providerAccessOf, setupBlockedDomainsOf, spaceAccessNoticeOf } from './space-access';
+import { blockedAttemptsOf, isDomainName, isRememberableWrite, providerAccessOf, setupBlockedDomainsOf, spaceAccessNoticeOf } from './space-access';
 import type { SpaceEntry, SpaceJournalRecord } from './spaces-api';
 
 const anthropic = { kind: 'model' as const, id: 'anthropic', provider: 'anthropic', upstream: 'https://api.anthropic.com/v1', source: { kind: 'typed' as const }, url: 'http://gatekeeper:8080/model/anthropic' };
@@ -19,7 +19,7 @@ const entry = (change: Partial<SpaceEntry> = {}): SpaceEntry => ({
   stoppedIdle: false,
   step: null,
   failure: null,
-  network: { mode: 'allowlist', domains: [], writes: 'ask' },
+  network: { mode: 'allowlist', domains: [], writes: 'ask', writesScope: 'path' },
   grants: [anthropic, openai],
   writeAccess: [],
   deniedWrites: [],
@@ -62,17 +62,17 @@ describe('spaceAccessNoticeOf', () => {
   });
 
   test('warns about a missing model key whatever the network, since OpenCode\'s free models refuse a space', () => {
-    expect(spaceAccessNoticeOf(entry({ grants: [], access: null, network: { mode: 'open', domains: [], writes: 'ask' } }))).toEqual({ kind: 'no_model' });
-    expect(spaceAccessNoticeOf(entry({ grants: [registry], network: { mode: 'open', domains: [], writes: 'ask' } }))).toEqual({ kind: 'no_model' });
+    expect(spaceAccessNoticeOf(entry({ grants: [], access: null, network: { mode: 'open', domains: [], writes: 'ask', writesScope: 'path' } }))).toEqual({ kind: 'no_model' });
+    expect(spaceAccessNoticeOf(entry({ grants: [registry], network: { mode: 'open', domains: [], writes: 'ask', writesScope: 'path' } }))).toEqual({ kind: 'no_model' });
     expect(spaceAccessNoticeOf(entry({ grants: [], access: null, network: null }))).toEqual({ kind: 'no_model' });
-    expect(spaceAccessNoticeOf(entry({ grants: [], access: null, network: { mode: 'allowlist', domains: ['opencode.ai'], writes: 'ask' } }))).toEqual({ kind: 'no_model' });
+    expect(spaceAccessNoticeOf(entry({ grants: [], access: null, network: { mode: 'allowlist', domains: ['opencode.ai'], writes: 'ask', writesScope: 'path' } }))).toEqual({ kind: 'no_model' });
     // A key, a login or a provider of the user's own is access with the open internet too.
     const custom = { kind: 'custom' as const, id: 'ollama-local', provider: 'ollama-local', url: 'http://gatekeeper:8080/model/ollama-local' };
     for (const grant of [anthropic, openaiLogin, custom]) {
-      expect(spaceAccessNoticeOf(entry({ grants: [grant], network: { mode: 'open', domains: [], writes: 'ask' } }))).toBeNull();
+      expect(spaceAccessNoticeOf(entry({ grants: [grant], network: { mode: 'open', domains: [], writes: 'ask', writesScope: 'path' } }))).toBeNull();
     }
     // A key lost at a restart is still said, whatever the network.
-    expect(spaceAccessNoticeOf(entry({ access: 'needs_access', needsAccess: ['anthropic'], network: { mode: 'open', domains: [], writes: 'ask' } }))).toEqual({ kind: 'needs_again', providers: ['anthropic'] });
+    expect(spaceAccessNoticeOf(entry({ access: 'needs_access', needsAccess: ['anthropic'], network: { mode: 'open', domains: [], writes: 'ask', writesScope: 'path' } }))).toEqual({ kind: 'needs_again', providers: ['anthropic'] });
   });
 
   test('says it could not check rather than "granted" when the gatekeeper did not answer', () => {
@@ -138,6 +138,14 @@ describe('isDomainName', () => {
     for (const value of ['localhost', '10.0.0.1', '1746020849', 'a_b.example.com', 'example.com/x', 'https://example.com', 'Example.com', '']) {
       expect(isDomainName(value)).toBe(false);
     }
+  });
+});
+
+describe('isRememberableWrite', () => {
+  test('a standing answer only for a domain name and one of the four write methods', () => {
+    for (const method of ['POST', 'PUT', 'PATCH', 'DELETE']) expect(isRememberableWrite('api.github.com', method)).toBe(true);
+    for (const method of ['GET', 'QUERY', 'MKCOL', 'post', '']) expect(isRememberableWrite('api.github.com', method)).toBe(false);
+    for (const host of ['10.0.0.4', 'localhost', '[::1]']) expect(isRememberableWrite(host, 'POST')).toBe(false);
   });
 });
 

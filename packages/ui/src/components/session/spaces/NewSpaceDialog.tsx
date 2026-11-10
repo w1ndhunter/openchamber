@@ -27,6 +27,7 @@ import { useI18n } from '@/lib/i18n';
 import { cn } from '@/lib/utils';
 import { SPACE_LOGIN_ONLY_PROVIDERS, SPACE_MODEL_PROVIDERS } from '@/lib/spaces/model-access';
 import { opencodeClient } from '@/lib/opencode/client';
+import { emptyEnvironmentDraft, environmentRequestOf, isEnvironmentDraftComplete, type EnvironmentDraft } from '@/lib/spaces/environment-draft';
 import { registryDomainsOf } from '@/lib/spaces/registry-domains';
 import { isDomainName } from '@/lib/spaces/space-access';
 import { listSpacePlaces, type SpaceFailure, type SpacePlace, type SpaceStart } from '@/lib/spaces/spaces-api';
@@ -37,6 +38,8 @@ import { useConfigStore } from '@/stores/useConfigStore';
 import { useUIStore } from '@/stores/useUIStore';
 import { failureOfError, spaceFailureText } from './spaceFailureText';
 import { DockerSetupNotice } from './DockerSetupNotice';
+import { EnvironmentSourcePicker } from './EnvironmentSourcePicker';
+import WriteScopeChoice from './WriteScopeChoice';
 import { ModelKeySource } from './ModelKeySource';
 import { isAccessChoiceComplete, modelGrantOf, usableHostLoginOf, useSpaceHostLogins, useSpaceModelProviders, type KeySourceChoice } from './spaceModelKeys';
 
@@ -104,9 +107,11 @@ export const NewSpaceDialog: React.FC<NewSpaceDialogProps> = ({ open, onOpenChan
   // Beside the destinations: whether writes go out on their own. Chosen with the two open-internet
   // options, and asking by default.
   const [writesAllowed, setWritesAllowed] = React.useState(false);
+  const [writesScope, setWritesScope] = React.useState<'path' | 'host'>('path');
   const [domains, setDomains] = React.useState<string[]>([]);
   const [domainInput, setDomainInput] = React.useState('');
   const [domainError, setDomainError] = React.useState(false);
+  const [environment, setEnvironment] = React.useState<EnvironmentDraft>(emptyEnvironmentDraft);
   const [access, setAccess] = React.useState<Record<string, AccessChoice>>({});
   const [submitting, setSubmitting] = React.useState(false);
   const [submitError, setSubmitError] = React.useState<string | null>(null);
@@ -123,9 +128,12 @@ export const NewSpaceDialog: React.FC<NewSpaceDialogProps> = ({ open, onOpenChan
     setStart(null);
     setShowFiles(false);
     setMode(null);
+    setWritesAllowed(false);
+    setWritesScope('path');
     setDomains([]);
     setDomainInput('');
     setDomainError(false);
+    setEnvironment(emptyEnvironmentDraft());
     setSubmitError(null);
     setAccess(Object.fromEntries([
       ...SPACE_MODEL_PROVIDERS.map((provider): [string, AccessChoice] => [provider.id, {
@@ -194,7 +202,8 @@ export const NewSpaceDialog: React.FC<NewSpaceDialogProps> = ({ open, onOpenChan
   const effectiveMode = mode === 'allowlist' && !canRestrict ? 'open' : mode ?? (canRestrict ? 'allowlist' : 'open');
   const chosenAccess = providers.filter((provider) => access[provider.id]?.selected);
   const accessIncomplete = chosenAccess.some((provider) => !isAccessChoiceComplete(provider, access[provider.id]));
-  const canCreate = place?.available === true && name.trim() !== '' && changes.kind !== 'loading' && !accessIncomplete && !submitting;
+  const environmentComplete = isEnvironmentDraftComplete(environment);
+  const canCreate = place?.available === true && name.trim() !== '' && changes.kind !== 'loading' && !accessIncomplete && environmentComplete && !submitting;
 
   const addDomain = () => {
     const candidates = domainInput.split(/[\s,]+/).map((value) => value.trim().toLowerCase()).filter(Boolean);
@@ -221,7 +230,14 @@ export const NewSpaceDialog: React.FC<NewSpaceDialogProps> = ({ open, onOpenChan
       await startSpaceCreation({
         projectId: project.id,
         setup,
-        request: { projectDirectory: project.path, placeId: place.id, name: name.trim(), start: effectiveStart, network: { mode: effectiveMode, domains: effectiveMode === 'allowlist' ? domains : [], writes: effectiveMode === 'open' && writesAllowed ? 'allow' : 'ask' } },
+        request: {
+          projectDirectory: project.path,
+          placeId: place.id,
+          name: name.trim(),
+          start: effectiveStart,
+          network: { mode: effectiveMode, domains: effectiveMode === 'allowlist' ? domains : [], writes: effectiveMode === 'open' && writesAllowed ? 'allow' : 'ask', writesScope },
+          environment: environmentRequestOf(environment),
+        },
         access: grants,
         refusalMessage: t('spaces.create.queueRefused'),
       });
@@ -396,6 +412,7 @@ export const NewSpaceDialog: React.FC<NewSpaceDialogProps> = ({ open, onOpenChan
           description={<span className={cn(effectiveMode === 'open' && writesAllowed && 'text-status-warning')}>{t('spaces.create.network.openWarning')}</span>}
         />
       </SettingsRadioGroup>
+      {effectiveMode === 'allowlist' || !writesAllowed ? <WriteScopeChoice value={writesScope} onChange={setWritesScope} /> : null}
     </div>
   );
 
@@ -434,8 +451,11 @@ export const NewSpaceDialog: React.FC<NewSpaceDialogProps> = ({ open, onOpenChan
       {block(t('spaces.create.start.label'), codeBlock, t('spaces.create.start.ignoredNeverTravel'))}
     </>
   );
+  const environmentBlock = <EnvironmentSourcePicker value={environment} onChange={setEnvironment} mountAvailable={place?.machine == null} />;
+
   const rightBlocks = (
     <>
+      {block(t('spaces.create.environment.label'), environmentBlock, t('spaces.create.environment.info'))}
       {block(t('spaces.create.network.label'), networkBlock, t('spaces.create.network.info'))}
       {block(t('spaces.create.access.label'), modelsBlock, providers.length > 0 ? t('spaces.create.access.info') : undefined)}
     </>

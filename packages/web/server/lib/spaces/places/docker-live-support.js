@@ -140,8 +140,14 @@ require('node:http').createServer((request, response) => {
   const body = models
     ? { data: [{ model_picker_enabled: true, id: 'gpt-4o', name: 'GPT-4o', version: 'gpt-4o-2024-11-20', capabilities: { family: 'gpt-4o', limits: { max_output_tokens: 4096, max_prompt_tokens: 64000 }, supports: { tool_calls: true, streaming: true } } }] }
     : seen;
-  request.resume();
+  // Marker words a test planted, as the request body carried them: how a test sees which
+  // instructions reached the model without reading the whole prompt.
+  let text = '';
+  request.setEncoding('utf8');
+  request.on('data', (chunk) => { if (text.length < 4 * 1024 * 1024) text += chunk; });
   request.on('end', () => {
+    const markers = [...new Set(text.match(/OCMARK-[A-Z0-9-]+/g) ?? [])].sort();
+    if (markers.length > 0) console.log('markers ' + JSON.stringify({ path: request.url, markers }));
     response.writeHead(200, { 'content-type': 'application/json' });
     response.end(JSON.stringify(body));
   });
@@ -160,6 +166,8 @@ require('node:http').createServer((request, response) => {
         url: 'http://upstream:9000/v1',
         /** Every request this upstream has seen so far, oldest first, from its log. */
         seen: async () => (await docker(['logs', name])).stdout.split('\n').filter((line) => line.startsWith('seen ')).map((line) => JSON.parse(line.slice(5))),
+        /** The planted marker words each request body carried, oldest first. */
+        markers: async () => (await docker(['logs', name])).stdout.split('\n').filter((line) => line.startsWith('markers ')).map((line) => JSON.parse(line.slice(8))),
         stop: () => docker(['rm', '--force', name]),
       };
     },

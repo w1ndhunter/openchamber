@@ -24,7 +24,7 @@ const entry: SpaceEntry = {
   stoppedIdle: false,
   step: 'checking_place',
   failure: null,
-  network: { mode: 'allowlist', domains: [], writes: 'ask' },
+  network: { mode: 'allowlist', domains: [], writes: 'ask', writesScope: 'path' },
   grants: [],
   writeAccess: [],
   deniedWrites: [],
@@ -59,7 +59,7 @@ const host = (grantAnswer: { status: number; body: { grant?: unknown; code?: str
 
 const start = (access: readonly SpaceModelAccess[] = [], setup = { commands: [] as string[], waitBeforeSending: false }) => startSpaceCreation({
   projectId: 'project-1',
-  request: { projectDirectory: PROJECT, placeId: 'docker', name: 'Fix login', start: 'clean', network: { mode: 'allowlist', domains: [], writes: 'ask' } },
+  request: { projectDirectory: PROJECT, placeId: 'docker', name: 'Fix login', start: 'clean', network: { mode: 'allowlist', domains: [], writes: 'ask', writesScope: 'path' } },
   setup,
   access,
   refusalMessage: 'refused',
@@ -199,7 +199,7 @@ describe('startSpaceCreation', () => {
   test('the setup commands travel with the request, and the message does not wait for them by default', async () => {
     const { created } = host({ status: 200, body: {} }, { state: 'running', index: 0, total: 1, command: 'npm ci' });
     await start([], { commands: ['npm ci'], waitBeforeSending: false });
-    expect(created).toEqual([{ projectDirectory: PROJECT, placeId: 'docker', name: 'Fix login', start: 'clean', network: { mode: 'allowlist', domains: [], writes: 'ask' }, setupCommands: ['npm ci'], grants: [] }]);
+    expect(created).toEqual([{ projectDirectory: PROJECT, placeId: 'docker', name: 'Fix login', start: 'clean', network: { mode: 'allowlist', domains: [], writes: 'ask', writesScope: 'path' }, setupCommands: ['npm ci'], grants: [] }]);
     const { outcome } = waitingMessage();
     useSpacesStore.getState().noteProgress({ spaceId: ID, step: 'ready', failure: null });
     expect(await outcome).toEqual({ directory: DIRECTORY });

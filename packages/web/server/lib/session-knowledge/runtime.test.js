@@ -437,6 +437,34 @@ describe('what the session carries', () => {
     expect((await entriesFor(createRuntime()))[MEMORY]).not.toContain('Full text.');
   });
 
+  test('shared memory has its own heading and only titles enter the index', async () => {
+    const runtime = createRuntime({
+      agentMemoryRuntime: {
+        readAll: async () => ({
+          global: [], project: [], sharedFailed: false,
+          shared: [{ id: 's1', title: 'Shared release train', body: 'Shared body.', type: 'fact', revision: 1, createdAt: 1, updatedAt: 2 }],
+        }),
+      },
+    });
+    const entries = await entriesFor(runtime, NO_PINS);
+    expect(entries[MEMORY]).toContain('### Shared with this environment');
+    expect(entries[MEMORY]).toContain('Shared release train');
+    expect(entries[MEMORY]).not.toContain('Shared body.');
+  });
+
+  test('a failed shared store does not hide private memory', async () => {
+    const runtime = createRuntime({
+      agentMemoryRuntime: {
+        readAll: async () => ({
+          global: [memory()], project: [], shared: [], sharedFailed: true,
+        }),
+      },
+    });
+    const entries = await entriesFor(runtime, NO_PINS);
+    expect(entries[MEMORY]).toContain('Uses bun');
+    expect(entries[MEMORY]).not.toContain('Nothing is stored yet.');
+  });
+
   test('unpinned notes and plans stay out', async () => {
     const entries = await entriesFor(createRuntime(), NO_PINS);
     expect(entries[PINNED]).toBe('');
@@ -537,7 +565,7 @@ describe('the memory switch', () => {
       isMemoryToolAvailable: async () => false,
     });
     expect((await entriesFor(runtime))[MEMORY]).toBe('');
-    expect((await runtime.collectSummary(DIRECTORY)).memory).toEqual({ global: 1, project: 0 });
+    expect((await runtime.collectSummary(DIRECTORY)).memory).toEqual({ global: 1, project: 0, shared: 0 });
   });
 
   test('an unreadable setting keeps memory out rather than guessing', async () => {

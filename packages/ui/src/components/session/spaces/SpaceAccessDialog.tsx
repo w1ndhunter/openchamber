@@ -23,15 +23,17 @@ import { MobileOverlayPanel } from '@/components/ui/MobileOverlayPanel';
 import { ScrollableOverlay } from '@/components/ui/ScrollableOverlay';
 import { useI18n, type I18nKey } from '@/lib/i18n';
 import { getCurrentIntlLocale } from '@/lib/i18n/intl';
-import { blockedAttemptsOf, isDomainName, providerAccessOf, type BlockReason } from '@/lib/spaces/space-access';
+import { blockedAttemptsOf, isDomainName, isWriteMethod, providerAccessOf, type BlockReason } from '@/lib/spaces/space-access';
 import { SPACE_LOGIN_ONLY_PROVIDERS } from '@/lib/spaces/model-access';
-import { grantSpaceAccess, providerGrantOf, type SpaceEntry, type SpaceWriteMethod } from '@/lib/spaces/spaces-api';
+import { changeSpaceNetwork, grantSpaceAccess, providerGrantOf, type SpaceEntry, type SpaceWriteMethod, type SpaceWriteScope } from '@/lib/spaces/spaces-api';
+import WriteScopeChoice from './WriteScopeChoice';
 import { runSpaceAction, spaceMenuActionsOf } from '@/lib/spaces/space-repair';
 import { refreshSpacesJourney, useSpacesStore } from '@/lib/spaces/spaces-store';
 import { useUIStore } from '@/stores/useUIStore';
 import { ModelKeySource } from './ModelKeySource';
 import { isAccessChoiceComplete, modelGrantOf, usableHostLoginOf, useSpaceHostLogins, useSpaceModelProviders, type HostLoginOffer, type KeySourceChoice, type SpaceModelProviderOption } from './spaceModelKeys';
 import { failureOfError, spaceFailureText } from './spaceFailureText';
+import { SpaceEnvironmentSection } from './SpaceEnvironmentSection';
 import { useApproveSpaceWrites, useClearSpaceDenial, useOpenSpaceDomain, useRevokeSpaceWrites, useSpaceJournal } from './spaceNetwork';
 
 const REASON_TEXT = {
@@ -45,11 +47,6 @@ const REASON_TEXT = {
   too_many: 'spaces.access.reason.tooMany',
   other: 'spaces.access.reason.other',
 } satisfies Record<BlockReason, I18nKey>;
-
-const WRITE_METHODS: ReadonlySet<string> = new Set(['DELETE', 'PATCH', 'POST', 'PUT']);
-// The journal's method is text the gatekeeper wrote, so it is checked against the set before it
-// is used as one of the four: a `GET`, an empty record or anything else is not approvable.
-const isWriteMethod = (value: string): value is SpaceWriteMethod => WRITE_METHODS.has(value);
 
 /** A time of the journal in the user's language: the hour when it is today, the date as well when it is not. */
 const formatJournalTime = (value: string): string => {
@@ -248,56 +245,68 @@ const DecisionChip: React.FC<{ method: SpaceWriteMethod; kind: 'allowed' | 'deni
  */
 const WritesSection: React.FC<{ entry: SpaceEntry; revokes: ReturnType<typeof useRevokeSpaceWrites>; denials: ReturnType<typeof useClearSpaceDenial> }> = ({ entry, revokes, denials }) => {
   const { t } = useI18n();
+  const [changingScope, setChangingScope] = React.useState(false);
+  const [scopeError, setScopeError] = React.useState<string | null>(null);
   const hosts = [...new Set([...entry.writeAccess, ...entry.deniedWrites].map((rule) => rule.host))].sort();
-  if (hosts.length === 0) return <p className="typography-meta text-muted-foreground">{t('spaces.access.writes.empty')}</p>;
+  const changeScope = async (writesScope: SpaceWriteScope) => {
+    setChangingScope(true);
+    setScopeError(null);
+    try {
+      await changeSpaceNetwork(entry.id, { writesScope });
+      await refreshSpacesJourney().catch(() => undefined);
+    } catch (failure) {
+      if (!(failure instanceof Error)) throw failure;
+      setScopeError(spaceFailureText(t, failureOfError(failure)));
+    } finally {
+      setChangingScope(false);
+    }
+  };
   return (
     <div className="space-y-2">
+      {entry.network ? <WriteScopeChoice value={entry.network.writesScope} onChange={(scope) => void changeScope(scope)} disabled={changingScope} /> : null}
+      {scopeError ? <p className="typography-meta text-status-error">{scopeError}</p> : null}
       <p className="typography-meta text-muted-foreground">{t('spaces.access.writes.intro')}</p>
-      <ul className="space-y-2">
-        {hosts.map((host) => {
-          const allowed = entry.writeAccess.find((rule) => rule.host === host)?.methods ?? [];
-          const denied = entry.deniedWrites.find((rule) => rule.host === host)?.methods ?? [];
-          const error = revokes.error?.key.startsWith(`${host}:`) ? revokes.error.text : denials.error?.key.startsWith(`${host}:`) ? denials.error.text : null;
-          return (
-            <li key={host} className="space-y-1">
-              <div className="font-mono typography-meta text-foreground break-all">{host}</div>
-              {allowed.length > 0 ? (
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <span className="typography-micro text-muted-foreground">{t('spaces.access.blocked.opened')}</span>
-                  {allowed.map((method) => (
-                    <DecisionChip
-                      key={`allowed:${method}`}
-                      method={method}
-                      kind="allowed"
-                      busy={revokes.revoking === `${host}:${method}`}
-                      disabled={revokes.revoking !== null}
-                      title={t('spaces.access.writes.revokeMethod', { method })}
-                      onClick={() => void revokes.revoke(host, method)}
-                    />
-                  ))}
-                </div>
-              ) : null}
-              {denied.length > 0 ? (
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <span className="typography-micro text-muted-foreground">{t('spaces.access.writes.denied')}</span>
-                  {denied.map((method) => (
-                    <DecisionChip
-                      key={`denied:${method}`}
-                      method={method}
-                      kind="denied"
-                      busy={denials.clearing === `${host}:${method}`}
-                      disabled={denials.clearing !== null}
-                      title={t('spaces.access.writes.clearDenial', { method })}
-                      onClick={() => void denials.clear(host, method, denied.filter((kept) => kept !== method))}
-                    />
-                  ))}
-                </div>
-              ) : null}
-              {error ? <div className="typography-micro text-status-error">{error}</div> : null}
-            </li>
-          );
-        })}
-      </ul>
+      {hosts.length === 0 ? <p className="typography-meta text-muted-foreground">{t('spaces.access.writes.empty')}</p> : (
+        <ul className="space-y-2">
+          {hosts.map((host) => {
+            // A host-wide entry and each exact-path entry are independent answers, in both lists.
+            const rows = ['allowed', 'denied'] as const;
+            return (
+              <li key={host} className="space-y-1">
+                <div className="font-mono typography-meta text-foreground break-all">{host}</div>
+                {rows.flatMap((kind) => {
+                  const list = kind === 'allowed' ? entry.writeAccess : entry.deniedWrites;
+                  return list.filter((rule) => rule.host === host).sort((left, right) => (left.path ?? '').localeCompare(right.path ?? '')).map((rule) => {
+                    const path = rule.path;
+                    const keyOf = (method: string) => `${host}:${path ?? ''}:${method}`;
+                    return (
+                      <div key={`${kind}:${path ?? ''}`} className="flex flex-wrap items-center gap-1.5">
+                        <span className="typography-micro text-muted-foreground">
+                          {path ? <span dir="ltr" className="font-mono text-foreground">{path}</span> : t(kind === 'allowed' ? 'spaces.access.blocked.opened' : 'spaces.access.writes.denied')}
+                        </span>
+                        {rule.methods.map((method) => (
+                          <DecisionChip
+                            key={`${kind}:${method}`}
+                            method={method}
+                            kind={kind}
+                            busy={kind === 'allowed' ? revokes.revoking === keyOf(method) : denials.clearing === keyOf(method)}
+                            disabled={kind === 'allowed' ? revokes.revoking !== null : denials.clearing !== null}
+                            title={t(kind === 'allowed' ? 'spaces.access.writes.revokeMethod' : 'spaces.access.writes.clearDenial', { method })}
+                            onClick={() => void (kind === 'allowed' ? revokes.revoke(host, method, path) : denials.clear(host, method, rule.methods.filter((kept) => kept !== method), path))}
+                          />
+                        ))}
+                        {(kind === 'allowed' ? revokes.error : denials.error)?.key.startsWith(`${host}:${path ?? ''}:`) ? (
+                          <span className="typography-micro text-status-error">{(kind === 'allowed' ? revokes.error : denials.error)?.text}</span>
+                        ) : null}
+                      </div>
+                    );
+                  });
+                })}
+              </li>
+            );
+          })}
+        </ul>
+      )}
     </div>
   );
 };
@@ -409,6 +418,9 @@ const SpaceAccessBody: React.FC<{ entry: SpaceEntry; focusProviderId: string | n
     <div className="space-y-5 pe-3">
       <p className="typography-meta text-muted-foreground">{t('spaces.access.intro')}</p>
       {!running ? <StoppedNotice spaceId={entry.id} /> : null}
+      <Section title={t('spaces.create.environment.label')}>
+        <SpaceEnvironmentSection entry={entry} />
+      </Section>
       <Section title={t('spaces.access.models.label')}>
         {providers.length === 0 ? <p className="typography-meta text-muted-foreground">{t('spaces.create.access.noneAvailable')}</p> : (
           <div className="space-y-3">

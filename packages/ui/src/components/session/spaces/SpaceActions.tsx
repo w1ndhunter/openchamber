@@ -30,7 +30,9 @@ import { MobileOverlayPanel } from '@/components/ui/MobileOverlayPanel';
 import { MobileSheetRow } from '@/components/ui/MobileSheetList';
 import { toast } from '@/components/ui';
 import { useI18n } from '@/lib/i18n';
+import { unsyncedMemoryOf } from '@/lib/spaces/space-environment';
 import { isSpaceApplicable, runSpaceAction } from '@/lib/spaces/space-repair';
+import { readSpaceEnvironmentMemory } from '@/lib/spaces/spaces-api';
 import { useSpacesStore, type SpaceAction } from '@/lib/spaces/spaces-store';
 import { useUIStore } from '@/stores/useUIStore';
 import { SPACE_ACTION_TEXT } from './spaceActionText';
@@ -213,6 +215,25 @@ export const SpaceDeleteDialog: React.FC = () => {
     setLastShown({ name, unsaved, applicable });
   }
   const shown = spaceId !== null ? { name, unsaved, applicable } : lastShown;
+  // Shared memory changes the source does not have yet go with the space; read from the space now.
+  const memoryWanted = useSpacesStore((state) => {
+    const entry = spaceId ? state.journey?.get(spaceId) : undefined;
+    return Boolean(entry?.environment && entry.environment.memory !== 'off' && entry.state === 'running');
+  });
+  // A count, or null when the space's memory could not be read: unknown is said, never taken for none.
+  const [unsyncedMemory, setUnsyncedMemory] = React.useState<number | null>(0);
+  React.useEffect(() => {
+    if (!spaceId || !memoryWanted) {
+      setUnsyncedMemory(0);
+      return undefined;
+    }
+    const controller = new AbortController();
+    readSpaceEnvironmentMemory(spaceId, controller.signal).then(
+      (live) => setUnsyncedMemory(unsyncedMemoryOf(live)),
+      () => { if (!controller.signal.aborted) setUnsyncedMemory(null); },
+    );
+    return () => controller.abort();
+  }, [spaceId, memoryWanted]);
   const close = () => useSpacesStore.getState().closeDeleteDialog();
   const confirm = () => {
     if (!spaceId) return;
@@ -234,12 +255,16 @@ export const SpaceDeleteDialog: React.FC = () => {
   );
   // After chats could not be saved: a line for the whole when anything but size failed, and one
   // per chat too large to save, named by its title from the space, shown as text.
-  const lines = shown.unsaved
-    ? [
-      ...(shown.unsaved.failed > 0 || shown.unsaved.tooLarge.length === 0 ? [t('spaces.delete.chatsNotSaved', { name: shown.name })] : []),
-      ...shown.unsaved.tooLarge.map((chatTitle) => t('spaces.delete.chatTooLarge', { title: chatTitle })),
-    ]
-    : [t('spaces.delete.body')];
+  const lines = [
+    ...(shown.unsaved
+      ? [
+        ...(shown.unsaved.failed > 0 || shown.unsaved.tooLarge.length === 0 ? [t('spaces.delete.chatsNotSaved', { name: shown.name })] : []),
+        ...shown.unsaved.tooLarge.map((chatTitle) => t('spaces.delete.chatTooLarge', { title: chatTitle })),
+      ]
+      : [t('spaces.delete.body')]),
+    ...(unsyncedMemory === null ? [t('spaces.delete.memoryUnknown')] : []),
+    ...(unsyncedMemory !== null && unsyncedMemory > 0 ? [t('spaces.delete.unsyncedMemory', { count: unsyncedMemory })] : []),
+  ];
 
   if (isMobile) {
     return (

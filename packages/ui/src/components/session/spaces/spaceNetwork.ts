@@ -86,12 +86,12 @@ export const useRevokeSpaceWrites = (spaceId: string) => {
   const { t } = useI18n();
   const [revoking, setRevoking] = React.useState<string | null>(null);
   const [error, setError] = React.useState<{ key: string; text: string } | null>(null);
-  const revoke = async (host: string, method: SpaceWriteMethod): Promise<boolean> => {
-    const key = `${host}:${method}`;
+  const revoke = async (host: string, method: SpaceWriteMethod, path?: string): Promise<boolean> => {
+    const key = `${host}:${path ?? ''}:${method}`;
     setRevoking(key);
     setError(null);
     try {
-      await revokeSpaceWrites(spaceId, host, [method]);
+      await revokeSpaceWrites(spaceId, host, [method], path);
       await refreshSpacesJourney().catch(() => undefined);
       return true;
     } catch (failure) {
@@ -114,12 +114,12 @@ export const useClearSpaceDenial = (spaceId: string) => {
   const { t } = useI18n();
   const [clearing, setClearing] = React.useState<string | null>(null);
   const [error, setError] = React.useState<{ key: string; text: string } | null>(null);
-  const clear = async (host: string, method: SpaceWriteMethod, remaining: readonly SpaceWriteMethod[]): Promise<boolean> => {
-    const key = `${host}:${method}`;
+  const clear = async (host: string, method: SpaceWriteMethod, remaining: readonly SpaceWriteMethod[], path?: string): Promise<boolean> => {
+    const key = `${host}:${path ?? ''}:${method}`;
     setClearing(key);
     setError(null);
     try {
-      await denySpaceWrites(spaceId, host, [...remaining]);
+      await denySpaceWrites(spaceId, host, [...remaining], path);
       await refreshSpacesJourney().catch(() => undefined);
       return true;
     } catch (failure) {

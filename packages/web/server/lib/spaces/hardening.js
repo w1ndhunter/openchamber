@@ -20,9 +20,15 @@ import {
   SPACE_ENVIRONMENT,
   SPACE_HOME,
   SPACE_SERVER_COMMAND,
+  SPACE_SHARED_MEMORY_DIRECTORY_VARIABLE,
+  SPACE_SHARED_MEMORY_MODE_VARIABLE,
   SPACE_USER,
+  ENVIRONMENT_MOUNT_PATH,
+  LABEL_ENVIRONMENT_MOUNT,
+  isEnvironmentMountPath,
   TOOLS_MARKER_PATH,
   TOOLS_MOUNT_PATH,
+  spaceSharedMemoryRoot,
   spaceWorkPath,
 } from './layout.js';
 import { isStartConfig, START_CONFIG_VARIABLE } from './space-opencode.js';
@@ -59,7 +65,13 @@ const BASE_IMAGE_ENVIRONMENT_NAMES = ['PATH', 'NODE_VERSION', 'YARN_VERSION'];
 // A space container may also carry OpenCode's start configuration in OPENCODE_CONFIG_CONTENT: the
 // window addresses of the custom providers given at creation and the placeholder key, nothing
 // else, which the checker reads whole.
-const SPACE_ENVIRONMENT_NAMES = new Set([...Object.keys(SPACE_ENVIRONMENT), ...BASE_IMAGE_ENVIRONMENT_NAMES, START_CONFIG_VARIABLE]);
+const SPACE_ENVIRONMENT_NAMES = new Set([
+  ...Object.keys(SPACE_ENVIRONMENT),
+  ...BASE_IMAGE_ENVIRONMENT_NAMES,
+  START_CONFIG_VARIABLE,
+  SPACE_SHARED_MEMORY_DIRECTORY_VARIABLE,
+  SPACE_SHARED_MEMORY_MODE_VARIABLE,
+]);
 const GATEKEEPER_ENVIRONMENT_NAMES = new Set([...Object.keys(GATEKEEPER_ENVIRONMENT), ...BASE_IMAGE_ENVIRONMENT_NAMES]);
 
 // Container output lands in a file on the Docker host. One 10 MB file, no rotation copies.
@@ -168,7 +180,10 @@ export function buildGatekeeperCreateArgs({ containerName, labelArguments, netwo
 /**
  * `startConfig` is OpenCode's start configuration from `buildStartConfig`, or null for none.
  */
-export function buildSpaceCreateArgs({ spaceId, containerName, labelArguments, network, workVolume, homeVolume, toolsVolume, memoryBytes, image, startConfig = null }) {
+export function buildSpaceCreateArgs({ spaceId, containerName, labelArguments, network, workVolume, homeVolume, toolsVolume, memoryBytes, image, startConfig = null, sharedMemoryMode = null, environmentMount = null }) {
+  if (environmentMount !== null && !isEnvironmentMountPath(environmentMount)) {
+    throw new Error('The environment folder must be an absolute path without commas, quotes or control characters');
+  }
   return [
     'create',
     '--name', containerName,
@@ -190,7 +205,15 @@ export function buildSpaceCreateArgs({ spaceId, containerName, labelArguments, n
     ...volumeMount(workVolume, spaceWorkPath(spaceId)),
     ...volumeMount(homeVolume, SPACE_HOME),
     ...readOnlyVolumeMount(toolsVolume, TOOLS_MOUNT_PATH),
+    ...(environmentMount === null ? [] : [
+      '--label', `${LABEL_ENVIRONMENT_MOUNT}=${environmentMount}`,
+      '--mount', `type=bind,src=${environmentMount},dst=${ENVIRONMENT_MOUNT_PATH},readonly,bind-propagation=rprivate`,
+    ]),
     ...Object.entries(SPACE_ENVIRONMENT).flatMap(([name, value]) => ['--env', `${name}=${value}`]),
+    ...(sharedMemoryMode === null ? [] : [
+      '--env', `${SPACE_SHARED_MEMORY_DIRECTORY_VARIABLE}=${spaceSharedMemoryRoot(spaceId)}`,
+      '--env', `${SPACE_SHARED_MEMORY_MODE_VARIABLE}=${sharedMemoryMode}`,
+    ]),
     ...(startConfig === null ? [] : ['--env', `${START_CONFIG_VARIABLE}=${startConfig}`]),
     image,
     ...SPACE_SERVER_COMMAND,
@@ -362,11 +385,26 @@ function findCommonViolations({ container, tmpfsOptions, networkMode, mountViola
  * Which mounts a space may have. The one exception to "only volumes of this space" is the mount
  * at the tools path, and it has rules of its own. A tools volume mounted anywhere else gets no exception.
  */
-function findSpaceMountViolations({ mounts, prefix, owner, toolsVolume }) {
+function findSpaceMountViolations({ mounts, prefix, owner, toolsVolume, environmentMount }) {
   const violations = [];
   const violate = (check, message) => violations.push({ check, message });
 
-  for (const mount of mounts.filter((candidate) => candidate.Destination !== TOOLS_MOUNT_PATH)) {
+  // The one host path a space may see: the folder the user named as its environment source, read-only,
+  // at a fixed place outside its volumes, and only when the host labelled the container with that path.
+  const environmentMounts = mounts.filter((candidate) => candidate.Destination === ENVIRONMENT_MOUNT_PATH);
+  if (environmentMounts.length > 1) violate('environment_mount', `More than one mount at ${ENVIRONMENT_MOUNT_PATH}`);
+  for (const mount of environmentMounts) {
+    if (environmentMount === null || !isEnvironmentMountPath(environmentMount)) {
+      violate('environment_mount', `A host folder is mounted at ${ENVIRONMENT_MOUNT_PATH} that nobody set for this space`);
+      continue;
+    }
+    if (mount.Type !== 'bind' || mount.Source !== environmentMount) violate('environment_mount', `The mount at ${ENVIRONMENT_MOUNT_PATH} is not the folder the user chose`);
+    if (mount.RW !== false) violate('environment_mount', 'The environment folder is writable from inside the space');
+    if (!['', 'rprivate', 'private'].includes(mount.Propagation ?? '')) violate('environment_mount', `The environment folder propagates mounts (${mount.Propagation})`);
+  }
+  if (environmentMount !== null && environmentMounts.length === 0) violate('environment_mount', `The environment folder is not mounted at ${ENVIRONMENT_MOUNT_PATH}`);
+
+  for (const mount of mounts.filter((candidate) => candidate.Destination !== TOOLS_MOUNT_PATH && candidate.Destination !== ENVIRONMENT_MOUNT_PATH)) {
     if (mount.Type !== 'volume' || !String(mount.Name ?? '').startsWith(prefix)) {
       violate('mounts', `Mount at ${mount.Destination} is not a volume of this space`);
     }
@@ -403,11 +441,12 @@ function findSpaceMountViolations({ mounts, prefix, owner, toolsVolume }) {
 export function findHardeningViolations({ spaceId, owner, container, network, toolsVolume }) {
   const prefix = spaceResourcePrefix(spaceId);
   const networkName = spaceResourceName(spaceId, ROLE_NETWORK);
+  const environmentMount = container?.Config?.Labels?.[LABEL_ENVIRONMENT_MOUNT] ?? null;
   const violations = findCommonViolations({
     container,
     tmpfsOptions: TMPFS_OPTIONS,
     networkMode: networkName,
-    mountViolations: (mounts) => findSpaceMountViolations({ mounts, prefix, owner, toolsVolume }),
+    mountViolations: (mounts) => findSpaceMountViolations({ mounts, prefix, owner, toolsVolume, environmentMount }),
     allowedEnvironment: SPACE_ENVIRONMENT_NAMES,
   });
   const violate = (check, message) => violations.push({ check, message });
@@ -416,6 +455,14 @@ export function findHardeningViolations({ spaceId, owner, container, network, to
   const startConfigs = (container?.Config?.Env ?? []).filter((entry) => String(entry).startsWith(`${START_CONFIG_VARIABLE}=`));
   if (startConfigs.length > 1 || startConfigs.some((entry) => !isStartConfig(String(entry).slice(START_CONFIG_VARIABLE.length + 1)))) {
     violate('environment', `${START_CONFIG_VARIABLE} holds more than the providers' window addresses`);
+  }
+  const environmentOf = (name) => (container?.Config?.Env ?? []).find((entry) => String(entry).startsWith(`${name}=`))?.slice(name.length + 1);
+  const sharedDir = environmentOf(SPACE_SHARED_MEMORY_DIRECTORY_VARIABLE);
+  const sharedMode = environmentOf(SPACE_SHARED_MEMORY_MODE_VARIABLE);
+  if (sharedDir !== undefined || sharedMode !== undefined) {
+    if (sharedDir !== spaceSharedMemoryRoot(spaceId) || !['off', 'read', 'write'].includes(sharedMode)) {
+      violate('environment', 'The shared memory environment names a folder or mode nobody set for this space');
+    }
   }
 
   // The space stays on one network, its inner one. The gatekeeper is the other member of it.

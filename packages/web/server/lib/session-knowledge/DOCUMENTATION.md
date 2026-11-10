@@ -30,7 +30,7 @@ source:
 | Key | Holds |
 |---|---|
 | `openchamber.pinned` | pinned notes and plan bodies |
-| `openchamber.memory` | the memory index and when to save |
+| `openchamber.memory` | the private and shared memory index, and when to save |
 | `openchamber.guidance` | when to link, when to draw a page, where the tools are called |
 | `openchamber.checkout` | the directory and branch the session works on |
 | `openchamber.response-style` | the user's current response style |
@@ -89,6 +89,11 @@ reached a teammate's agents. Unfinished work goes to project todos and plans.
 The save rule also says to save before the final reply. The chat shows only the
 last step's text as the answer, so an agent that answered, then saved, then
 wrote one closing line had its whole answer folded into Activity.
+
+A space may also carry shared memory from its environment source. It has its
+own `### Shared with this environment` heading. Only titles enter this entry;
+bodies require `memory.read`. A failed shared store is omitted and makes the
+index incomplete, never empty, while private scopes still appear.
 
 A source that will not load never blanks the rest: an unreadable memory store
 still writes the pinned notes. A memory scope that failed to load is left out

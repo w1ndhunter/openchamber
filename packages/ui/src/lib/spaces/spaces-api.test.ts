@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 
-import { approveSpaceWrites, denySpaceWrites, revokeSpaceWrites, applySpaceWork, cleanUpSpaceDisk, createSpace, listSpacePlaces, listSpaces, previewSpaceApply, openSpaceDomain, pullSpaceImage, readDockerSetupJob, readSpaceDisk, readSpaceIdleStop, readSpaceJournal, readSpaceSetup, readSpacesSwitch, runSpaceSetup, setSpaceIdleStop, setSpaceMachine, SpacesRequestError, startDockerSetup } from './spaces-api';
+import { approveSpaceWrites, decideSpaceApproval, denySpaceWrites, endSpaceTurn, revokeSpaceWrites, applySpaceWork, cleanUpSpaceDisk, createSpace, listSpacePlaces, listSpaces, previewSpaceApply, openSpaceDomain, pullSpaceImage, readDockerSetupJob, readSpaceDisk, readSpaceIdleStop, readSpaceJournal, readSpaceSetup, readSpacesSwitch, runSpaceSetup, setSpaceIdleStop, setSpaceMachine, SpacesRequestError, startDockerSetup } from './spaces-api';
 
 const ID = 'a1b2c3d4e5f6';
 const originalFetch = globalThis.fetch;
@@ -27,7 +27,7 @@ const entry = {
   state: 'preparing',
   step: 'checking_place',
   failure: null,
-  network: { mode: 'allowlist', domains: [], writes: 'ask' },
+  network: { mode: 'allowlist', domains: [], writes: 'ask', writesScope: 'path' },
   history: 'pending',
   grants: [],
   access: null,
@@ -113,10 +113,10 @@ describe('spaces-api', () => {
 
   test('a creation posts the four choices as JSON', async () => {
     const seen = answer(202, JSON.stringify(entry));
-    await createSpace({ projectDirectory: '/home/me/app', placeId: 'docker', name: 'Fix login', start: 'clean', network: { mode: 'open', domains: [], writes: 'ask' }, setupCommands: ['npm ci'], grants: [] });
+    await createSpace({ projectDirectory: '/home/me/app', placeId: 'docker', name: 'Fix login', start: 'clean', network: { mode: 'open', domains: [], writes: 'ask', writesScope: 'path' }, setupCommands: ['npm ci'], grants: [] });
     expect(seen[0]?.method).toBe('POST');
     expect(new URL(seen[0]?.url ?? '').pathname).toBe('/api/openchamber/spaces');
-    expect(await seen[0]?.json()).toEqual({ projectDirectory: '/home/me/app', placeId: 'docker', name: 'Fix login', start: 'clean', network: { mode: 'open', domains: [], writes: 'ask' }, setupCommands: ['npm ci'], grants: [] });
+    expect(await seen[0]?.json()).toEqual({ projectDirectory: '/home/me/app', placeId: 'docker', name: 'Fix login', start: 'clean', network: { mode: 'open', domains: [], writes: 'ask', writesScope: 'path' }, setupCommands: ['npm ci'], grants: [] });
   });
 });
 
@@ -235,8 +235,8 @@ describe('the journal and opened domains', () => {
   });
 
   test('opens a domain with a POST that names it, and answers the network as it now is', async () => {
-    const seen = answer(200, JSON.stringify({ network: { mode: 'allowlist', domains: ['registry.npmjs.org'], writes: 'ask' } }));
-    expect(await openSpaceDomain(ID, 'registry.npmjs.org')).toEqual({ mode: 'allowlist', domains: ['registry.npmjs.org'], writes: 'ask' });
+    const seen = answer(200, JSON.stringify({ network: { mode: 'allowlist', domains: ['registry.npmjs.org'], writes: 'ask', writesScope: 'path' } }));
+    expect(await openSpaceDomain(ID, 'registry.npmjs.org')).toEqual({ mode: 'allowlist', domains: ['registry.npmjs.org'], writes: 'ask', writesScope: 'path' });
     expect(seen[0].method).toBe('POST');
     expect(new URL(seen[0].url).pathname).toBe(`/api/openchamber/spaces/${ID}/network/domains`);
     expect(await seen[0].json()).toEqual({ domain: 'registry.npmjs.org' });
@@ -267,6 +267,20 @@ describe('the journal and opened domains', () => {
     const cleared = answer(200, JSON.stringify({ deniedWrites: [] }));
     expect(await denySpaceWrites(ID, 'api.github.com', [])).toEqual([]);
     expect(await cleared[0].json()).toEqual({ host: 'api.github.com', methods: [] });
+  });
+
+  test('answers a waiting write, and reads the scope the host chose', async () => {
+    const seen = answer(200, JSON.stringify({ settled: true, scope: 'host' }));
+    expect(await decideSpaceApproval(ID, 3, true, true)).toEqual({ settled: true, scope: 'host' });
+    expect(new URL(seen[0].url).pathname).toBe(`/api/openchamber/spaces/${ID}/approvals`);
+    expect(await seen[0].json()).toEqual({ requestId: 3, allowed: true, remember: true });
+  });
+
+  test('ends a chat turn with a POST that carries nothing', async () => {
+    const seen = answer(200, JSON.stringify({ ended: true }));
+    await endSpaceTurn(ID);
+    expect(seen[0].method).toBe('POST');
+    expect(new URL(seen[0].url).pathname).toBe(`/api/openchamber/spaces/${ID}/turn-end`);
   });
 
   test('reads the journal, and a journal without records is an error, never an empty one', async () => {

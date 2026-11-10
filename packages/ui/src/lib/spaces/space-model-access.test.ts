@@ -21,7 +21,7 @@ const running = (change: Partial<SpaceEntry> = {}): SpaceEntry => ({
   stoppedIdle: false,
   step: null,
   failure: null,
-  network: { mode: 'allowlist', domains: [], writes: 'ask' },
+  network: { mode: 'allowlist', domains: [], writes: 'ask', writesScope: 'path' },
   grants: [anthropic],
   writeAccess: [],
   deniedWrites: [],
@@ -89,7 +89,7 @@ describe('spaceModelRefusal', () => {
   });
 
   test('never refuses a provider the grant dialog cannot give a key for, other than OpenCode\'s own', () => {
-    listed(running({ grants: [], access: null, network: { mode: 'open', domains: [], writes: 'ask' } }));
+    listed(running({ grants: [], access: null, network: { mode: 'open', domains: [], writes: 'ask', writesScope: 'path' } }));
     expect(spaceModelRefusal(session, 'azure')).toBeNull();
   });
 
@@ -98,7 +98,7 @@ describe('spaceModelRefusal', () => {
     noteSpaceModelAccess({ requestId: 'r1', directory: DIRECTORY }, ['anthropic']);
     listed(running({ state: 'preparing', step: 'creating', grants: [], access: null }));
     expect(spaceModelRefusal({ requestId: 'r1', directory: '/home/me/app' }, 'opencode')).toEqual(refused);
-    for (const network of [{ mode: 'open' as const, domains: [], writes: 'ask' as const }, { mode: 'allowlist' as const, domains: ['opencode.ai'], writes: 'ask' as const }, { mode: 'allowlist' as const, domains: [], writes: 'allow' as const }, null]) {
+    for (const network of [{ mode: 'open' as const, domains: [], writes: 'ask' as const, writesScope: 'path' as const }, { mode: 'allowlist' as const, domains: ['opencode.ai'], writes: 'ask' as const, writesScope: 'path' as const }, { mode: 'allowlist' as const, domains: [], writes: 'allow' as const, writesScope: 'path' as const }, null]) {
       listed(running({ network }));
       expect(spaceModelRefusal(session, 'opencode')).toEqual(refused);
     }

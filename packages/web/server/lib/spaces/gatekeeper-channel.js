@@ -19,6 +19,7 @@ import {
   tail,
 } from './exec-http.js';
 import { ROLE_GATEKEEPER } from './labels.js';
+import { writePathSchema } from './space-records.js';
 import {
   GATEKEEPER_BIND_PATH,
   GATEKEEPER_CONTROL_HOST,
@@ -195,9 +196,18 @@ export function createGatekeeperChannel({ exec, wait = pause, now = Date.now }) 
    * host has heard of; ids restart with the gatekeeper's process, so a host that restarts begins
    * at zero and hears about everything still waiting.
    */
-  const waitForApprovals = async (spaceId, { since = 0, waitMs = APPROVAL_WAIT_MS } = {}) => {
+  const waitForApprovals = (spaceId, { since = 0, waitMs = APPROVAL_WAIT_MS } = {}) =>
+    readPending(spaceId, since, Number.isSafeInteger(waitMs) && waitMs > 0 ? waitMs : APPROVAL_WAIT_MS);
+
+  /**
+   * One write still waiting, as the gatekeeper holds it, or null when it was answered or its time
+   * passed. Answers at once: a wait of zero is no long poll.
+   */
+  const readWaitingWrite = async (spaceId, id) =>
+    (await readPending(spaceId, id - 1, 0)).requests.find((entry) => entry.id === id) ?? null;
+
+  const readPending = async (spaceId, since, wait) => {
     const from = Number.isSafeInteger(since) && since > 0 ? since : 0;
-    const wait = Number.isSafeInteger(waitMs) && waitMs > 0 ? waitMs : APPROVAL_WAIT_MS;
     const answer = await request(spaceId, {
       path: `/pending?since=${from}&wait=${wait}`,
       timeoutSeconds: Math.ceil(wait / 1000) + 10,
@@ -214,7 +224,7 @@ export function createGatekeeperChannel({ exec, wait = pause, now = Date.now }) 
     }
     const requests = parsed.requests.slice(0, MAX_PENDING_FROM_INSIDE).map((entry) => {
       const record = entry instanceof Object && !Array.isArray(entry) ? entry : {};
-      return {
+      const wait = {
         id: Number.isSafeInteger(record.id) && record.id > 0 ? record.id : 0,
         host: text(record.host),
         port: Number.isSafeInteger(record.port) ? record.port : 0,
@@ -222,20 +232,40 @@ export function createGatekeeperChannel({ exec, wait = pause, now = Date.now }) 
         url: text(record.url),
         expiresAt: text(record.expiresAt),
       };
+      // A gatekeeper from before path rules names none. A path is kept whole or not at all: a
+      // shortened one would make an "always" answer stand for a path the space never wrote.
+      const rulePath = writePathSchema.safeParse(record.path);
+      if (rulePath.success) wait.path = rulePath.data;
+      return wait;
     }).filter((entry) => entry.id > 0 && entry.host !== '');
     const seen = Number.isSafeInteger(parsed.since) && parsed.since > from ? parsed.since : from;
     return { requests, since: seen };
   };
 
   /**
-   * The host's answer for one waiting write: `allowed` sends it on, anything else refuses it.
-   * A wait that is already gone answers 404, which is not an error: the user came too late.
+   * The host's answer for one waiting write: `allowed` sends it on, anything else refuses it, and
+   * the refusal stands for the destination unless `remember` is false. `scope` chooses whether it
+   * stands for the exact path or the whole host. A wait that is already gone answers 404, which
+   * is not an error: the user came too late.
    */
-  const decideApproval = async (spaceId, { id, allowed }) => {
-    const answer = await request(spaceId, { method: 'POST', path: '/approvals', body: JSON.stringify({ id, allow: allowed === true }) });
+  const decideApproval = async (spaceId, { id, allowed, remember = true, scope = null }) => {
+    const body = { id, allow: allowed === true, remember: remember !== false };
+    if (scope !== null) body.scope = scope;
+    const answer = await request(spaceId, { method: 'POST', path: '/approvals', body: JSON.stringify(body) });
     if (answer.status === 200) return { settled: true };
     if (answer.status === 404) return { settled: false };
     throw new SpaceError('gatekeeper_refused', `The network filter refused the answer for a waiting write: ${tail(answer.body) || `status ${answer.status}`}`, { status: answer.status });
+  };
+
+  /**
+   * The chat's turn is over, so a refusal the user made for one write only ends: whatever it
+   * refused inside that turn is asked again next turn. A gatekeeper from before turn refusals
+   * answers 404 and holds nothing to clear, which is not a failure.
+   */
+  const endTurn = async (spaceId) => {
+    const answer = await request(spaceId, { method: 'POST', path: '/turn-end', body: '{}' });
+    if (answer.status === 200 || answer.status === 404) return;
+    throw new SpaceError('gatekeeper_refused', `The network filter refused to end the turn: ${tail(answer.body) || `status ${answer.status}`}`, { status: answer.status });
   };
 
   /**
@@ -274,7 +304,10 @@ export function createGatekeeperChannel({ exec, wait = pause, now = Date.now }) 
       ? value.slice(0, MAX_POLICY_ENTRIES).map((entry) => {
         const record = entry instanceof Object && !Array.isArray(entry) ? entry : {};
         const methods = Array.isArray(record.methods) ? record.methods.map(text).filter((method) => method !== '') : [];
-        return { host: text(record.host), methods };
+        const path = text(record.path);
+        const rule = { host: text(record.host), methods };
+        if (path !== '') rule.path = path;
+        return rule;
       }).filter((entry) => entry.host !== '')
       : []);
     return {
@@ -283,6 +316,7 @@ export function createGatekeeperChannel({ exec, wait = pause, now = Date.now }) 
       grants: names(parsed.grants),
       writes: writeList(parsed.writes),
       denials: writeList(parsed.denials),
+      pathRules: parsed.pathRules === true,
     };
   };
 
@@ -328,5 +362,5 @@ export function createGatekeeperChannel({ exec, wait = pause, now = Date.now }) 
     };
   };
 
-  return { writeProgram, waitUntilReady, setNetwork, setWrites, setDenials, waitForApprovals, decideApproval, addGrant, readPolicy, readJournal };
+  return { writeProgram, waitUntilReady, setNetwork, setWrites, setDenials, waitForApprovals, readWaitingWrite, decideApproval, endTurn, addGrant, readPolicy, readJournal };
 }

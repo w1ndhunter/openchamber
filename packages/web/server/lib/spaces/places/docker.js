@@ -27,7 +27,7 @@ import {
   requireSpaceId,
   spaceResourceName,
 } from '../labels.js';
-import { SPACE_CONNECT_COMMAND, SPACE_IDLE_EXIT_CODE, SPACE_USER, TOOLS_MOUNT_PATH } from '../layout.js';
+import { LABEL_ENVIRONMENT_MOUNT, SPACE_CONNECT_COMMAND, SPACE_IDLE_EXIT_CODE, SPACE_SHARED_MEMORY_MODE_VARIABLE, SPACE_USER, TOOLS_MOUNT_PATH } from '../layout.js';
 import { openCommandStream as openCommandStreamProcess } from '../run-command.js';
 import { START_CONFIG_VARIABLE } from '../space-opencode.js';
 import { createSpaceServerChannel, createSpaceToken } from '../space-server.js';
@@ -323,7 +323,7 @@ export function createDockerPlace({ runCommand, openCommandStream = openCommandS
   // `downloading_image` only when the image is absent, `preparing_tools` only when the tools
   // volume is filled, and `creating` again once those are done. `startConfig` is OpenCode's start
   // configuration for the space container, or null.
-  const create = async ({ id, name, project, created, memoryBytes }, { onStep = () => {}, startConfig = null } = {}) => {
+  const create = async ({ id, name, project, created, memoryBytes }, { onStep = () => {}, startConfig = null, sharedMemoryMode = null, environmentMount = null } = {}) => {
     requireMemoryBytes(memoryBytes);
     // Built first, so a bad spec is rejected before Docker is asked anything.
     const labelArguments = new Map([ROLE_NETWORK, ROLE_OUTER_NETWORK, ROLE_VOLUME, ROLE_SETUP, ROLE_GATEKEEPER, ROLE_SPACE].map((role) => (
@@ -399,6 +399,8 @@ export function createDockerPlace({ runCommand, openCommandStream = openCommandS
         toolsVolume,
         memoryBytes,
         startConfig,
+        sharedMemoryMode,
+        environmentMount,
       }), CHANGE_TIMEOUT_MS);
       await requireVerified(id, await inspectOwnContainer(id, containerName) ?? {});
       await docker(['start', containerName], CHANGE_TIMEOUT_MS);
@@ -601,6 +603,9 @@ export function createDockerPlace({ runCommand, openCommandStream = openCommandS
     await docker(['rename', name, aside], CHANGE_TIMEOUT_MS);
     let createdId = '';
     try {
+      // The old container's memory mode and environment folder, both verified when it was made.
+      const sharedMemoryEntry = (old.Config?.Env ?? []).find((entry) => entry.startsWith(`${SPACE_SHARED_MEMORY_MODE_VARIABLE}=`));
+      const sharedMemoryMode = sharedMemoryEntry === undefined ? null : sharedMemoryEntry.slice(SPACE_SHARED_MEMORY_MODE_VARIABLE.length + 1);
       createdId = (await docker(buildSpaceCreateArgs({
         spaceId,
         containerName: name,
@@ -613,6 +618,8 @@ export function createDockerPlace({ runCommand, openCommandStream = openCommandS
         image: SPACE_BASE_IMAGE,
         // The old container's, which was verified when it was made, so the move keeps it.
         startConfig: startConfigOf(old),
+        sharedMemoryMode: ['off', 'read', 'write'].includes(sharedMemoryMode) ? sharedMemoryMode : null,
+        environmentMount: old.Config?.Labels?.[LABEL_ENVIRONMENT_MOUNT] ?? null,
       }), CHANGE_TIMEOUT_MS)).trim().split('\n').pop();
       await requireVerified(spaceId, await inspectOwnContainer(spaceId, createdId) ?? {});
       await docker(['start', createdId], CHANGE_TIMEOUT_MS);

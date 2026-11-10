@@ -19,7 +19,7 @@ import { createPlaceRegistry } from './places/registry.js';
 import { createSpaceRecords } from './space-records.js';
 
 const PROJECT = '/home/me/project';
-const NETWORK = { mode: 'allowlist', domains: ['api.anthropic.com'], writes: 'ask' };
+const NETWORK = { mode: 'allowlist', domains: ['api.anthropic.com'], writes: 'ask', writesScope: 'path' };
 const BASE = 'b'.repeat(40);
 const quiet = { warn: () => {} };
 const folders = [];
@@ -35,7 +35,7 @@ afterEach(() => {
 });
 
 /** A journey on fresh stand-ins. `failAt` names a stand-in step that rejects. */
-const journeyWith = ({ readHostLogin = null, hostProviders = undefined, failAt = null, place = createMemoryPlace(), morePlaces = [], projects = [PROJECT], historyStatus = 'sent', holdCodeIn = false, holdCodeOut = false, holdIdleSave = false, holdReady = false, holdLoginRow = false, hostEnvironment = {}, hostLogin = null, dataDir = null, archiveChats = null, waitingApprovals = [], logger = quiet, resolveDirectory = undefined } = {}) => {
+const journeyWith = ({ readHostLogin = null, hostProviders = undefined, failAt = null, place = createMemoryPlace(), morePlaces = [], projects = [PROJECT], historyStatus = 'sent', holdCodeIn = false, holdCodeOut = false, holdIdleSave = false, holdReady = false, holdLoginRow = false, hostEnvironment = {}, hostLogin = null, dataDir = null, archiveChats = null, waitingApprovals = [], oldGatekeeper = false, environment = null, logger = quiet, resolveDirectory = undefined } = {}) => {
   // With `holdCodeIn`, code in waits until the test lets it go, so a creation stays under way;
   // `holdCodeOut` does the same for the fetch of an apply.
   let releaseCodeIn = () => {};
@@ -69,22 +69,34 @@ const journeyWith = ({ readHostLogin = null, hostProviders = undefined, failAt =
       if (requests.length === 0) return quiet;
       return { requests, since: requests[requests.length - 1].id };
     },
+    readWaitingWrite: async (spaceId, id) => {
+      calls.push(['readWaitingWrite', spaceId, id]);
+      return waitingApprovals.find((request) => request.id === id) ?? null;
+    },
     decideApproval: async (spaceId, decision) => {
       calls.push(['decideApproval', spaceId, decision]);
       fail('decideApproval');
-      // A refusal stands for its destination, as the gatekeeper records it.
-      const refused = decision.allowed === false ? waitingApprovals.find((request) => request.id === decision.id) : undefined;
+      // A refusal stands for its destination, as the gatekeeper records it, unless the answer was
+      // for this write only; a gatekeeper from before that answer remembers every refusal.
+      const remembers = decision.allowed === false && (decision.remember !== false || oldGatekeeper);
+      const refused = remembers ? waitingApprovals.find((request) => request.id === decision.id) : undefined;
       if (refused) {
         const denials = heldDenials.get(spaceId) ?? [];
-        const known = denials.find((entry) => entry.host === refused.host);
+        const path = decision.scope === 'path' && refused.path ? refused.path : null;
+        const known = denials.find((entry) => entry.host === refused.host && (entry.path ?? null) === path);
         if (known) { if (!known.methods.includes(refused.method)) known.methods.push(refused.method); }
-        else denials.push({ host: refused.host, methods: [refused.method] });
+        else {
+          const denial = { host: refused.host, methods: [refused.method] };
+          if (path !== null) denial.path = path;
+          denials.push(denial);
+        }
         heldDenials.set(spaceId, denials);
       }
       return { settled: true };
     },
+    endTurn: async (spaceId) => { calls.push(['endTurn', spaceId]); fail('endTurn'); },
     addGrant: async (spaceId, grant) => { calls.push(['addGrant', spaceId, grant]); fail('addGrant'); if (!held.has(spaceId)) held.set(spaceId, new Set()); held.get(spaceId).add(grant.id); },
-    readPolicy: async (spaceId) => { calls.push(['readPolicy', spaceId]); fail('readPolicy'); return { mode: 'allowlist', domains: [], grants: Array.from(held.get(spaceId) ?? []), writes: heldWrites.get(spaceId) ?? [], denials: heldDenials.get(spaceId) ?? [] }; },
+    readPolicy: async (spaceId) => { calls.push(['readPolicy', spaceId]); fail('readPolicy'); return { mode: 'allowlist', domains: [], grants: Array.from(held.get(spaceId) ?? []), writes: heldWrites.get(spaceId) ?? [], denials: heldDenials.get(spaceId) ?? [], pathRules: !oldGatekeeper }; },
     readJournal: async (spaceId) => { calls.push(['readJournal', spaceId]); return { records: [], dropped: 0, since: '2026-09-26T10:00:00.000Z' }; },
     forget: (spaceId) => { held.delete(spaceId); heldWrites.delete(spaceId); heldDenials.delete(spaceId); },
   };
@@ -113,7 +125,9 @@ const journeyWith = ({ readHostLogin = null, hostProviders = undefined, failAt =
   const loginRowHeld = new Promise((resolve) => { releaseLoginRow = resolve; });
   const spaceOpenCode = {
     // The host's custom provider definitions travel as a fourth element only when there are any, so the older expectations read as before.
-    writeProviderConfig: async (spaceId, grants, customProviders) => { calls.push(['writeProviderConfig', spaceId, grants, ...(customProviders?.size > 0 ? [customProviders] : [])]); fail('writeProviderConfig'); },
+    // The environment source's part is kept apart in `configs`, so the older expectations read as before.
+    configs: [],
+    writeProviderConfig: async (spaceId, grants, customProviders, environment) => { spaceOpenCode.configs.push({ spaceId, grants, environment }); calls.push(['writeProviderConfig', spaceId, grants, ...(customProviders?.size > 0 ? [customProviders] : [])]); fail('writeProviderConfig'); },
     writeLogin: async (spaceId, provider, login) => { calls.push(['writeLogin', spaceId, provider, login]); if (holdLoginRow) await loginRowHeld; fail('writeLogin'); },
     removeLogin: async (spaceId, provider) => { calls.push(['removeLogin', spaceId, provider]); if (holdLoginRow) await loginRowHeld; fail('removeLogin'); },
   };
@@ -137,6 +151,53 @@ const journeyWith = ({ readHostLogin = null, hostProviders = undefined, failAt =
     applyAsBranch: async (request) => { calls.push(['applyAsBranch', request]); fail('applyAsBranch'); return { branch: request.branch, commit: 'c'.repeat(40) }; },
     applyAsChanges: async (request) => { calls.push(['applyAsChanges', request]); fail('applyAsChanges'); return { status: failAt === 'nothing' ? 'nothing_to_apply' : 'applied', appliedPaths: 3, remembered: true }; },
   };
+  const environmentCall = environment ?? {
+    inspect: async (source) => {
+      calls.push(['inspectEnvironment', source]);
+      fail('inspectEnvironment');
+      return { revision: 'source-revision', location: source.location };
+    },
+    check: async (source) => {
+      calls.push(['checkEnvironment', source]);
+      fail('checkEnvironment');
+      return { revision: 'next-revision', location: source.location };
+    },
+    apply: async (spaceId, source, options) => {
+      calls.push(['applyEnvironment', spaceId, source, options]);
+      fail('applyEnvironment');
+      return {
+        kind: source.kind,
+        location: source.location,
+        ref: source.ref,
+        memory: source.memory,
+        delivery: source.delivery,
+        revision: 'source-revision',
+        included: 2,
+        omitted: [],
+        instructions: ['/spaces/x/.shared/environment/config/instructions/team.md'],
+        config: { model: 'anthropic/claude-sonnet-5-5' },
+        appliedAt: '2026-11-06T00:00:00.000Z',
+      };
+    },
+    detach: async (spaceId) => {
+      calls.push(['detachEnvironment', spaceId]);
+      fail('detachEnvironment');
+    },
+    memoryStatus: async (spaceId) => {
+      calls.push(['readEnvironmentMemory', spaceId]);
+      if (failAt === 'memoryStatus') throw new Error('memoryStatus failed');
+      return { state: failAt === 'memoryPending' ? 'pending' : 'synced', pending: failAt === 'memoryPending' ? 2 : 0, conflicts: 0, entries: 1, at: null };
+    },
+    syncMemory: async (spaceId, source) => {
+      calls.push(['syncEnvironmentMemory', spaceId, source]);
+      fail('syncEnvironmentMemory');
+      return { state: 'synced', at: '2026-11-06T00:00:00.000Z', revision: 'r', conflicts: [], pending: 0, published: true, settled: 1 };
+    },
+    importMemory: async (source, options) => {
+      calls.push(['importEnvironmentMemory', source, options]);
+      return { entries: [], imported: 0 };
+    },
+  };
   const records = createSpaceRecords({ dataDir, logger: quiet });
   // The clock of the manager and the journey; a test moves it to get past the manager's pause on a failed place.
   const clock = { time: Date.parse('2026-09-26T10:00:00.000Z') };
@@ -148,7 +209,7 @@ const journeyWith = ({ readHostLogin = null, hostProviders = undefined, failAt =
     now: () => new Date(clock.time),
   });
   const journey = createSpaceJourney({
-    manager, places, gatekeeper, codeIn, codeOut, records, spaceOpenCode, serverInside, restartOpenCodeInside,
+    manager, places, gatekeeper, codeIn, codeOut, environment: environmentCall, records, spaceOpenCode, serverInside, restartOpenCodeInside,
     listProjectDirectories: async () => projects,
     archiveChats,
     readHostSecret: (name) => hostEnvironment[name],
@@ -164,7 +225,7 @@ const journeyWith = ({ readHostLogin = null, hostProviders = undefined, failAt =
     logger,
     now: () => new Date(clock.time),
   });
-  return { journey, place, records, calls, events, changes, manager, releaseCodeIn, releaseCodeOut, releaseReady, releaseLoginRow, gatekeeper, approvalWaits, dataDir, idle, defaultMode, userTaskTitles, clock };
+  return { journey, place, records, calls, events, changes, manager, spaceOpenCode, releaseCodeIn, releaseCodeOut, releaseReady, releaseLoginRow, gatekeeper, approvalWaits, dataDir, idle, defaultMode, userTaskTitles, clock };
 };
 
 const REQUEST = { projectDirectory: PROJECT, name: ' Fix login ', start: 'uncommitted', network: NETWORK };
@@ -226,6 +287,112 @@ describe('the journey: create', () => {
 
     const listed = await journey.listSpaces();
     expect(listed).toEqual([expect.objectContaining({ id: answer.id, state: 'running', step: null, failure: null, network: NETWORK, history: 'sent', damaged: false })]);
+  });
+
+  it('inspects, delivers and remembers an environment source before ready', async () => {
+    const environment = { kind: 'folder', location: '/shared/environment', ref: '', memory: 'write' };
+    const { journey, records, calls, events, spaceOpenCode } = journeyWith();
+    const { id } = await journey.createSpace({ ...REQUEST, environment });
+
+    expect(await until(() => steps(events, id).includes('ready'))).toBe(true);
+    expect(steps(events, id)).toEqual(['checking_place', 'creating', 'setting_network', 'bringing_code', 'preparing_environment', 'ready']);
+    expect(calls.slice(0, 4).map(([name]) => name)).toEqual(['inspectEnvironment', 'setNetwork', 'bringCodeIn', 'applyEnvironment']);
+    expect(calls.find(([name]) => name === 'applyEnvironment')[3]).toEqual({ seedMemory: true });
+    const parsed = { ...environment, delivery: 'snapshot', optIns: { mcp: [], plugins: [], commands: [], skills: [], formatter: false, skillSources: [] } };
+    expect(records.read(id).record).toMatchObject({
+      environment: parsed,
+      environmentStatus: { state: 'ready', kind: 'folder', location: '/shared/environment', memory: 'write', revision: 'source-revision', included: 2 },
+    });
+    expect((await journey.listSpaces())[0]).toMatchObject({ environment: parsed, environmentStatus: { revision: 'source-revision' } });
+    // The provider configuration beside the project carries the instructions and preferences.
+    expect(spaceOpenCode.configs.at(-1)).toMatchObject({ environment: { instructions: ['/spaces/x/.shared/environment/config/instructions/team.md'], config: { model: 'anthropic/claude-sonnet-5-5' } } });
+
+    // A refresh takes the assets and leaves memory alone.
+    expect(await journey.refreshEnvironment(id)).toMatchObject({ environment: parsed, status: { revision: 'source-revision' } });
+    expect(calls.filter(([name]) => name === 'applyEnvironment').at(-1)[3]).toEqual({ seedMemory: false, mountedAt: null });
+    expect(await journey.checkEnvironment(id)).toMatchObject({ current: 'source-revision', changed: true, plan: { revision: 'next-revision' } });
+    expect(await journey.syncEnvironmentMemory(id)).toMatchObject({ state: 'synced', published: true });
+    expect(records.read(id).record.environmentStatus.memoryStatus).toMatchObject({ state: 'synced', pending: 0, conflicts: 0 });
+
+    // A change of the mode applies now; the location cannot change.
+    expect(await journey.configureEnvironment(id, { memory: 'read' })).toMatchObject({ environment: { memory: 'read' } });
+    await expect(journey.configureEnvironment(id, { location: '/elsewhere' })).rejects.toMatchObject({ code: 'invalid_environment_source' });
+
+    // A change while stopped is kept and applied at the next start.
+    await journey.stopSpace(id);
+    expect(await journey.configureEnvironment(id, { memory: 'write' })).toMatchObject({ status: { pendingChange: { memory: 'read' } } });
+    const appliedBefore = calls.filter(([name]) => name === 'applyEnvironment').length;
+    await journey.startSpace(id);
+    expect(calls.filter(([name]) => name === 'applyEnvironment').length).toBe(appliedBefore + 1);
+    expect(records.read(id).record.environmentStatus.pendingChange).toBeUndefined();
+
+    // A detach takes the source out and keeps what was copied.
+    expect(await journey.detachEnvironment(id)).toMatchObject({ environment: null, status: { state: 'off' } });
+    expect(calls.at(-1)?.[0] === 'detachEnvironment' || calls.some(([name]) => name === 'detachEnvironment')).toBe(true);
+    expect(records.read(id).record).toMatchObject({ environment: null, environmentStatus: { state: 'off', revision: 'source-revision' } });
+    expect(spaceOpenCode.configs.at(-1).environment).toBeUndefined();
+    await expect(journey.syncEnvironmentMemory(id)).rejects.toMatchObject({ code: 'environment_source_missing' });
+
+    const other = await journey.createSpace({ ...REQUEST, name: 'No source' });
+    expect(await until(() => steps(events, other.id).includes('ready'))).toBe(true);
+    await expect(journey.syncEnvironmentMemory(other.id)).rejects.toMatchObject({ code: 'environment_source_missing' });
+  });
+
+  it.each(['memoryPending', 'memoryStatus'])('refuses a detach and memory off while shared memory is %s, unless the user leaves it behind', async (failAt) => {
+    const environment = { kind: 'folder', location: '/shared/environment', ref: '', memory: 'write' };
+    const { journey, records, events } = journeyWith({ failAt });
+    const { id } = await journey.createSpace({ ...REQUEST, environment });
+    expect(await until(() => steps(events, id).includes('ready'))).toBe(true);
+    await expect(journey.detachEnvironment(id, {})).rejects.toMatchObject({ code: 'environment_memory_pending' });
+    await expect(journey.configureEnvironment(id, { memory: 'off' })).rejects.toMatchObject({ code: 'environment_memory_pending' });
+    expect(records.read(id).record.environment).toMatchObject({ memory: 'write' });
+    expect(await journey.detachEnvironment(id, { discardPending: true })).toMatchObject({ environment: null });
+  });
+
+  it('keeps the memory mode the space had across two changes while it was stopped', async () => {
+    const environment = { kind: 'folder', location: '/shared/environment', ref: '', memory: 'off' };
+    const { journey, records, events, calls } = journeyWith();
+    const { id } = await journey.createSpace({ ...REQUEST, environment });
+    expect(await until(() => steps(events, id).includes('ready'))).toBe(true);
+    await journey.stopSpace(id);
+    await journey.configureEnvironment(id, { memory: 'write' });
+    await journey.configureEnvironment(id, { ref: 'main' });
+    expect(records.read(id).record.environmentStatus.pendingChange).toEqual({ memory: 'off' });
+    await journey.startSpace(id);
+    // Off before, write now: the start seeds memory from the source.
+    expect(calls.filter(([name]) => name === 'applyEnvironment').at(-1)[3]).toMatchObject({ seedMemory: true });
+  });
+
+  it('keeps a working space when its source cannot be delivered, and says why', async () => {
+    const environment = { kind: 'folder', location: '/shared/environment', ref: '', memory: 'off' };
+    const { journey, records, events } = journeyWith({ failAt: 'applyEnvironment' });
+    const { id } = await journey.createSpace({ ...REQUEST, environment });
+    expect(await until(() => steps(events, id).includes('ready'))).toBe(true);
+    expect(records.read(id).record.environmentStatus).toMatchObject({ state: 'blocked', lastFailure: { message: expect.any(String) } });
+  });
+
+  it('refuses a source the inspection refuses before any container exists', async () => {
+    const environment = { kind: 'folder', location: '/shared/environment', ref: '', memory: 'off' };
+    const { journey, events, calls } = journeyWith({ failAt: 'inspectEnvironment' });
+    const { id } = await journey.createSpace({ ...REQUEST, environment });
+    expect(await until(() => steps(events, id).includes('failed'))).toBe(true);
+    expect(calls.some(([name]) => name === 'setNetwork')).toBe(false);
+  });
+
+  it('refuses to mount a folder into a space on another machine', async () => {
+    const remote = createMemoryPlace({ id: 'remote' });
+    remote.machine = 'me@box';
+    const { journey, events, calls } = journeyWith({ morePlaces: [remote] });
+    const { id } = await journey.createSpace({ ...REQUEST, placeId: 'remote', environment: { kind: 'folder', location: '/shared/environment', delivery: 'mount' } });
+    expect(await until(() => steps(events, id).includes('failed'))).toBe(true);
+    expect(events.find((event) => event.spaceId === id && event.step === 'failed').failure.code).toBe('environment_mount_unavailable');
+    expect(calls.some(([name]) => name === 'setNetwork')).toBe(false);
+  });
+
+  it('checks a source for the dialog without a space, and refuses one that is not a source', async () => {
+    const { journey } = journeyWith();
+    expect(await journey.checkEnvironmentSource({ kind: 'folder', location: '/shared/environment' })).toMatchObject({ plan: { revision: 'next-revision' } });
+    await expect(journey.checkEnvironmentSource({ kind: 'folder', location: 'relative' })).rejects.toMatchObject({ code: 'invalid_environment_source' });
   });
 
   it('keeps the space and marks the history failed when only the history did not arrive', async () => {
@@ -711,20 +878,20 @@ describe('the journey: opening a domain', () => {
 
   it('tells the gatekeeper the allowlist with the domain, then remembers it for the next start', async () => {
     const { journey, records, calls, id } = await ready();
-    expect(await journey.openDomain(id, { domain: ' Registry.NPMJS.org ' })).toEqual({ network: { mode: 'allowlist', domains: ['api.anthropic.com', 'registry.npmjs.org'], writes: 'ask' } });
-    expect(calls).toEqual([['setNetwork', id, { mode: 'allowlist', domains: ['api.anthropic.com', 'registry.npmjs.org'], writes: 'ask' }]]);
+    expect(await journey.openDomain(id, { domain: ' Registry.NPMJS.org ' })).toEqual({ network: { mode: 'allowlist', domains: ['api.anthropic.com', 'registry.npmjs.org'], writes: 'ask', writesScope: 'path' } });
+    expect(calls).toEqual([['setNetwork', id, { mode: 'allowlist', domains: ['api.anthropic.com', 'registry.npmjs.org'], writes: 'ask', writesScope: 'path' }]]);
     expect(records.read(id).record.network.domains).toEqual(['api.anthropic.com', 'registry.npmjs.org']);
 
     // A domain already on the list changes nothing.
     calls.splice(0);
-    expect(await journey.openDomain(id, { domain: 'registry.npmjs.org' })).toEqual({ network: { mode: 'allowlist', domains: ['api.anthropic.com', 'registry.npmjs.org'], writes: 'ask' } });
+    expect(await journey.openDomain(id, { domain: 'registry.npmjs.org' })).toEqual({ network: { mode: 'allowlist', domains: ['api.anthropic.com', 'registry.npmjs.org'], writes: 'ask', writesScope: 'path' } });
     expect(calls).toEqual([]);
 
     // The next start says the list with the opened domain again.
     await journey.stopSpace(id);
     calls.splice(0);
     await journey.startSpace(id);
-    expect(calls.find(([name]) => name === 'setNetwork')).toEqual(['setNetwork', id, { mode: 'allowlist', domains: ['api.anthropic.com', 'registry.npmjs.org'], writes: 'ask' }]);
+    expect(calls.find(([name]) => name === 'setNetwork')).toEqual(['setNetwork', id, { mode: 'allowlist', domains: ['api.anthropic.com', 'registry.npmjs.org'], writes: 'ask', writesScope: 'path' }]);
   });
 
   it('refuses what is not a name, a stopped space, an open network, and a record it cannot read, telling the gatekeeper nothing', async () => {
@@ -920,6 +1087,13 @@ describe('the journey: taking an approval back', () => {
 
 describe('the journey: writes waiting for the user', () => {
   const waiting = { id: 3, host: 'api.github.com', port: 443, method: 'POST', expiresAt: '2026-09-26T10:01:00.000Z' };
+  const ready = async (options = {}) => {
+    const made = journeyWith(options);
+    const { id } = await made.journey.createSpace(REQUEST);
+    await until(() => steps(made.events, id).includes('ready'));
+    made.calls.splice(0);
+    return { ...made, id };
+  };
 
   it('announces a waiting write while the space runs, and answers it when the user decides', async () => {
     const made = journeyWith({ waitingApprovals: [waiting] });
@@ -936,7 +1110,126 @@ describe('the journey: writes waiting for the user', () => {
 
     made.calls.splice(0);
     expect(await made.journey.decideWriteApproval(id, { requestId: 3, allowed: true })).toEqual({ settled: true });
-    expect(made.calls).toEqual([['decideApproval', id, { id: 3, allowed: true }]]);
+    expect(made.calls).toEqual([['decideApproval', id, { id: 3, allowed: true, remember: false }]]);
+  });
+
+  it('keeps "always allow" for the scope in the host\'s record, not one the app names', async () => {
+    const made = journeyWith({ waitingApprovals: [{ ...waiting, path: '/a' }] });
+    const { id } = await made.journey.createSpace(REQUEST);
+    expect(await until(() => made.events.some((event) => event.spaceId === id && event.requestId === 3))).toBe(true);
+    const shown = { host: 'api.github.com', method: 'POST', path: '/a' };
+    expect(await made.journey.decideWriteApproval(id, { requestId: 3, allowed: true, remember: true, shown })).toEqual({ settled: true, scope: 'path' });
+    expect(made.records.read(id).record.writeAccess).toEqual([{ host: 'api.github.com', path: '/a', methods: ['POST'] }]);
+    expect(made.calls.filter(([name]) => name === 'decideApproval')).toEqual([]);
+
+    await made.journey.revokeWrites(id, { host: 'api.github.com', methods: ['POST'], path: '/a' });
+    await made.journey.changeWritePolicy(id, { writesScope: 'host' });
+    expect(await made.journey.decideWriteApproval(id, { requestId: 3, allowed: true, remember: true, shown })).toEqual({ settled: true, scope: 'host' });
+    expect(made.records.read(id).record.writeAccess).toEqual([{ host: 'api.github.com', methods: ['POST'] }]);
+  });
+
+  it('saves nothing for "always allow" on a wait that is gone, and never widens a path the gatekeeper cannot name', async () => {
+    const gone = journeyWith();
+    const { id } = await gone.journey.createSpace(REQUEST);
+    await until(() => steps(gone.events, id).includes('ready'));
+    const shown = { host: 'api.github.com', method: 'POST' };
+    expect(await gone.journey.decideWriteApproval(id, { requestId: 9, allowed: true, remember: true, shown })).toEqual({ settled: false, scope: 'path' });
+    expect(gone.records.read(id).record.writeAccess).toEqual([]);
+
+    const old = journeyWith({ waitingApprovals: [waiting], oldGatekeeper: true });
+    const { id: oldId } = await old.journey.createSpace(REQUEST);
+    expect(await until(() => old.events.some((event) => event.spaceId === oldId && event.requestId === 3))).toBe(true);
+    await expect(old.journey.decideWriteApproval(oldId, { requestId: 3, allowed: true, remember: true, shown })).rejects.toMatchObject({ code: 'space_gatekeeper_too_old' });
+    expect(old.records.read(oldId).record.writeAccess).toEqual([]);
+  });
+
+  it('saves nothing when the id now holds another write than the prompt showed, and wants the shown write', async () => {
+    const made = journeyWith({ waitingApprovals: [{ ...waiting, path: '/a' }] });
+    const { id } = await made.journey.createSpace(REQUEST);
+    expect(await until(() => made.events.some((event) => event.spaceId === id && event.requestId === 3))).toBe(true);
+    for (const shown of [{ host: 'example.com', method: 'POST', path: '/a' }, { host: 'api.github.com', method: 'PUT', path: '/a' }, { host: 'api.github.com', method: 'POST', path: '/b' }, { host: 'api.github.com', method: 'POST' }]) {
+      expect(await made.journey.decideWriteApproval(id, { requestId: 3, allowed: true, remember: true, shown }), JSON.stringify(shown)).toEqual({ settled: false, scope: 'path' });
+    }
+    expect(made.records.read(id).record.writeAccess).toEqual([]);
+    await expect(made.journey.decideWriteApproval(id, { requestId: 3, allowed: true, remember: true })).rejects.toMatchObject({ code: 'invalid_approval' });
+  });
+
+  it('denies one write without remembering it, and leaves the record and the gatekeeper as they were', async () => {
+    const made = journeyWith({ waitingApprovals: [waiting] });
+    const { id } = await made.journey.createSpace(REQUEST);
+    expect(await until(() => made.events.some((event) => event.spaceId === id && event.requestId === 3))).toBe(true);
+    made.calls.splice(0);
+    expect(await made.journey.decideWriteApproval(id, { requestId: 3, allowed: false, remember: false })).toEqual({ settled: true, scope: 'path' });
+    expect(made.calls[0]).toEqual(['decideApproval', id, { id: 3, allowed: false, remember: false, scope: 'path' }]);
+    expect(made.records.read(id).record.deniedWrites).toEqual([]);
+    expect(made.calls.filter(([name]) => name === 'setDenials')).toEqual([]);
+  });
+
+  it('tells a running space that its chat turn is over, and a stopped one nothing', async () => {
+    const made = await ready();
+    expect(await made.journey.endSpaceTurn(made.id)).toEqual({ ended: true });
+    expect(made.calls).toEqual([['endTurn', made.id]]);
+
+    await made.journey.stopSpace(made.id);
+    made.calls.splice(0);
+    expect(await made.journey.endSpaceTurn(made.id)).toEqual({ ended: true });
+    expect(made.calls).toEqual([]);
+  });
+
+  it('takes back what a gatekeeper started before the answer for one write remembered anyway', async () => {
+    const made = journeyWith({ waitingApprovals: [waiting], oldGatekeeper: true });
+    const { id } = await made.journey.createSpace(REQUEST);
+    expect(await until(() => made.events.some((event) => event.spaceId === id && event.requestId === 3))).toBe(true);
+    made.calls.splice(0);
+    await made.journey.decideWriteApproval(id, { requestId: 3, allowed: false, remember: false });
+    expect(made.calls.filter(([name]) => name === 'setDenials')).toEqual([['setDenials', id, []]]);
+    expect(made.records.read(id).record.deniedWrites).toEqual([]);
+  });
+
+  it('lets an approval of one write out while an apply holds the space, and holds a refusal for its turn', async () => {
+    const made = journeyWith({ waitingApprovals: [waiting], holdCodeOut: true });
+    const { id } = await made.journey.createSpace(REQUEST);
+    expect(await until(() => made.events.some((event) => event.spaceId === id && event.requestId === 3))).toBe(true);
+    const applying = made.journey.applySpace(id, { as: 'changes' });
+    await sleep(20);
+    expect(await made.journey.decideWriteApproval(id, { requestId: 3, allowed: true })).toEqual({ settled: true });
+    await expect(made.journey.decideWriteApproval(id, { requestId: 3, allowed: false })).rejects.toMatchObject({ code: 'space_busy' });
+    made.releaseCodeOut();
+    await applying;
+  });
+
+  it('says a remembered denial back to the gatekeeper, so the other waits it covers end now', async () => {
+    const made = journeyWith({ waitingApprovals: [waiting] });
+    const { id } = await made.journey.createSpace(REQUEST);
+    expect(await until(() => made.events.some((event) => event.spaceId === id && event.requestId === 3))).toBe(true);
+    made.calls.splice(0);
+    await made.journey.decideWriteApproval(id, { requestId: 3, allowed: false });
+    expect(made.calls.filter(([name]) => name === 'setDenials')).toEqual([['setDenials', id, [{ host: 'api.github.com', methods: ['POST'] }]]]);
+  });
+
+  it('keeps approvals for one path apart from the host, and changes the scope for later answers', async () => {
+    const { journey, records, calls, id } = await ready();
+    expect(await journey.approveWrites(id, { host: 'example.com', methods: ['POST'], path: '/a' })).toEqual({ writeAccess: [{ host: 'example.com', path: '/a', methods: ['POST'] }] });
+    expect(await journey.approveWrites(id, { host: 'example.com', methods: ['POST'] })).toEqual({ writeAccess: [{ host: 'example.com', path: '/a', methods: ['POST'] }, { host: 'example.com', methods: ['POST'] }] });
+    expect(await journey.revokeWrites(id, { host: 'example.com', methods: ['POST'], path: '/a' })).toEqual({ writeAccess: [{ host: 'example.com', methods: ['POST'] }] });
+    expect(await journey.changeWritePolicy(id, { writesScope: 'host' })).toEqual({ network: { ...NETWORK, writesScope: 'host' } });
+    expect(calls.filter(([name]) => name === 'setNetwork').length).toBeGreaterThan(0);
+    expect(records.read(id).record.network.writesScope).toBe('host');
+  });
+
+  it('remembers a denial from one waiting write for exactly its path', async () => {
+    const made = journeyWith({ waitingApprovals: [{ ...waiting, path: '/a' }] });
+    const { id } = await made.journey.createSpace(REQUEST);
+    expect(await until(() => made.events.some((event) => event.spaceId === id && event.requestId === 3 && event.path === '/a'))).toBe(true);
+    await made.journey.decideWriteApproval(id, { requestId: 3, allowed: false });
+    expect(made.records.read(id).record.deniedWrites).toEqual([{ host: 'api.github.com', path: '/a', methods: ['POST'] }]);
+    expect(made.calls.find(([name]) => name === 'decideApproval')).toEqual(['decideApproval', id, { id: 3, allowed: false, remember: true, scope: 'path' }]);
+  });
+
+  it('refuses a path approval on an old gatekeeper rather than making it host-wide', async () => {
+    const { journey, calls, id } = await ready({ oldGatekeeper: true });
+    await expect(journey.approveWrites(id, { host: 'example.com', methods: ['POST'], path: '/a' })).rejects.toMatchObject({ code: 'space_gatekeeper_too_old' });
+    expect(calls.filter(([name]) => name === 'setWrites')).toEqual([]);
   });
 
   it('keeps a denial in the record, and clears it when the dialog says so', async () => {
@@ -944,12 +1237,12 @@ describe('the journey: writes waiting for the user', () => {
     const { id } = await made.journey.createSpace(REQUEST);
     expect(await until(() => made.events.some((event) => event.spaceId === id && event.requestId === 3))).toBe(true);
 
-    expect(await made.journey.decideWriteApproval(id, { requestId: 3, allowed: false })).toEqual({ settled: true });
+    expect(await made.journey.decideWriteApproval(id, { requestId: 3, allowed: false })).toEqual({ settled: true, scope: 'path' });
     expect(made.records.read(id).record.deniedWrites).toEqual([{ host: 'api.github.com', methods: ['POST'] }]);
 
     // The dialog gives the prompt back by clearing the destination.
     expect(await made.journey.denyWrites(id, { host: 'api.github.com', methods: [] })).toEqual({ deniedWrites: [] });
-    expect(made.calls.find(([name]) => name === 'setDenials')).toEqual(['setDenials', id, []]);
+    expect(made.calls.filter(([name]) => name === 'setDenials').at(-1)).toEqual(['setDenials', id, []]);
 
     // And the next start says an empty list too, which is what a fresh gatekeeper already is.
     await made.journey.stopSpace(id);
@@ -972,7 +1265,7 @@ describe('the journey: writes waiting for the user', () => {
     const made = journeyWith();
     const { id } = await made.journey.createSpace(REQUEST);
     await until(() => steps(made.events, id).includes('ready'));
-    for (const request of [{}, { requestId: 0, allowed: true }, { requestId: 2 }, { requestId: 2, allowed: true, extra: 1 }]) {
+    for (const request of [{}, { requestId: 0, allowed: true }, { requestId: 2 }, { requestId: 2, allowed: true, extra: 1 }, { requestId: 2, allowed: false, remember: 'no' }]) {
       await expect(made.journey.decideWriteApproval(id, request), JSON.stringify(request)).rejects.toMatchObject({ code: 'invalid_approval' });
     }
     await made.journey.stopSpace(id);

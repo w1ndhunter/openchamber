@@ -96,13 +96,32 @@ describe('gatekeeper channel: control requests', () => {
     expect(calls[0].options.stdin).toContain('url = "http://127.0.0.1:9099/pending?since=3&wait=2000"');
   });
 
+  it('reads one waiting write without a long poll, and null once it is gone', async () => {
+    const waiting = { id: 4, host: 'api.github.com', port: 443, method: 'POST', url: 'https://api.github.com/a', path: '/a', expiresAt: '2026-11-06T10:00:00.000Z' };
+    const { channel, calls } = channelWith(ok(http(200, JSON.stringify({ since: 5, requests: [waiting, { ...waiting, id: 5 }] }))), ok(http(200, '{"since":5,"requests":[]}')));
+    expect(await channel.readWaitingWrite(ID, 4)).toEqual(waiting);
+    expect(calls[0].options.stdin).toContain('url = "http://127.0.0.1:9099/pending?since=3&wait=0"');
+    expect(await channel.readWaitingWrite(ID, 4)).toBeNull();
+  });
+
+  it('keeps a long path whole, and drops one that cannot be a rule rather than shortening it', async () => {
+    const long = `/${'a'.repeat(1_000)}`;
+    const base = { host: 'api.github.com', port: 443, method: 'POST', url: 'https://api.github.com/', expiresAt: '2026-11-06T10:00:00.000Z' };
+    const body = { since: 6, requests: [{ ...base, id: 4, path: long }, { ...base, id: 5, path: `/${'a'.repeat(3_000)}` }, { ...base, id: 6, path: '/a?b' }] };
+    const { channel } = channelWith(ok(http(200, JSON.stringify(body))));
+    const { requests } = await channel.waitForApprovals(ID, { since: 3 });
+    expect(requests.map((request) => request.path)).toEqual([long, undefined, undefined]);
+  });
+
   it('answers a waiting write, and takes a wait that is already gone as settled false', async () => {
     const { channel, calls } = channelWith(ok(http(200, '{"ok":true}')), ok(http(404, '{"error":"gone"}')));
     expect(await channel.decideApproval(ID, { id: 4, allowed: true })).toEqual({ settled: true });
     expect(calls[0].options.stdin).toContain('url = "http://127.0.0.1:9099/approvals"');
     const data = calls[0].options.stdin.split('\n').find((line) => line.startsWith('data-raw = '));
-    expect(JSON.parse(JSON.parse(data.slice('data-raw = '.length)))).toEqual({ id: 4, allow: true });
-    expect(await channel.decideApproval(ID, { id: 4, allowed: false })).toEqual({ settled: false });
+    expect(JSON.parse(JSON.parse(data.slice('data-raw = '.length)))).toEqual({ id: 4, allow: true, remember: true });
+    expect(await channel.decideApproval(ID, { id: 4, allowed: false, remember: false })).toEqual({ settled: false });
+    const once = calls[1].options.stdin.split('\n').find((line) => line.startsWith('data-raw = '));
+    expect(JSON.parse(JSON.parse(once.slice('data-raw = '.length)))).toEqual({ id: 4, allow: false, remember: false });
   });
 
   it('keeps a grant\'s secret out of every argument list, on the host and inside', async () => {
@@ -131,10 +150,13 @@ describe('gatekeeper channel: control requests', () => {
   });
 
   it('reads what the gatekeeper holds as data: mode, names and grant ids, capped, and never a secret', async () => {
-    const { channel } = channelWith(ok(http(200, JSON.stringify({ mode: 'open', domains: ['a.example.com', 7, {}], grants: ['anthropic', ['x'], 'open-1'], secret: SECRET }))));
-    expect(await channel.readPolicy(ID)).toEqual({ mode: 'open', domains: ['a.example.com', '7'], grants: ['anthropic', 'open-1'], writes: [], denials: [] });
+    const { channel } = channelWith(ok(http(200, JSON.stringify({ mode: 'open', domains: ['a.example.com', 7, {}], grants: ['anthropic', ['x'], 'open-1'], secret: SECRET, pathRules: true, writes: [{ host: 'a.example.com', path: '/a', methods: ['POST'] }] }))));
+    expect(await channel.readPolicy(ID)).toEqual({ mode: 'open', domains: ['a.example.com', '7'], grants: ['anthropic', 'open-1'], writes: [{ host: 'a.example.com', path: '/a', methods: ['POST'] }], denials: [], pathRules: true });
+    // A gatekeeper from before path rules says nothing of them, and a path it does send is unread.
+    const { channel: old } = channelWith(ok(http(200, '{"mode":"allowlist","domains":[],"grants":[],"writes":[{"host":"a.example.com","methods":["POST"]}]}')));
+    expect(await old.readPolicy(ID)).toMatchObject({ writes: [{ host: 'a.example.com', methods: ['POST'] }], pathRules: false });
     const { channel: allowlist } = channelWith(ok(http(200, '{"mode":"anything","domains":[],"grants":[]}')));
-    expect(await allowlist.readPolicy(ID)).toEqual({ mode: 'allowlist', domains: [], grants: [], writes: [], denials: [] });
+    expect(await allowlist.readPolicy(ID)).toEqual({ mode: 'allowlist', domains: [], grants: [], writes: [], denials: [], pathRules: false });
     for (const body of ['not json', '[]', '{"grants":"anthropic"}', '{"grants":[]}']) {
       const { channel: broken } = channelWith(ok(http(200, body)));
       await expect(broken.readPolicy(ID)).rejects.toMatchObject({ code: 'gatekeeper_answer_unreadable' });
