@@ -12,7 +12,7 @@ import { Checkbox } from '@/components/ui/checkbox';
 import { SettingsRadioGroup, SettingsRadioOption } from '@/components/sections/shared/SettingsSection';
 import { Input } from '@/components/ui/input';
 import { useI18n } from '@/lib/i18n';
-import { environmentRequestOf, noOptIns, type EnvironmentDraft } from '@/lib/spaces/environment-draft';
+import { emptyMcpKey, environmentRequestOf, noOptIns, type EnvironmentDraft, type McpKeyDraft } from '@/lib/spaces/environment-draft';
 import { checkEnvironmentSource, type SpaceEnvironmentPlan } from '@/lib/spaces/spaces-api';
 import { failureOfError, spaceFailureText } from './spaceFailureText';
 
@@ -56,7 +56,10 @@ export const EnvironmentSourcePicker: React.FC<{
     if (!request) return;
     setCheck({ kind: 'checking' });
     try {
-      setCheck({ kind: 'ready', plan: await checkEnvironmentSource(request) });
+      const plan = await checkEnvironmentSource(request);
+      setCheck({ kind: 'ready', plan });
+      // The dialog holds the servers too, so a key can name the url it belongs to.
+      onChange({ ...value, mcpServers: plan.mcpServers });
     } catch (error) {
       if (!(error instanceof Error)) throw error;
       setCheck({ kind: 'failed', message: spaceFailureText(t, failureOfError(error)) });
@@ -137,6 +140,40 @@ export const EnvironmentSourcePicker: React.FC<{
                   </SettingsRadioGroup>
                   <p className="typography-micro text-muted-foreground">{t('spaces.create.environment.deliveryMountHint')}</p>
                 </>
+              ) : null}
+              {offers && offers.mcp.length > 0 ? (
+                <div className="space-y-2">
+                  {(plan?.mcpServers ?? []).filter((server) => value.optIns.mcp.includes(server.name)).map((server) => {
+                    const key = value.mcpKeys[server.name] ?? emptyMcpKey();
+                    const localVariables: string[] = plan?.mcpEnv[server.name] ?? [];
+                    if (server.type === 'local') {
+                      return localVariables.length === 0 ? null : (
+                        <p key={server.name} className="typography-micro text-status-warning">
+                          {t('spaces.create.environment.mcpHandedOver', { name: server.name, variables: localVariables.join(', ') })}
+                        </p>
+                      );
+                    }
+                    const change = (patch: Partial<McpKeyDraft>) => onChange({ ...value, mcpKeys: { ...value.mcpKeys, [server.name]: { ...key, ...patch } } });
+                    return (
+                      <div key={server.name} className="space-y-1 rounded border border-border p-2">
+                        <p className="typography-meta text-foreground">{t('spaces.create.environment.mcpKey', { name: server.name })}</p>
+                        <p className="typography-micro text-muted-foreground">{t('spaces.create.environment.mcpKeyHint')}</p>
+                        <div className="flex flex-wrap gap-2">
+                          <Input value={key.header} onChange={(event) => change({ header: event.target.value })} placeholder="authorization" aria-label={t('spaces.create.environment.mcpHeader')} />
+                          <SettingsRadioGroup aria-label={t('spaces.create.environment.mcpSource')}>
+                            <SettingsRadioOption ariaLabel={t('spaces.create.environment.mcpSourceEnv')} selected={key.source === 'env'} onSelect={() => change({ source: 'env' })} label={t('spaces.create.environment.mcpSourceEnv')} />
+                            <SettingsRadioOption ariaLabel={t('spaces.create.environment.mcpSourceTyped')} selected={key.source === 'typed'} onSelect={() => change({ source: 'typed' })} label={t('spaces.create.environment.mcpSourceTyped')} />
+                          </SettingsRadioGroup>
+                        </div>
+                        {key.source === 'env' ? (
+                          <Input value={key.envName} onChange={(event) => change({ envName: event.target.value })} placeholder="DOCS_TOKEN" aria-label={t('spaces.create.environment.mcpEnvName')} />
+                        ) : (
+                          <Input type="password" value={key.value} onChange={(event) => change({ value: event.target.value })} aria-label={t('spaces.create.environment.mcpValue')} />
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
               ) : null}
               <p className="typography-micro text-muted-foreground">{t('spaces.create.environment.optIns')}</p>
               {offers && offerCount === 0 ? <p className="typography-meta text-muted-foreground">{t('spaces.create.environment.noOffers')}</p> : null}

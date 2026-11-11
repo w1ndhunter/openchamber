@@ -3,6 +3,14 @@
 
 import type { SpaceEnvironmentOptIns, SpaceEnvironmentSourceRequest } from '@/lib/spaces/spaces-api';
 
+/** A key for one MCP server of the source, as the dialog holds it until the space is made. */
+export type McpKeyDraft = {
+  header: string;
+  source: 'typed' | 'env';
+  value: string;
+  envName: string;
+};
+
 export type EnvironmentDraft = {
   kind: 'none' | 'folder' | 'git';
   location: string;
@@ -10,11 +18,17 @@ export type EnvironmentDraft = {
   memory: 'off' | 'read' | 'write';
   delivery: 'snapshot' | 'mount';
   optIns: SpaceEnvironmentOptIns;
+  /** By server name. A server without one goes out without a key. */
+  mcpKeys: Record<string, McpKeyDraft>;
+  /** What the host said the source offers, so a key knows the url it is for. */
+  mcpServers: { name: string; type: 'local' | 'remote'; url?: string }[];
 };
 
 export const noOptIns = (): SpaceEnvironmentOptIns => ({ agents: [], mcp: [], plugins: [], commands: [], skills: [], formatter: false, skillSources: [] });
 
-export const emptyEnvironmentDraft = (): EnvironmentDraft => ({ kind: 'none', location: '', ref: '', memory: 'off', delivery: 'snapshot', optIns: noOptIns() });
+export const emptyMcpKey = (): McpKeyDraft => ({ header: 'authorization', source: 'env', value: '', envName: '' });
+
+export const emptyEnvironmentDraft = (): EnvironmentDraft => ({ kind: 'none', location: '', ref: '', memory: 'off', delivery: 'snapshot', optIns: noOptIns(), mcpKeys: {}, mcpServers: [] });
 
 /** The request the host takes, or null for none. A mount is a folder's only. */
 export const environmentRequestOf = (draft: EnvironmentDraft): SpaceEnvironmentSourceRequest | null => (draft.kind === 'none' ? null : {

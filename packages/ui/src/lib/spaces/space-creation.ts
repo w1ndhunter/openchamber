@@ -24,7 +24,7 @@ import { noteSpaceModelAccess } from './space-model-access';
 import type { SpaceSetupPlan } from './space-setup';
 import { forgetSpaceCreationRequest, noteSpaceCreationRequest } from './space-creation-requests';
 
-export type SpaceModelAccess = Extract<GrantRequest, { kind: 'model' | 'login' | 'custom' }>;
+export type SpaceModelAccess = Extract<GrantRequest, { kind: 'model' | 'login' | 'custom' | 'mcp' }>;
 
 type CreationOutcome = { kind: 'ready'; directory: string } | { kind: 'failed'; failure: SpaceFailure };
 
@@ -94,7 +94,7 @@ export const startSpaceCreation = async ({ projectId, request, setup, access, re
 
   const requestId = createPendingDraftWorktreeRequest();
   noteSpaceCreationRequest(requestId, entry.id);
-  if (entry.directory) noteSpaceModelAccess({ requestId, directory: entry.directory }, access.map((grant) => grant.provider));
+  if (entry.directory) noteSpaceModelAccess({ requestId, directory: entry.directory }, access.flatMap((grant) => (grant.kind === 'mcp' ? [] : [grant.provider])));
   // A draft that is never sent must not turn a refusal into an unhandled rejection.
   void waitForPendingDraftWorktreeRequest(requestId).catch(() => undefined);
   const sessionStore = useSessionUIStore.getState();

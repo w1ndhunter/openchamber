@@ -50,7 +50,7 @@ import { permissionDefaultOf } from './space-permission-default.js';
 import { ROLE_GATEKEEPER, createSpaceId, hashProjectDirectory, spaceResourceName } from './labels.js';
 import { spaceProjectPath, spaceWindowUrl } from './layout.js';
 import { LOGIN_PROVIDERS, buildStartConfig, loginEndOf, loginEnded, loginGrantOf } from './space-opencode.js';
-import { WRITABLE_METHODS, domainSchema, grantSchema, networkSchema, providerIdSchema, secretSourceSchema, writeAccessSchema, writePathSchema } from './space-records.js';
+import { WRITABLE_METHODS, domainSchema, grantHeaderSchema, grantIdSchema, grantSchema, networkSchema, providerIdSchema, secretSourceSchema, upstreamSchema, writeAccessSchema, writePathSchema } from './space-records.js';
 import { createSpaceToken } from './space-server.js';
 import { createSpaceSetup, setupCommandsSchema } from './space-setup.js';
 
@@ -112,9 +112,9 @@ const grantRequestSchema = z.discriminatedUnion('kind', [
   // server then goes through the window; a local one never gets here, since it runs inside.
   z.object({
     kind: z.literal('mcp'),
-    id: grantSchema.options[4].shape.id,
-    upstream: grantSchema.options[4].shape.upstream,
-    header: grantSchema.options[4].shape.header,
+    id: grantIdSchema,
+    upstream: upstreamSchema,
+    header: grantHeaderSchema,
     secret: z.discriminatedUnion('kind', [
       z.object({ kind: z.literal('typed'), value: z.string().min(1).max(MAX_SECRET_LENGTH) }).strict(),
       secretSourceSchema.options[0],
@@ -1412,7 +1412,7 @@ export function createSpaceJourney({
     } else if (asked.kind === 'mcp') {
       const source = asked.secret.kind === 'typed' ? { kind: 'typed' } : { kind: 'env', name: asked.secret.name };
       const secret = asked.secret.kind === 'typed' ? asked.secret.value : readHostSecret(asked.secret.name);
-      if (typeof secret !== 'string' || secret === '') {
+      if (secret === null || secret === '') {
         throw new SpaceError('secret_source_missing', `The environment variable ${asked.secret.name} is not set for OpenChamber, so there is no key to give.`);
       }
       grant = { kind: 'mcp', id: asked.id, upstream: asked.upstream, header: asked.header, source };

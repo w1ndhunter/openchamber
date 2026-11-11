@@ -69,7 +69,10 @@ const isHttpUrl = (value) => {
     return false;
   }
 };
-const upstreamSchema = z.string().url().refine(isHttpUrl, 'http or https');
+export const upstreamSchema = z.string().url().refine(isHttpUrl, 'http or https');
+/** A grant's id and header name, shared with the request that asks for one. */
+export const grantIdSchema = z.string().regex(GRANT_ID_PATTERN);
+export const grantHeaderSchema = z.string().regex(/^[a-z0-9-]{1,64}$/);
 /** Where the host finds a secret again, never the secret: an environment variable of the host's by name, or the user typed it once. */
 export const secretSourceSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('env'), name: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]{0,255}$/) }).strict(),
@@ -82,15 +85,15 @@ export const secretSourceSchema = z.discriminatedUnion('kind', [
 export const grantSchema = z.discriminatedUnion('kind', [
   z.object({
     kind: z.literal('model'),
-    id: z.string().regex(GRANT_ID_PATTERN),
+    id: grantIdSchema,
     provider: z.string().regex(GRANT_ID_PATTERN),
     upstream: upstreamSchema,
-    header: z.string().regex(/^[a-z0-9-]{1,64}$/),
+    header: grantHeaderSchema,
     source: secretSourceSchema,
   }).strict(),
   z.object({
     kind: z.literal('domain'),
-    id: z.string().regex(GRANT_ID_PATTERN),
+    id: grantIdSchema,
     upstream: upstreamSchema,
   }).strict(),
   // A provider's browser login of the host's, since stage 7: the host reads its own login again
@@ -113,9 +116,9 @@ export const grantSchema = z.discriminatedUnion('kind', [
   // the id is the server's name in the source, and the upstream is the url the source declared.
   z.object({
     kind: z.literal('mcp'),
-    id: z.string().regex(GRANT_ID_PATTERN),
+    id: grantIdSchema,
     upstream: upstreamSchema,
-    header: z.string().regex(/^[a-z0-9-]{1,64}$/),
+    header: grantHeaderSchema,
     source: secretSourceSchema,
   }).strict(),
 ]);

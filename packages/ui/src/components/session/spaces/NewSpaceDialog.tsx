@@ -32,6 +32,7 @@ import { registryDomainsOf } from '@/lib/spaces/registry-domains';
 import { isDomainName } from '@/lib/spaces/space-access';
 import { listSpacePlaces, type SpaceFailure, type SpacePlace, type SpaceStart } from '@/lib/spaces/spaces-api';
 import { startSpaceCreation, type SpaceModelAccess } from '@/lib/spaces/space-creation';
+import { mcpGrantRequestOf } from '@/lib/spaces/spaces-api';
 import { composerModelForSpaceAccess } from '@/lib/spaces/space-model-access';
 import { resolveSpaceSetupPlan } from '@/lib/spaces/space-setup';
 import { useConfigStore } from '@/stores/useConfigStore';
@@ -224,6 +225,14 @@ export const NewSpaceDialog: React.FC<NewSpaceDialogProps> = ({ open, onOpenChan
     setSubmitting(true);
     setSubmitError(null);
     const grants: SpaceModelAccess[] = chosenAccess.map((provider) => modelGrantOf(provider, access[provider.id]));
+    // A key the dialog holds for an MCP server of the source is a grant like a model key: it goes
+    // to the gatekeeper, and the server is pointed at the window when the environment is applied.
+    for (const server of environment.mcpServers ?? []) {
+      const key = environment.mcpKeys[server.name];
+      if (!key || server.type !== 'remote' || key.header.trim() === '') continue;
+      if (key.source === 'env' ? key.envName.trim() === '' : key.value.trim() === '') continue;
+      grants.push(mcpGrantRequestOf({ name: server.name, url: server.url ?? '' }, key));
+    }
     try {
       // Before the space is asked for: the trust prompt for shared commands opens over this dialog.
       const setup = await resolveSpaceSetupPlan(project.path);
@@ -242,7 +251,7 @@ export const NewSpaceDialog: React.FC<NewSpaceDialogProps> = ({ open, onOpenChan
         refusalMessage: t('spaces.create.queueRefused'),
       });
       // The first message goes on a model the space was given, not on one it would refuse.
-      const model = composerModelForSpaceAccess(grants.map((grant) => grant.provider));
+      const model = composerModelForSpaceAccess(grants.flatMap((grant) => (grant.kind === 'mcp' ? [] : [grant.provider])));
       if (model) {
         useConfigStore.getState().setProvider(model.providerId);
         useConfigStore.getState().setModel(model.modelId);

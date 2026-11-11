@@ -10,6 +10,7 @@ import { createEnvironmentService } from './environment-service.js';
 import {
   applyEnvironmentSource,
   createSourceQueue,
+  describePlan,
   environmentSourceSchema,
   inspectEnvironmentSource,
   syncEnvironmentMemory,
@@ -184,6 +185,32 @@ describe('environment source: selection', () => {
       formatter: true,
       skillSources: ['https://example.com/skills/'],
     });
+  });
+
+  test('offers a remote server its key and names the variables a local one reads', async () => {
+    const root = await sourceTree();
+    const plan = await inspect(source(root, { optIns: { mcp: ['docs', 'local'] } }));
+    // The dialog needs the url a key's grant is for, and the variables a local server reads from
+    // this computer, without any file content.
+    expect(describePlan(plan).mcpServers).toEqual([{ name: 'docs', type: 'remote', url: 'https://mcp.example.com' }, { name: 'local', type: 'local' }]);
+    expect(describePlan(plan).mcpEnv).toEqual({});
+  });
+
+  test('keeps a local server\'s host variables as names, and a literal value out', async () => {
+    const root = await temporary();
+    await write(root, 'config/opencode.jsonc', `{ "mcp": { "servers": {
+      "keyed": { "type": "local", "command": ["bunx", "tool"], "environment": { "TOKEN": "{env:TOOL_TOKEN}", "OTHER": "literal-secret" } },
+      "literal": { "type": "local", "command": ["bunx", "other"], "environment": { "TOKEN": "sk-live" } },
+      "remote": { "type": "remote", "url": "https://mcp.example.com", "environment": { "TOKEN": "{env:X}" } }
+    } } }\n`);
+    const plan = await inspect(source(root, { optIns: { mcp: ['keyed', 'literal', 'remote'] } }));
+    expect(plan.assets.config.mcp.servers.keyed).toEqual({ type: 'local', command: ['bunx', 'tool'], environment: { TOKEN: '{env:TOOL_TOKEN}' } });
+    // A committed secret never travels; the server does, without that value.
+    expect(plan.assets.config.mcp.servers.literal).toEqual({ type: 'local', command: ['bunx', 'other'] });
+    // The environment is a local server's, and a remote one has none.
+    expect(plan.assets.config.mcp.servers.remote).toEqual({ type: 'remote', url: 'https://mcp.example.com' });
+    expect(describePlan(plan).mcpEnv).toEqual({ keyed: ['TOOL_TOKEN'] });
+    expect(JSON.stringify(plan.assets.config)).not.toContain('sk-live');
   });
 
   test('a ticked item travels without anything that could carry a credential', async () => {

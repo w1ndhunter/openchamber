@@ -163,6 +163,8 @@ const environmentStatusSchema = z.object({
   included: z.number().int().min(0),
   omitted: z.array(z.object({ path: z.string(), reason: z.string() })).default([]),
   assets: environmentAssetsSchema.optional(),
+  // The servers the space applied, so the access dialog can offer a key without asking the source again.
+  mcpServers: z.array(z.object({ name: z.string(), type: z.enum(['local', 'remote']), url: z.string().optional() })).default([]),
   instructions: z.array(z.string()).default([]),
   appliedAt: z.string(),
   lastFailure: environmentFailureSchema.optional(),
@@ -181,6 +183,11 @@ const environmentPlanSchema = z.object({
   commit: z.string().nullable().default(null),
   assets: environmentAssetsSchema,
   offers: environmentOptInsSchema,
+  // Per local MCP server, the host variables its environment reads: the agent inside can read
+  // them too, and the dialog says so before the server is ticked.
+  mcpEnv: z.record(z.string(), z.array(z.string())).default({}),
+  // A ticked server is local or remote; a remote one names the url a key's grant is for.
+  mcpServers: z.array(z.object({ name: z.string(), type: z.enum(['local', 'remote']), url: z.string().optional() })).default([]),
   omitted: z.array(z.object({ path: z.string(), reason: z.string() })).default([]),
   memory: z.object({
     declared: z.boolean(),
@@ -249,9 +256,35 @@ const grantSchema = z.discriminatedUnion('kind', [
   // A provider of the user's own from Settings: the host reads its address, key and models again at every start.
   z.object({ kind: z.literal('custom'), id: z.string(), provider: z.string(), url: z.string() }),
   z.object({ kind: z.literal('domain'), id: z.string(), upstream: z.string(), url: z.string() }),
+  // An MCP server of the shared environment whose calls go through the window, since 2026-11-11:
+  // the id is the server's name in the source and the url its window.
+  z.object({
+    kind: z.literal('mcp'),
+    id: z.string(),
+    upstream: z.string(),
+    header: z.string(),
+    source: z.discriminatedUnion('kind', [
+      z.object({ kind: z.literal('typed') }),
+      z.object({ kind: z.literal('env'), name: z.string() }),
+    ]),
+    url: z.string(),
+  }),
 ]);
 
 export type SpaceGrant = z.infer<typeof grantSchema>;
+
+/** The MCP servers of a space's environment that have a key, by server name. */
+export const mcpGrantOf = (grants: readonly SpaceGrant[]): Map<string, Extract<SpaceGrant, { kind: 'mcp' }>> =>
+  new Map(grants.filter((grant): grant is Extract<SpaceGrant, { kind: 'mcp' }> => grant.kind === 'mcp').map((grant) => [grant.id, grant]));
+
+/** The key of one MCP server, for the dialog that gives or replaces it. */
+export const mcpGrantRequestOf = (server: { name: string; url: string }, ids: { header: string; source: 'typed' | 'env'; value: string; envName: string }) => ({
+  kind: 'mcp' as const,
+  id: server.name,
+  upstream: server.url,
+  header: ids.header.trim().toLowerCase(),
+  secret: ids.source === 'env' ? { kind: 'env' as const, name: ids.envName.trim() } : { kind: 'typed' as const, value: ids.value.trim() },
+});
 
 /** The grant that gives a space a provider: a key or the host's login, under the provider's id. */
 export const providerGrantOf = (grants: readonly SpaceGrant[], providerId: string): Extract<SpaceGrant, { kind: 'model' | 'login' | 'custom' }> | undefined =>
@@ -376,14 +409,17 @@ export type CreateSpaceRequest = {
   /** A shared folder or Git repository of passive agent assets and optional shared memory. */
   environment?: SpaceEnvironmentSourceRequest | null;
   /** The model access chosen in the dialog; the host gives it before the space is ready. */
-  grants: Extract<GrantRequest, { kind: 'model' | 'login' | 'custom' }>[];
+  grants: Extract<GrantRequest, { kind: 'model' | 'login' | 'custom' | 'mcp' }>[];
 };
 
 export type GrantRequest =
   | { kind: 'model'; provider: string; upstream: string; secret: { kind: 'typed'; value: string } | { kind: 'env'; name: string } }
   | { kind: 'login'; provider: string }
   | { kind: 'custom'; provider: string }
-  | { kind: 'domain'; upstream: string };
+  | { kind: 'domain'; upstream: string }
+  // An MCP server of the space's shared environment: the url the source declared, the header its
+  // key goes in, and where the key comes from. A remote server is then reached through the window.
+  | { kind: 'mcp'; id: string; upstream: string; header: string; secret: { kind: 'typed'; value: string } | { kind: 'env'; name: string } };
 
 // A browser login of the host's a space can be given (7c), never its token: `usable` can be said
 // to a space now, `expired` has run out and the host could not renew it, `unsupported` was made in

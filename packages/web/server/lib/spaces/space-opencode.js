@@ -99,9 +99,9 @@ const mcpServersOf = (servers, grants, hostSecret) => {
     }
     const environment = {};
     for (const [key, value] of Object.entries(server.environment)) {
-      const variable = typeof value === 'string' ? /^\{env:([A-Za-z_][A-Za-z0-9_]*)\}$/.exec(value)?.[1] : undefined;
+      const variable = /^\{env:([A-Za-z_][A-Za-z0-9_]*)\}$/.exec(String(value))?.[1];
       const secret = variable ? hostSecret(variable) : null;
-      if (typeof secret === 'string' && secret !== '') environment[key] = secret;
+      if (secret !== null && secret !== '') environment[key] = secret;
     }
     const rest = { ...server };
     delete rest.environment;

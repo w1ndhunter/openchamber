@@ -9,6 +9,7 @@ import React from 'react';
 import { Icon } from '@/components/icon/Icon';
 import { SettingsRadioGroup, SettingsRadioOption } from '@/components/sections/shared/SettingsSection';
 import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
 import { useI18n, type I18nKey } from '@/lib/i18n';
 import { environmentStateOf, environmentStateTone, unsyncedMemoryOf, type SpaceEnvironmentState } from '@/lib/spaces/space-environment';
 import {
@@ -19,9 +20,14 @@ import {
   readSpaceEnvironmentMemory,
   refreshSpaceEnvironment,
   syncSpaceEnvironmentMemory,
+  grantSpaceAccess,
+  mcpGrantOf,
+  mcpGrantRequestOf,
   type SpaceEntry,
+  type SpaceEnvironmentStatus,
   type SpaceLiveMemory,
 } from '@/lib/spaces/spaces-api';
+import { emptyMcpKey, type McpKeyDraft } from '@/lib/spaces/environment-draft';
 import { refreshSpacesJourney } from '@/lib/spaces/spaces-store';
 import { cn } from '@/lib/utils';
 import { failureOfError, spaceFailureText } from './spaceFailureText';
@@ -66,6 +72,81 @@ const useLiveMemory = (entry: SpaceEntry): [SpaceLiveMemory | null, boolean, () 
     return () => controller.abort();
   }, [entry.id, wanted, turn]);
   return [live, unread, () => setTurn((value) => value + 1)];
+};
+
+/**
+ * The MCP servers the environment brought, each with whether it has a key. A remote server's key
+ * goes to the gatekeeper and the server talks to the window; a local one reads host variables, and
+ * the agent inside can read them too. Giving a key replaces the server's grant, which is how a
+ * rotated token survives.
+ */
+const McpKeys: React.FC<{ entry: SpaceEntry; servers: SpaceEnvironmentStatus['mcpServers'] }> = ({ entry, servers }) => {
+  const { t } = useI18n();
+  const [open, setOpen] = React.useState<string | null>(null);
+  const [error, setError] = React.useState<string | null>(null);
+  const [busy, setBusy] = React.useState(false);
+  const [draft, setDraft] = React.useState<McpKeyDraft>(emptyMcpKey());
+  const keys = React.useMemo(() => mcpGrantOf(entry.grants), [entry.grants]);
+  if (servers.length === 0) return null;
+  const give = async (server: { name: string; url?: string }) => {
+    if (!server.url) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await grantSpaceAccess(entry.id, mcpGrantRequestOf({ name: server.name, url: server.url }, draft));
+      await refreshSpacesJourney().catch(() => undefined);
+      setOpen(null);
+      setDraft(emptyMcpKey());
+    } catch (failure) {
+      if (!(failure instanceof Error)) throw failure;
+      setError(spaceFailureText(t, failureOfError(failure)));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="space-y-1">
+      <div className="typography-ui-label text-foreground">{t('spaces.access.environment.mcp')}</div>
+      {servers.map((server) => {
+        const grant = keys.get(server.name);
+        return (
+          <div key={server.name} className="space-y-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <span dir="ltr" className="font-mono typography-meta text-foreground">{server.name}</span>
+              <span className="typography-micro text-muted-foreground">
+                {server.type === 'local'
+                  ? t('spaces.access.environment.mcpLocal')
+                  : grant
+                    ? t(grant.source.kind === 'env' ? 'spaces.access.environment.mcpKeyFromEnv' : 'spaces.access.environment.mcpKeyGiven', { name: grant.source.kind === 'env' ? grant.source.name : server.name })
+                    : t('spaces.access.environment.mcpKeyNone')}
+              </span>
+              {server.type === 'remote' ? (
+                <Button variant="outline" size="xs" disabled={busy} onClick={() => { setOpen(open === server.name ? null : server.name); setError(null); }}>
+                  {t(grant ? 'spaces.access.environment.mcpKeyReplace' : 'spaces.access.environment.mcpKeyGive')}
+                </Button>
+              ) : null}
+            </div>
+            {open === server.name ? (
+              <div className="space-y-1 rounded border border-border p-2">
+                <Input value={draft.header} onChange={(event) => setDraft({ ...draft, header: event.target.value })} placeholder="authorization" aria-label={t('spaces.access.environment.mcpHeader')} />
+                <SettingsRadioGroup aria-label={t('spaces.access.environment.mcpSource')}>
+                  <SettingsRadioOption ariaLabel={t('spaces.access.environment.mcpSourceEnv')} selected={draft.source === 'env'} onSelect={() => setDraft({ ...draft, source: 'env' })} label={t('spaces.access.environment.mcpSourceEnv')} />
+                  <SettingsRadioOption ariaLabel={t('spaces.access.environment.mcpSourceTyped')} selected={draft.source === 'typed'} onSelect={() => setDraft({ ...draft, source: 'typed' })} label={t('spaces.access.environment.mcpSourceTyped')} />
+                </SettingsRadioGroup>
+                {draft.source === 'env' ? (
+                  <Input value={draft.envName} onChange={(event) => setDraft({ ...draft, envName: event.target.value })} placeholder="DOCS_TOKEN" aria-label={t('spaces.access.environment.mcpEnvName')} />
+                ) : (
+                  <Input type="password" value={draft.value} onChange={(event) => setDraft({ ...draft, value: event.target.value })} aria-label={t('spaces.access.environment.mcpValue')} />
+                )}
+                <Button size="xs" disabled={busy} onClick={() => void give(server)}>{t('spaces.access.environment.mcpSave')}</Button>
+              </div>
+            ) : null}
+          </div>
+        );
+      })}
+      {error ? <p className="typography-micro text-status-error">{error}</p> : null}
+    </div>
+  );
 };
 
 export const SpaceEnvironmentSection: React.FC<{ entry: SpaceEntry }> = ({ entry }) => {
@@ -132,6 +213,7 @@ export const SpaceEnvironmentSection: React.FC<{ entry: SpaceEntry }> = ({ entry
         </div>
       ) : null}
       {status && status.omitted.length > 0 ? <div className="typography-micro text-muted-foreground">{t('spaces.access.environment.omitted', { count: status.omitted.length })}</div> : null}
+      {running && status ? <McpKeys entry={entry} servers={status.mcpServers} /> : null}
       {status?.pendingChange ? <p className="typography-meta text-status-warning">{t('spaces.access.environment.appliesOnRestart')}</p> : null}
       {status?.state === 'off' && status.mountRemains ? <p className="typography-meta text-muted-foreground">{t('spaces.access.environment.mountRemains')}</p> : null}
       {status?.lastFailure ? <p className="typography-meta text-status-error">{t('spaces.access.environment.lastFailure', { message: status.lastFailure.message })}</p> : null}

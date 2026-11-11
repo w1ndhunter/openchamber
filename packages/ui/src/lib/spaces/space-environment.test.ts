@@ -22,6 +22,7 @@ const status = (change: Partial<SpaceEnvironmentStatus> = {}): SpaceEnvironmentS
   included: 3,
   omitted: [],
   instructions: [],
+  mcpServers: [],
   appliedAt: '2026-11-06T00:00:00.000Z',
   ...change,
 });

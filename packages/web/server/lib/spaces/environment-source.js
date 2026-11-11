@@ -614,6 +614,13 @@ export const inspectEnvironmentSource = async ({ source, withHostGit }) => {
   });
 };
 
+/** The MCP servers a plan carries, with the url a key's grant is for: no file contents, no secret. */
+const mcpServersOfPlan = (plan) => Object.entries(plan.assets.config.mcp?.servers ?? {}).map(([name, server]) => ({
+  name,
+  type: server.type,
+  ...(server.type === 'remote' ? { url: server.url } : {}),
+}));
+
 /** What the dialog shows before a space is made: identity, assets, offers and memory, no file contents. */
 export const describePlan = (plan) => ({
   location: plan.location,
@@ -623,7 +630,10 @@ export const describePlan = (plan) => ({
   offers: plan.assets.offers,
   // Per local MCP server, the host variables its environment will read: the dialog warns that
   // the agent inside can read them too.
-  mcpEnv: plan.assets.mcpEnv ?? {},
+  mcpEnv: plan.assets.assets.mcpEnv ?? {},
+  // Where each ticked server talks to: a remote one can take a key through the window, and its url
+  // is what that grant's upstream has to be.
+  mcpServers: mcpServersOfPlan(plan),
   omitted: plan.assets.omitted,
   memory: {
     declared: plan.manifest.memory !== null,
@@ -834,6 +844,7 @@ export const applyEnvironmentSource = async ({ spaceId, source, plan, exec, seed
     assets: plan.assets.assets,
     instructions: plan.assets.instructions.map((relative) => `${paths.environmentRoot}/${configRoot}/${relative}`),
     config: plan.assets.config,
+    mcpServers: mcpServersOfPlan(plan),
     appliedAt: now().toISOString(),
   };
 };
