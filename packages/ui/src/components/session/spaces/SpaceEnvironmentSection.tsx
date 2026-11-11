@@ -27,7 +27,7 @@ import {
   type SpaceEnvironmentStatus,
   type SpaceLiveMemory,
 } from '@/lib/spaces/spaces-api';
-import { emptyMcpKey, type McpKeyDraft } from '@/lib/spaces/environment-draft';
+import { canKeyServer, emptyMcpKey, headerFieldOf, variableFieldOf, type McpKeyDraft } from '@/lib/spaces/environment-draft';
 import { refreshSpacesJourney } from '@/lib/spaces/spaces-store';
 import { cn } from '@/lib/utils';
 import { failureOfError, spaceFailureText } from './spaceFailureText';
@@ -109,32 +109,37 @@ const McpKeys: React.FC<{ entry: SpaceEntry; servers: SpaceEnvironmentStatus['mc
       <div className="typography-ui-label text-foreground">{t('spaces.access.environment.mcp')}</div>
       {servers.map((server) => {
         const grant = keys.get(server.name);
+        // A typed key lives in the gatekeeper's memory only, and one from a host variable that is
+        // now unset cannot be said again: both come back here as needing the key once more.
+        const needsAgain = entry.needsAccess.includes(server.name);
         return (
           <div key={server.name} className="space-y-1">
             <div className="flex flex-wrap items-center gap-2">
               <span dir="ltr" className="font-mono typography-meta text-foreground">{server.name}</span>
-              <span className="typography-micro text-muted-foreground">
+              <span className={cn('typography-micro', needsAgain ? 'text-status-warning' : 'text-muted-foreground')}>
                 {server.type === 'local'
                   ? t('spaces.access.environment.mcpLocal')
-                  : grant
-                    ? t(grant.source.kind === 'env' ? 'spaces.access.environment.mcpKeyFromEnv' : 'spaces.access.environment.mcpKeyGiven', { name: grant.source.kind === 'env' ? grant.source.name : server.name })
-                    : t('spaces.access.environment.mcpKeyNone')}
+                  : needsAgain
+                    ? t('spaces.access.environment.mcpKeyAgain')
+                    : grant
+                      ? t(grant.source.kind === 'env' ? 'spaces.access.environment.mcpKeyFromEnv' : 'spaces.access.environment.mcpKeyGiven', { name: grant.source.kind === 'env' ? grant.source.name : server.name })
+                      : t('spaces.access.environment.mcpKeyNone')}
               </span>
-              {server.type === 'remote' ? (
-                <Button variant="outline" size="xs" disabled={busy} onClick={() => { setOpen(open === server.name ? null : server.name); setError(null); }}>
-                  {t(grant ? 'spaces.access.environment.mcpKeyReplace' : 'spaces.access.environment.mcpKeyGive')}
+              {server.type === 'remote' && canKeyServer(server.name) ? (
+                <Button variant="outline" size="xs" disabled={busy} onClick={() => { setOpen(open === server.name ? null : server.name); setDraft(emptyMcpKey()); setError(null); }}>
+                  {t(grant && !needsAgain ? 'spaces.access.environment.mcpKeyReplace' : 'spaces.access.environment.mcpKeyGive')}
                 </Button>
               ) : null}
             </div>
             {open === server.name ? (
               <div className="space-y-1 rounded border border-border p-2">
-                <Input value={draft.header} onChange={(event) => setDraft({ ...draft, header: event.target.value })} placeholder="authorization" aria-label={t('spaces.access.environment.mcpHeader')} />
+                <Input value={draft.header} onChange={(event) => setDraft({ ...draft, header: headerFieldOf(event.target.value) })} placeholder="authorization" aria-label={t('spaces.access.environment.mcpHeader')} />
                 <SettingsRadioGroup aria-label={t('spaces.access.environment.mcpSource')}>
                   <SettingsRadioOption ariaLabel={t('spaces.access.environment.mcpSourceEnv')} selected={draft.source === 'env'} onSelect={() => setDraft({ ...draft, source: 'env' })} label={t('spaces.access.environment.mcpSourceEnv')} />
                   <SettingsRadioOption ariaLabel={t('spaces.access.environment.mcpSourceTyped')} selected={draft.source === 'typed'} onSelect={() => setDraft({ ...draft, source: 'typed' })} label={t('spaces.access.environment.mcpSourceTyped')} />
                 </SettingsRadioGroup>
                 {draft.source === 'env' ? (
-                  <Input value={draft.envName} onChange={(event) => setDraft({ ...draft, envName: event.target.value })} placeholder="DOCS_TOKEN" aria-label={t('spaces.access.environment.mcpEnvName')} />
+                  <Input value={draft.envName} onChange={(event) => setDraft({ ...draft, envName: variableFieldOf(event.target.value) })} placeholder="DOCS_TOKEN" aria-label={t('spaces.access.environment.mcpEnvName')} />
                 ) : (
                   <Input type="password" value={draft.value} onChange={(event) => setDraft({ ...draft, value: event.target.value })} aria-label={t('spaces.access.environment.mcpValue')} />
                 )}

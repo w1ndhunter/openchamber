@@ -388,7 +388,7 @@ const selectAssets = (files, manifest, optIns) => {
   const omitted = [];
   const chosen = new Map();
   const offers = { agents: [], mcp: [], plugins: [], commands: [], skills: [], formatter: false, skillSources: [] };
-  const assets = { agents: [], commands: [], skills: [], instructions: [], references: 0, plugins: [], mcp: [], mcpEnv: {}, agentsFile: false, preferences: [] };
+  const assets = { agents: [], commands: [], skills: [], instructions: [], references: 0, plugins: [], mcp: [], mcpEnv: {}, mcpServers: [], agentsFile: false, preferences: [] };
   const choose = (file) => chosen.set(file.path, file);
   const skillRoots = new Set();
   const pluginRoots = new Set();
@@ -505,6 +505,15 @@ const selectAssets = (files, manifest, optIns) => {
         for (const [name, server] of Object.entries(value.servers)) {
           if (!ITEM_NAME.test(name)) continue;
           offers.mcp.push(name);
+          // What the dialog needs to show before anything is ticked: where a remote server talks
+          // to, so a key knows its url, and which variables a local one reads from this computer.
+          const offered = { name, type: server?.type === 'local' ? 'local' : 'remote' };
+          const url = String(server?.url ?? '');
+          if (offered.type === 'remote' && url !== '') offered.url = url;
+          assets.mcpServers.push(offered);
+          // Only a local server reads its own environment; a remote one's is not delivered.
+          const variables = offered.type === 'local' ? hostVariableNames(server?.environment) : [];
+          if (variables.length > 0) assets.mcpEnv[name] = variables;
           if (!optIns.mcp.includes(name)) {
             omitted.push({ path: `opencode.jsonc#mcp.${name}`, reason: 'mcp' });
             continue;
@@ -517,9 +526,6 @@ const selectAssets = (files, manifest, optIns) => {
           config.mcp ??= { servers: {} };
           config.mcp.servers[name] = sanitized;
           assets.mcp.push(name);
-          // The variables a local server will read from the host, so the dialog can say so.
-          const names = hostVariableNames(sanitized.environment);
-          if (names.length > 0) assets.mcpEnv[name] = names;
         }
         continue;
       }
@@ -631,9 +637,7 @@ export const describePlan = (plan) => ({
   // Per local MCP server, the host variables its environment will read: the dialog warns that
   // the agent inside can read them too.
   mcpEnv: plan.assets.assets.mcpEnv ?? {},
-  // Where each ticked server talks to: a remote one can take a key through the window, and its url
-  // is what that grant's upstream has to be.
-  mcpServers: mcpServersOfPlan(plan),
+  mcpServers: plan.assets.assets.mcpServers ?? [],
   omitted: plan.assets.omitted,
   memory: {
     declared: plan.manifest.memory !== null,

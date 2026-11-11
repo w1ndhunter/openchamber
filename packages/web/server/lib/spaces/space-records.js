@@ -169,6 +169,9 @@ const environmentStatusSchema = z.object({
   instructions: z.array(z.string()).default([]),
   // The preferences and ticked items the configuration beside the project takes, as data.
   config: z.record(z.string(), z.unknown()).default({}),
+  // The MCP servers the space applied, so the access dialog can offer a key without asking the
+  // source again.
+  mcpServers: z.array(z.object({ name: z.string(), type: z.enum(['local', 'remote']), url: z.string().optional() })).default([]),
   appliedAt: z.string(),
   lastFailure: failureSchema.optional(),
   memoryStatus: z.object({

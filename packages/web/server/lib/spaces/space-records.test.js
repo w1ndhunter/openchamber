@@ -41,6 +41,24 @@ describe('space records', () => {
     expect(records.list()).toEqual([]);
   });
 
+  it('keeps what the environment applied, the MCP servers it brought among it', () => {
+    const records = createSpaceRecords({ dataDir: temporary(), logger: quiet });
+    const status = {
+      state: 'ready',
+      kind: 'folder',
+      location: '/shared',
+      memory: 'write',
+      included: 3,
+      instructions: [],
+      appliedAt: '2026-11-11T00:00:00.000Z',
+      mcpServers: [{ name: 'docs', type: 'remote', url: 'https://mcp.example.com/mcp' }, { name: 'local', type: 'local' }],
+    };
+    // The status is strict: a field the record does not know would make every environment apply fail.
+    const written = records.write(ID, { network: { mode: 'allowlist', domains: [], writes: 'ask', writesScope: 'path' }, environmentStatus: status });
+    expect(written.environmentStatus).toMatchObject({ mcpServers: status.mcpServers });
+    expect(records.read(ID).record.environmentStatus.mcpServers).toHaveLength(2);
+  });
+
   it('reports a file it cannot read as unreadable, never as a fresh record, and does not write over it', () => {
     const dataDir = temporary();
     const records = createSpaceRecords({ dataDir, logger: quiet });

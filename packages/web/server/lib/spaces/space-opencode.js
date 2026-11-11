@@ -85,11 +85,13 @@ export function buildProviderConfig(grants, customProviders = new Map(), environ
  * with its own missing-token answer instead of sending a blank one.
  */
 const mcpServersOf = (servers, grants, hostSecret) => {
+  // Keyed by the url as well: a grant stands for the destination the user keyed, so a source that
+  // moved its server to another address keeps that one asked through the corridor.
   const windows = new Map(grants.filter((grant) => grant.kind === 'mcp').map((grant) => [grant.id, grant]));
   const next = {};
   for (const [name, server] of Object.entries(servers)) {
     if (!isRecord(server)) continue;
-    if (server.type === 'remote' && windows.has(name)) {
+    if (server.type === 'remote' && windows.get(name)?.upstream === server.url) {
       next[name] = { ...server, url: spaceWindowUrl(name) };
       continue;
     }

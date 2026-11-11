@@ -96,6 +96,7 @@ export const spaceEnvironmentI18n = {
     'spaces.access.environment.mcpSourceTyped': 'Typed here',
     'spaces.access.environment.mcpEnvName': 'Variable name',
     'spaces.access.environment.mcpValue': 'Key',
+    'spaces.access.environment.mcpKeyAgain': 'The key must be given again',
   },
   de: {
     'spaces.create.environment.label': 'Umgebungsquelle',
@@ -193,6 +194,7 @@ export const spaceEnvironmentI18n = {
     'spaces.access.environment.mcpSourceTyped': 'Hier eingetippt',
     'spaces.access.environment.mcpEnvName': 'Name der Variable',
     'spaces.access.environment.mcpValue': 'Schlüssel',
+    'spaces.access.environment.mcpKeyAgain': 'Der Schlüssel muss erneut hinterlegt werden',
   },
   fr: {
     'spaces.create.environment.label': 'Source d’environnement',
@@ -290,6 +292,7 @@ export const spaceEnvironmentI18n = {
     'spaces.access.environment.mcpSourceTyped': 'Saisie ici',
     'spaces.access.environment.mcpEnvName': 'Nom de la variable',
     'spaces.access.environment.mcpValue': 'Clé',
+    'spaces.access.environment.mcpKeyAgain': 'La clé doit être fournie à nouveau',
   },
   nl: {
     'spaces.create.environment.label': 'Omgevingsbron',
@@ -387,6 +390,7 @@ export const spaceEnvironmentI18n = {
     'spaces.access.environment.mcpSourceTyped': 'Hier ingevoerd',
     'spaces.access.environment.mcpEnvName': 'Naam van de variabele',
     'spaces.access.environment.mcpValue': 'Sleutel',
+    'spaces.access.environment.mcpKeyAgain': 'De sleutel moet opnieuw gegeven worden',
   },
   es: {
     'spaces.create.environment.label': 'Origen del entorno',
@@ -484,6 +488,7 @@ export const spaceEnvironmentI18n = {
     'spaces.access.environment.mcpSourceTyped': 'Escrita aquí',
     'spaces.access.environment.mcpEnvName': 'Nombre de la variable',
     'spaces.access.environment.mcpValue': 'Clave',
+    'spaces.access.environment.mcpKeyAgain': 'La clave debe darse otra vez',
   },
   ja: {
     'spaces.create.environment.label': '環境ソース',
@@ -581,6 +586,7 @@ export const spaceEnvironmentI18n = {
     'spaces.access.environment.mcpSourceTyped': 'ここで入力',
     'spaces.access.environment.mcpEnvName': '変数名',
     'spaces.access.environment.mcpValue': 'キー',
+    'spaces.access.environment.mcpKeyAgain': 'キーをもう一度設定してください',
   },
   'pt-BR': {
     'spaces.create.environment.label': 'Origem do ambiente',
@@ -678,6 +684,7 @@ export const spaceEnvironmentI18n = {
     'spaces.access.environment.mcpSourceTyped': 'Digitada aqui',
     'spaces.access.environment.mcpEnvName': 'Nome da variável',
     'spaces.access.environment.mcpValue': 'Chave',
+    'spaces.access.environment.mcpKeyAgain': 'A chave precisa ser dada de novo',
   },
   uk: {
     'spaces.create.environment.label': 'Джерело середовища',
@@ -775,6 +782,7 @@ export const spaceEnvironmentI18n = {
     'spaces.access.environment.mcpSourceTyped': 'Введений тут',
     'spaces.access.environment.mcpEnvName': 'Назва змінної',
     'spaces.access.environment.mcpValue': 'Ключ',
+    'spaces.access.environment.mcpKeyAgain': 'Ключ треба надати знову',
   },
   ko: {
     'spaces.create.environment.label': '환경 소스',
@@ -872,6 +880,7 @@ export const spaceEnvironmentI18n = {
     'spaces.access.environment.mcpSourceTyped': '여기서 입력',
     'spaces.access.environment.mcpEnvName': '변수 이름',
     'spaces.access.environment.mcpValue': '키',
+    'spaces.access.environment.mcpKeyAgain': '키를 다시 줘야 합니다',
   },
   pl: {
     'spaces.create.environment.label': 'Źródło środowiska',
@@ -969,6 +978,7 @@ export const spaceEnvironmentI18n = {
     'spaces.access.environment.mcpSourceTyped': 'Wpisany tutaj',
     'spaces.access.environment.mcpEnvName': 'Nazwa zmiennej',
     'spaces.access.environment.mcpValue': 'Klucz',
+    'spaces.access.environment.mcpKeyAgain': 'Klucz trzeba podać ponownie',
   },
   'zh-CN': {
     'spaces.create.environment.label': '环境来源',
@@ -1066,6 +1076,7 @@ export const spaceEnvironmentI18n = {
     'spaces.access.environment.mcpSourceTyped': '在此输入',
     'spaces.access.environment.mcpEnvName': '变量名',
     'spaces.access.environment.mcpValue': '密钥',
+    'spaces.access.environment.mcpKeyAgain': '需要重新设置密钥',
   },
   'zh-TW': {
     'spaces.create.environment.label': '環境來源',
@@ -1163,6 +1174,7 @@ export const spaceEnvironmentI18n = {
     'spaces.access.environment.mcpSourceTyped': '在此輸入',
     'spaces.access.environment.mcpEnvName': '變數名稱',
     'spaces.access.environment.mcpValue': '金鑰',
+    'spaces.access.environment.mcpKeyAgain': '需要重新設定金鑰',
   },
   tr: {
     'spaces.create.environment.label': 'Ortam kaynağı',
@@ -1260,6 +1272,7 @@ export const spaceEnvironmentI18n = {
     'spaces.access.environment.mcpSourceTyped': 'Buraya yazıldı',
     'spaces.access.environment.mcpEnvName': 'Değişken adı',
     'spaces.access.environment.mcpValue': 'Anahtar',
+    'spaces.access.environment.mcpKeyAgain': 'Anahtarın yeniden verilmesi gerekiyor',
   },
   ar: {
     'spaces.create.environment.label': 'مصدر البيئة',
@@ -1357,6 +1370,7 @@ export const spaceEnvironmentI18n = {
     'spaces.access.environment.mcpSourceTyped': 'مكتوب هنا',
     'spaces.access.environment.mcpEnvName': 'اسم المتغيّر',
     'spaces.access.environment.mcpValue': 'المفتاح',
+    'spaces.access.environment.mcpKeyAgain': 'يجب إعطاء المفتاح من جديد',
   },
   he: {
     'spaces.create.environment.label': 'מקור סביבה',
@@ -1454,5 +1468,6 @@ export const spaceEnvironmentI18n = {
     'spaces.access.environment.mcpSourceTyped': 'הוקלד כאן',
     'spaces.access.environment.mcpEnvName': 'שם המשתנה',
     'spaces.access.environment.mcpValue': 'מפתח',
+    'spaces.access.environment.mcpKeyAgain': 'צריך לתת את המפתח שוב',
   },
 } as const;

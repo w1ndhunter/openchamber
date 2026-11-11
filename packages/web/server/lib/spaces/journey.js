@@ -1412,7 +1412,7 @@ export function createSpaceJourney({
     } else if (asked.kind === 'mcp') {
       const source = asked.secret.kind === 'typed' ? { kind: 'typed' } : { kind: 'env', name: asked.secret.name };
       const secret = asked.secret.kind === 'typed' ? asked.secret.value : readHostSecret(asked.secret.name);
-      if (secret === null || secret === '') {
+      if (!secret) {
         throw new SpaceError('secret_source_missing', `The environment variable ${asked.secret.name} is not set for OpenChamber, so there is no key to give.`);
       }
       grant = { kind: 'mcp', id: asked.id, upstream: asked.upstream, header: asked.header, source };
@@ -1425,6 +1425,11 @@ export function createSpaceJourney({
     // keep the login's headers and model list for requests the window now sends with the key; a
     // removal that fails answers the grant before anything changed.
     const replaced = current.record.grants.find((entry) => entry.id === grant.id);
+    // A grant's id is its window path, and a model grant's id is its provider's: a server of the
+    // same name would take that provider's window, so it keeps its own or nothing.
+    if (grant.kind === 'mcp' && replaced !== undefined && replaced.kind !== 'mcp') {
+      throw new SpaceError('grant_id_taken', `A grant of this space already uses the name ${grant.id}. Rename that server in the source, or remove the provider grant it collides with.`);
+    }
     if (grant.kind !== 'login' && replaced?.kind === 'login') await spaceOpenCode.removeLogin(spaceId, grant.provider);
     await gatekeeper.addGrant(spaceId, { id: grant.id, ...window });
     const grants = [...current.record.grants.filter((entry) => entry.id !== grant.id), grant];

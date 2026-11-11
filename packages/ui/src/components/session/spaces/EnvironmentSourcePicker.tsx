@@ -12,7 +12,7 @@ import { Checkbox } from '@/components/ui/checkbox';
 import { SettingsRadioGroup, SettingsRadioOption } from '@/components/sections/shared/SettingsSection';
 import { Input } from '@/components/ui/input';
 import { useI18n } from '@/lib/i18n';
-import { emptyMcpKey, environmentRequestOf, noOptIns, type EnvironmentDraft, type McpKeyDraft } from '@/lib/spaces/environment-draft';
+import { canKeyServer, emptyMcpKey, environmentRequestOf, headerFieldOf, noOptIns, variableFieldOf, type EnvironmentDraft, type McpKeyDraft } from '@/lib/spaces/environment-draft';
 import { checkEnvironmentSource, type SpaceEnvironmentPlan } from '@/lib/spaces/spaces-api';
 import { failureOfError, spaceFailureText } from './spaceFailureText';
 
@@ -143,7 +143,7 @@ export const EnvironmentSourcePicker: React.FC<{
               ) : null}
               {offers && offers.mcp.length > 0 ? (
                 <div className="space-y-2">
-                  {(plan?.mcpServers ?? []).filter((server) => value.optIns.mcp.includes(server.name)).map((server) => {
+                  {(plan?.mcpServers ?? []).filter((server) => value.optIns.mcp.includes(server.name) && canKeyServer(server.name)).map((server) => {
                     const key = value.mcpKeys[server.name] ?? emptyMcpKey();
                     const localVariables: string[] = plan?.mcpEnv[server.name] ?? [];
                     if (server.type === 'local') {
@@ -159,14 +159,14 @@ export const EnvironmentSourcePicker: React.FC<{
                         <p className="typography-meta text-foreground">{t('spaces.create.environment.mcpKey', { name: server.name })}</p>
                         <p className="typography-micro text-muted-foreground">{t('spaces.create.environment.mcpKeyHint')}</p>
                         <div className="flex flex-wrap gap-2">
-                          <Input value={key.header} onChange={(event) => change({ header: event.target.value })} placeholder="authorization" aria-label={t('spaces.create.environment.mcpHeader')} />
+                          <Input value={key.header} onChange={(event) => change({ header: headerFieldOf(event.target.value) })} placeholder="authorization" aria-label={t('spaces.create.environment.mcpHeader')} />
                           <SettingsRadioGroup aria-label={t('spaces.create.environment.mcpSource')}>
                             <SettingsRadioOption ariaLabel={t('spaces.create.environment.mcpSourceEnv')} selected={key.source === 'env'} onSelect={() => change({ source: 'env' })} label={t('spaces.create.environment.mcpSourceEnv')} />
                             <SettingsRadioOption ariaLabel={t('spaces.create.environment.mcpSourceTyped')} selected={key.source === 'typed'} onSelect={() => change({ source: 'typed' })} label={t('spaces.create.environment.mcpSourceTyped')} />
                           </SettingsRadioGroup>
                         </div>
                         {key.source === 'env' ? (
-                          <Input value={key.envName} onChange={(event) => change({ envName: event.target.value })} placeholder="DOCS_TOKEN" aria-label={t('spaces.create.environment.mcpEnvName')} />
+                          <Input value={key.envName} onChange={(event) => change({ envName: variableFieldOf(event.target.value) })} placeholder="DOCS_TOKEN" aria-label={t('spaces.create.environment.mcpEnvName')} />
                         ) : (
                           <Input type="password" value={key.value} onChange={(event) => change({ value: event.target.value })} aria-label={t('spaces.create.environment.mcpValue')} />
                         )}

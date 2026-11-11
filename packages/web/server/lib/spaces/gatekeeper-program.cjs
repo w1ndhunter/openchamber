@@ -816,7 +816,10 @@ function isRawGraphqlRequest(request) {
 // reads included, so an allowlisted MCP server would never list its tools without asking. The
 // endpoint is what names it, by the `/mcp` path every server uses, and only a message that reads
 // as a read goes out; anything else waits exactly as before.
-const JSONRPC_PATH_PATTERN = /\/mcp(\/|$)/i;
+// The endpoint itself, not anything under a folder that happens to be called `mcp`: a path below
+// it is not an MCP endpoint this rule knows, and `POST /mcp/charges` would otherwise be a way to
+// send any JSON body out untold.
+const JSONRPC_PATH_PATTERN = /^\/mcp\/?$/i;
 
 function isJsonRpcRequest(request, path) {
   if (!JSONRPC_PATH_PATTERN.test(path.split('?')[0])) return false;
@@ -1727,7 +1730,9 @@ async function serveWindow(request, response) {
     hostname: upstream.hostname,
     port,
     method: request.method,
-    path: upstream.pathname.replace(/\/$/, '') + (match[2] || ''),
+    // The grant's own path, then whatever the client added. A query the source declared travels
+    // too, unless the client names one of its own: an MCP endpoint can be `.../sse?tenant=acme`.
+    path: upstream.pathname.replace(/\/$/, '') + (match[2] || '') + ((match[2] || '').includes('?') ? '' : upstream.search),
     headers,
     agent: windowAgents[upstream.protocol],
     // The address was checked a moment ago, and this is the address the request goes to.
@@ -2138,5 +2143,5 @@ function describeFailure(error) {
 if (require.main === module) {
   main();
 } else {
-  module.exports = { APPROVAL_TIMEOUT_MS, MAX_PENDING_APPROVALS, SAFE_METHODS, TUNNEL_IDLE_MS, WRITABLE_METHODS, addGrant, approvalsSince, chooseAddress, classifyGraphqlBody, classifyJsonRpcBody, createCertificateAuthority, decideApproval, guardTunnelIdle, holdForApproval, isBlockedAddress, isDomainName, issueCertificate, parseIPv4, parseIPv6, refuseTarget, setNetwork, setWrites, splitTarget, walksOutOfGrant, writeForwardedBody };
+  module.exports = { APPROVAL_TIMEOUT_MS, MAX_PENDING_APPROVALS, SAFE_METHODS, TUNNEL_IDLE_MS, WRITABLE_METHODS, addGrant, approvalsSince, chooseAddress, classifyGraphqlBody, classifyJsonRpcBody, createCertificateAuthority, isJsonRpcRequest, decideApproval, guardTunnelIdle, holdForApproval, isBlockedAddress, isDomainName, issueCertificate, parseIPv4, parseIPv6, refuseTarget, setNetwork, setWrites, splitTarget, walksOutOfGrant, writeForwardedBody };
 }

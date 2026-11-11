@@ -28,6 +28,15 @@ export const noOptIns = (): SpaceEnvironmentOptIns => ({ agents: [], mcp: [], pl
 
 export const emptyMcpKey = (): McpKeyDraft => ({ header: 'authorization', source: 'env', value: '', envName: '' });
 
+/** A header name as the host takes it: lower case, letters, digits and dashes. */
+export const headerFieldOf = (typed: string) => typed.toLowerCase().replace(/[^a-z0-9-]/g, '');
+
+/** A host variable name as the host takes it: letters, digits and underscores, not starting with a digit. */
+export const variableFieldOf = (typed: string) => typed.replace(/[^A-Za-z0-9_]/g, '').replace(/^\d+/, '');
+
+/** Whether a server's name can name a grant at all; a longer or odder one goes out without a key. */
+export const canKeyServer = (name: string) => /^[A-Za-z0-9._-]{1,64}$/.test(name);
+
 export const emptyEnvironmentDraft = (): EnvironmentDraft => ({ kind: 'none', location: '', ref: '', memory: 'off', delivery: 'snapshot', optIns: noOptIns(), mcpKeys: {}, mcpServers: [] });
 
 /** The request the host takes, or null for none. A mount is a folder's only. */

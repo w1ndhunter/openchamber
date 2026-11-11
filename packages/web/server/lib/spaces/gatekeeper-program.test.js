@@ -399,6 +399,19 @@ describe('gatekeeper program', () => {
       expect(classifyJsonRpcBody(envelope([{ jsonrpc: '2.0', id: 1, method: 'tools/list' }, { jsonrpc: '2.0', id: 2, method: 'tools/call' }]))).toBe('unknown');
     });
 
+    it('is only the endpoint itself, never a path below a folder called mcp', () => {
+      // The corridor asks this of the space's own path before reading anything.
+      const { isJsonRpcRequest } = createRequire(import.meta.url)(PROGRAM);
+      const json = { headers: { 'content-type': 'application/json' } };
+      expect(isJsonRpcRequest(json, '/mcp')).toBe(true);
+      expect(isJsonRpcRequest(json, '/mcp/')).toBe(true);
+      expect(isJsonRpcRequest(json, '/mcp?x=1')).toBe(true);
+      expect(isJsonRpcRequest(json, '/mcp/charges')).toBe(false);
+      expect(isJsonRpcRequest(json, '/api/mcp')).toBe(false);
+      // The media type is part of it: a form post to the same path is not JSON-RPC.
+      expect(isJsonRpcRequest({ headers: { 'content-type': 'text/plain' } }, '/mcp')).toBe(false);
+    });
+
     it('answers unknown for anything it cannot read, so the user is asked', () => {
       expect(classifyJsonRpcBody(Buffer.from('not json'))).toBe('unknown');
       expect(classifyJsonRpcBody(Buffer.from(''))).toBe('unknown');
