@@ -189,6 +189,10 @@ describe('environment source: selection', () => {
 
   test('offers a remote server its key and names the variables a local one reads', async () => {
     const root = await sourceTree();
+    // With nothing ticked, which is what the dialog checks with: the fields have to be there
+    // before a tick, or the dialog can never show one.
+    const unticked = await inspect(source(root));
+    expect(describePlan(unticked).mcpServers).toEqual([{ name: 'docs', type: 'remote', url: 'https://mcp.example.com' }, { name: 'local', type: 'local' }]);
     const plan = await inspect(source(root, { optIns: { mcp: ['docs', 'local'] } }));
     // The dialog needs the url a key's grant is for, and the variables a local server reads from
     // this computer, without any file content.
