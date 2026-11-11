@@ -812,6 +812,64 @@ function isRawGraphqlRequest(request) {
   return String(request.headers['content-type'] ?? '').toLowerCase().split(';')[0].trim() === GRAPHQL_MEDIA_TYPE;
 }
 
+// MCP is the second protocol whose HTTP method says nothing: every JSON-RPC message is a POST,
+// reads included, so an allowlisted MCP server would never list its tools without asking. The
+// endpoint is what names it, by the `/mcp` path every server uses, and only a message that reads
+// as a read goes out; anything else waits exactly as before.
+const JSONRPC_PATH_PATTERN = /\/mcp(\/|$)/i;
+
+function isJsonRpcRequest(request, path) {
+  if (!JSONRPC_PATH_PATTERN.test(path.split('?')[0])) return false;
+  const type = String(request.headers['content-type'] ?? '').toLowerCase().split(';')[0].trim();
+  return type === 'application/json';
+}
+
+/**
+ * The JSON-RPC methods that only read: the handshake, discovery, and reading a resource or a
+ * prompt. `tools/call` is not one of them, and neither is subscribing or anything this program
+ * does not know, so a tool call still waits for the user.
+ */
+const JSONRPC_READ_METHODS = new Set([
+  'initialize',
+  'notifications/initialized',
+  'ping',
+  'tools/list',
+  'resources/list',
+  'resources/templates/list',
+  'resources/read',
+  'prompts/list',
+  'prompts/get',
+  'completion/complete',
+  'logging/setLevel',
+]);
+
+/**
+ * 'read' when every message in the body is a JSON-RPC 2.0 request or notification with a method
+ * that only reads, 'unknown' for anything else: a body that does not parse, an array with a bad
+ * item, a reply instead of a request, or a method this program does not follow. Only 'read' is let
+ * through without the user.
+ */
+function classifyJsonRpcBody(body) {
+  const text = body.toString('utf8').replace(/^\ufeff/, '');
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return 'unknown';
+  }
+  const items = Array.isArray(parsed) ? parsed : [parsed];
+  if (items.length === 0) return 'unknown';
+  for (const item of items) {
+    if (!(item instanceof Object) || Array.isArray(item)) return 'unknown';
+    if (item.jsonrpc !== '2.0') return 'unknown';
+    if (Object.prototype.toString.call(item.method) !== '[object String]') return 'unknown';
+    if (!JSONRPC_READ_METHODS.has(item.method)) return 'unknown';
+    // A reply, not a request: the corridor sees what the space sends, and a reply is not a read.
+    if (item.result !== undefined || item.error !== undefined) return 'unknown';
+  }
+  return 'read';
+}
+
 /** The index after a GraphQL string or block string, or -1 when it never closes. */
 function skipGraphqlString(text, start) {
   const length = text.length;
@@ -1314,6 +1372,44 @@ function decideGraphqlRequest(request, response, target, path, method, { denied 
 }
 
 /**
+ * An MCP message the user has not approved: read it (bounded, the same limit as a GraphQL body),
+ * and send it on only when every message in it reads. A body past the limit is held with the bytes
+ * read, as a GraphQL one is, so a large tool call still waits rather than being refused.
+ *
+ * `denied` is the destination and method already refused: a discovery message is ordinary traffic
+ * and goes out, while a tool call is refused at once without asking again.
+ */
+function decideJsonRpcRequest(request, response, target, path, method, { denied = false } = {}) {
+  readRequestBody(request, GRAPHQL_BODY_LIMIT).then((read) => {
+    if (read.failed) {
+      request.resume();
+      record('corridor', target.host, target.port, 'deny:unreadable-request', method);
+      refuseDecrypted(response, 400, REFUSED, 'the gatekeeper could not read this request');
+      return;
+    }
+    const verdict = read.body ? classifyJsonRpcBody(read.body) : 'unknown';
+    if (verdict === 'read') {
+      forwardRequest(request, response, target, path, { body: read.body, quiet: true });
+      return;
+    }
+    if (denied) {
+      request.resume();
+      noteStandingDenial(target.host, target.port, method);
+      refuseDecrypted(response, 403, REFUSED, REFUSED_BY_USER);
+      return;
+    }
+    if (read.body) {
+      holdForApproval(request, response, target, path, method, { body: read.body });
+      return;
+    }
+    holdForApproval(request, response, target, path, method, { prefix: read.prefix });
+  }).catch(() => {
+    if (!response.headersSent) refuseDecrypted(response, 502, UNREACHABLE, 'the gatekeeper could not serve this request');
+    else response.destroy();
+  });
+}
+
+/**
  * The host's answer for one wait. `{ status }` is what the control listener answers with. A
  * refusal stands unless `remember` is false, when the user denied this one write: for the wait's
  * exact path when `scope` is `path`, for the whole destination otherwise. A refusal the user did
@@ -1392,6 +1488,11 @@ function serveDecryptedRequest(request, response) {
       decideGraphqlRequest(request, response, target, path, method, { denied: true });
       return;
     }
+    // An MCP discovery message is a read for the same reason.
+    if (method === 'POST' && isJsonRpcRequest(request, path)) {
+      decideJsonRpcRequest(request, response, target, path, method, { denied: true });
+      return;
+    }
     request.resume();
     noteStandingDenial(target.host, target.port, method);
     refuseDecrypted(response, 403, REFUSED, REFUSED_BY_USER);
@@ -1409,6 +1510,12 @@ function serveDecryptedRequest(request, response) {
     // classifier cannot read with certainty, still waits for the user.
     if ((method === 'POST' || method === 'PUT') && isGraphqlRequest(request, path)) {
       decideGraphqlRequest(request, response, target, path, method);
+      return;
+    }
+    // An MCP server lists its tools and reads its resources over POST as well; only a message that
+    // reads goes out, and a tool call waits here like any other write.
+    if (method === 'POST' && isJsonRpcRequest(request, path)) {
+      decideJsonRpcRequest(request, response, target, path, method);
       return;
     }
     // The user decides, and the request waits for the answer: see "Waiting for the user".
@@ -2031,5 +2138,5 @@ function describeFailure(error) {
 if (require.main === module) {
   main();
 } else {
-  module.exports = { APPROVAL_TIMEOUT_MS, MAX_PENDING_APPROVALS, SAFE_METHODS, TUNNEL_IDLE_MS, WRITABLE_METHODS, addGrant, approvalsSince, chooseAddress, classifyGraphqlBody, createCertificateAuthority, decideApproval, guardTunnelIdle, holdForApproval, isBlockedAddress, isDomainName, issueCertificate, parseIPv4, parseIPv6, refuseTarget, setNetwork, setWrites, splitTarget, walksOutOfGrant, writeForwardedBody };
+  module.exports = { APPROVAL_TIMEOUT_MS, MAX_PENDING_APPROVALS, SAFE_METHODS, TUNNEL_IDLE_MS, WRITABLE_METHODS, addGrant, approvalsSince, chooseAddress, classifyGraphqlBody, classifyJsonRpcBody, createCertificateAuthority, decideApproval, guardTunnelIdle, holdForApproval, isBlockedAddress, isDomainName, issueCertificate, parseIPv4, parseIPv6, refuseTarget, setNetwork, setWrites, splitTarget, walksOutOfGrant, writeForwardedBody };
 }

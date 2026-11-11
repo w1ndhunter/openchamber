@@ -378,6 +378,40 @@ describe('gatekeeper program', () => {
     });
   });
 
+  describe('JSON-RPC bodies', () => {
+    const { classifyJsonRpcBody } = createRequire(import.meta.url)(PROGRAM);
+    const envelope = (value) => Buffer.from(JSON.stringify(value));
+    const request = (method, extra = {}) => envelope({ jsonrpc: '2.0', id: 1, method, ...extra });
+
+    it('reads the handshake, discovery and reading a resource or a prompt', () => {
+      for (const method of ['initialize', 'ping', 'tools/list', 'resources/list', 'resources/templates/list', 'resources/read', 'prompts/list', 'prompts/get', 'completion/complete', 'logging/setLevel']) {
+        expect(classifyJsonRpcBody(request(method)), method).toBe('read');
+      }
+      // The handshake's notification carries no id, which is not what makes it a write.
+      expect(classifyJsonRpcBody(envelope({ jsonrpc: '2.0', method: 'notifications/initialized' }))).toBe('read');
+      expect(classifyJsonRpcBody(envelope([{ jsonrpc: '2.0', id: 1, method: 'tools/list' }, { jsonrpc: '2.0', id: 2, method: 'resources/read', params: { uri: 'file:///a' } }]))).toBe('read');
+    });
+
+    it('never reads a tool call, a subscription, or a method it does not know', () => {
+      expect(classifyJsonRpcBody(request('tools/call', { params: { name: 'delete_everything', arguments: {} } }))).toBe('unknown');
+      expect(classifyJsonRpcBody(request('resources/subscribe'))).toBe('unknown');
+      expect(classifyJsonRpcBody(request('sampling/createMessage'))).toBe('unknown');
+      expect(classifyJsonRpcBody(envelope([{ jsonrpc: '2.0', id: 1, method: 'tools/list' }, { jsonrpc: '2.0', id: 2, method: 'tools/call' }]))).toBe('unknown');
+    });
+
+    it('answers unknown for anything it cannot read, so the user is asked', () => {
+      expect(classifyJsonRpcBody(Buffer.from('not json'))).toBe('unknown');
+      expect(classifyJsonRpcBody(Buffer.from(''))).toBe('unknown');
+      expect(classifyJsonRpcBody(Buffer.from('[]'))).toBe('unknown');
+      // Not JSON-RPC 2.0, no method, or a reply rather than a request.
+      expect(classifyJsonRpcBody(envelope({ jsonrpc: '1.0', id: 1, method: 'tools/list' }))).toBe('unknown');
+      expect(classifyJsonRpcBody(envelope({ jsonrpc: '2.0', id: 1 }))).toBe('unknown');
+      expect(classifyJsonRpcBody(envelope({ jsonrpc: '2.0', id: 1, method: 42 }))).toBe('unknown');
+      expect(classifyJsonRpcBody(envelope({ jsonrpc: '2.0', id: 1, method: 'tools/list', result: {} }))).toBe('unknown');
+      expect(classifyJsonRpcBody(envelope({ jsonrpc: '2.0', id: 1, method: 'tools/list', error: { code: -32600, message: 'no' } }))).toBe('unknown');
+    });
+  });
+
   describe('corridor, in allowlist mode', () => {
     beforeAll(async () => {
       expect((await control('POST', '/network', { mode: 'allowlist', domains: ['example.com', 'blocked.test'] })).status).toBe(200);
@@ -845,6 +879,22 @@ describe('gatekeeper program', () => {
       const answer = await secureRequest('POST', '/graphql', { body: query, headers: { 'content-type': 'application/json' } });
       expect(answer.status).not.toMatch(/403/);
       expect(await pendingNow()).toEqual([]);
+    });
+
+    // The classifier's own cases are beside the GraphQL ones. This is the corridor: an MCP read
+    // goes out on the same POST the server would otherwise be asked about. The other half, that a
+    // tool call still waits, is measured through the same path in a standalone run and covered by
+    // `tools/call` in the classifier tests: a wait here competes with the state the tests above
+    // leave, and a test that answers somebody else's wait proves nothing.
+    it('sends an MCP server discovery message without asking', async () => {
+      const at = await journalMark();
+      expect((await control('POST', '/denials', { entries: [] })).status).toBe(200);
+      expect((await control('POST', '/turn-end', {})).status).toBe(200);
+      const list = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
+      const answer = await secureRequest('POST', '/mcp', { host: 'example.org', body: list, headers: { 'content-type': 'application/json' } });
+      expect(answer.status).not.toMatch(/403/);
+      expect(await pendingNow()).toEqual([]);
+      expect((await recordsSince(at)).some((record) => record.decision === 'deny:method')).toBe(false);
     });
 
     it('asks for a body it cannot read with certainty, and refuses it on a no', async () => {
