@@ -42,7 +42,7 @@ const writeConfigScriptOf = (spaceId) => {
  * composer offers the host's catalog, and the same provider id inside is what makes that choice
  * work in the space unchanged. Decided with the maintainer on 2026-09-26.
  */
-export function buildProviderConfig(grants, customProviders = new Map(), environment = NO_ENVIRONMENT) {
+export function buildProviderConfig(grants, customProviders = new Map(), environment = NO_ENVIRONMENT, { hostSecret = (name) => process.env[name] ?? null } = {}) {
   if (!isRecord(environment.config) || !Array.isArray(environment.instructions)) throw new TypeError('An environment configuration is instructions and a config object');
   const provider = {};
   const providers = {};
@@ -70,8 +70,45 @@ export function buildProviderConfig(grants, customProviders = new Map(), environ
   delete config.providers;
   if (Object.keys(providers).length > 0) config.providers = providers;
   if (environment.instructions.length > 0) config.instructions = environment.instructions;
+  if (isRecord(config.mcp) && isRecord(config.mcp.servers)) config.mcp = { ...config.mcp, servers: mcpServersOf(config.mcp.servers, grants, hostSecret) };
   return config;
 }
+
+/**
+ * The MCP servers of a shared environment, as OpenCode inside must read them.
+ *
+ * A remote server with a grant of its own is pointed at the window, so the credential stays in
+ * the gatekeeper; the grant's upstream is the url the source declared, and the window keeps its
+ * path, so the client's own path lands where it meant to. A local server runs inside the space and
+ * reads nothing but its own environment: each `{env:NAME}` value is resolved here, on the host, and
+ * written in. A variable that is not set is left out rather than written empty, so the server fails
+ * with its own missing-token answer instead of sending a blank one.
+ */
+const mcpServersOf = (servers, grants, hostSecret) => {
+  const windows = new Map(grants.filter((grant) => grant.kind === 'mcp').map((grant) => [grant.id, grant]));
+  const next = {};
+  for (const [name, server] of Object.entries(servers)) {
+    if (!isRecord(server)) continue;
+    if (server.type === 'remote' && windows.has(name)) {
+      next[name] = { ...server, url: spaceWindowUrl(name) };
+      continue;
+    }
+    if (server.type !== 'local' || !isRecord(server.environment)) {
+      next[name] = server;
+      continue;
+    }
+    const environment = {};
+    for (const [key, value] of Object.entries(server.environment)) {
+      const variable = typeof value === 'string' ? /^\{env:([A-Za-z_][A-Za-z0-9_]*)\}$/.exec(value)?.[1] : undefined;
+      const secret = variable ? hostSecret(variable) : null;
+      if (typeof secret === 'string' && secret !== '') environment[key] = secret;
+    }
+    const rest = { ...server };
+    delete rest.environment;
+    next[name] = Object.keys(environment).length > 0 ? { ...rest, environment } : rest;
+  }
+  return next;
+};
 
 /**
  * The variable a space container carries OpenCode's start configuration in. OpenCode reads it

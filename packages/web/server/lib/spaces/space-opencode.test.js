@@ -39,6 +39,35 @@ describe('the provider configuration inside a space', () => {
     expect(config.providers).toBeUndefined();
   });
 
+  it('points a remote MCP server with a grant at the window, and resolves a local one\'s variables on the host', () => {
+    const grants = [{ kind: 'mcp', id: 'docs', upstream: 'https://mcp.example.com/mcp', header: 'authorization', source: { kind: 'env', name: 'DOCS_TOKEN' } }];
+    const environment = {
+      instructions: [],
+      config: {
+        mcp: {
+          servers: {
+            docs: { type: 'remote', url: 'https://mcp.example.com/mcp' },
+            other: { type: 'remote', url: 'https://mcp.other.example/mcp' },
+            local: { type: 'local', command: ['bunx', 'tool'], environment: { TOKEN: '{env:TOOL_TOKEN}', MISSING: '{env:NOT_SET}' } },
+          },
+        },
+      },
+    };
+    const config = buildProviderConfig(grants, new Map(), environment, { hostSecret: (name) => ({ TOOL_TOKEN: 'resolved-value' })[name] ?? null });
+    expect(config.mcp.servers).toEqual({
+      // A grant of its own: the credential stays in the gatekeeper and the url the source declared
+      // is the grant's upstream, so the window keeps its path.
+      docs: { type: 'remote', url: 'http://gatekeeper:8080/model/docs' },
+      other: { type: 'remote', url: 'https://mcp.other.example/mcp' },
+      // A local server runs inside, so its value is written in; a variable that is not set is left
+      // out rather than written empty.
+      local: { type: 'local', command: ['bunx', 'tool'], environment: { TOKEN: 'resolved-value' } },
+    });
+    expect(JSON.stringify(config)).not.toContain('{env:');
+    // With the variable unset, the local server still travels, without that value.
+    expect(buildProviderConfig(grants, new Map(), environment).mcp.servers.local).toEqual({ type: 'local', command: ['bunx', 'tool'] });
+  });
+
   it('writes the whole file over exec, as JSON on stdin, through a temporary name, beside the project and not in the home directory', async () => {
     const calls = [];
     const opencode = createSpaceOpenCode({ exec: async (spaceId, argv, options) => { calls.push({ spaceId, argv, options }); return { code: 0, stdout: '', stderr: '' }; } });

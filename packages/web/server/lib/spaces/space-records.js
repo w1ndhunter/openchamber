@@ -109,6 +109,15 @@ export const grantSchema = z.discriminatedUnion('kind', [
     id: z.string().regex(GRANT_ID_PATTERN),
     provider: z.string().regex(GRANT_ID_PATTERN),
   }).strict(),
+  // An MCP server of a shared environment whose calls go through the window, since 2026-11-11:
+  // the id is the server's name in the source, and the upstream is the url the source declared.
+  z.object({
+    kind: z.literal('mcp'),
+    id: z.string().regex(GRANT_ID_PATTERN),
+    upstream: upstreamSchema,
+    header: z.string().regex(/^[a-z0-9-]{1,64}$/),
+    source: secretSourceSchema,
+  }).strict(),
 ]);
 const MAX_GRANTS = 100;
 

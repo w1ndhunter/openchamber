@@ -1320,6 +1320,22 @@ describe('the journey: grants', () => {
     expect(JSON.stringify(await journey.listSpaces({ access: true }))).not.toContain(KEY);
   });
 
+  it('gives an MCP server a key through the window, remembering where it came from and nothing of it', async () => {
+    const { journey, records, calls, id } = await ready({ hostEnvironment: { DOCS_TOKEN: ENV_KEY } });
+    const docs = { kind: 'mcp', id: 'docs', upstream: 'https://mcp.example.com/mcp', header: 'x-api-key', secret: { kind: 'env', name: 'DOCS_TOKEN' } };
+    const given = await journey.grantAccess(id, docs);
+    expect(given.grant).toEqual({ kind: 'mcp', id: 'docs', upstream: 'https://mcp.example.com/mcp', header: 'x-api-key', source: { kind: 'env', name: 'DOCS_TOKEN' }, url: 'http://gatekeeper:8080/model/docs' });
+    expect(calls[0]).toEqual(['addGrant', id, { id: 'docs', upstream: 'https://mcp.example.com/mcp', header: 'x-api-key', secret: ENV_KEY }]);
+    // The configuration is written again, which is what points the server at the window.
+    expect(calls[1][0]).toBe('writeProviderConfig');
+    expect(JSON.stringify(records.read(id).record)).not.toContain(ENV_KEY);
+
+    // A typed key is in the gatekeeper's memory only, so a later start asks for it again.
+    await journey.grantAccess(id, { ...docs, id: 'linear', upstream: 'https://mcp.linear.app/mcp', secret: { kind: 'typed', value: KEY } });
+    expect(JSON.stringify(records.read(id).record)).not.toContain(KEY);
+    await expect(journey.grantAccess(id, { ...docs, secret: { kind: 'env', name: 'NOT_SET' } })).rejects.toMatchObject({ code: 'secret_source_missing' });
+  });
+
   it('replaces the grant of the same provider, and opens a domain with no key and no header', async () => {
     const { journey, records, calls, id } = await ready();
     await journey.grantAccess(id, anthropic);

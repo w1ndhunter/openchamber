@@ -107,6 +107,19 @@ const grantRequestSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('login'), provider: providerIdSchema }).strict(),
   // A provider the user defined on the host; its address, key and models are read from the host's configuration here.
   z.object({ kind: z.literal('custom'), provider: providerIdSchema }).strict(),
+  // A secret for an MCP server of the shared environment: the server's name, the url the source
+  // declared, the header it goes in, and where the value comes from, as a model key does. A remote
+  // server then goes through the window; a local one never gets here, since it runs inside.
+  z.object({
+    kind: z.literal('mcp'),
+    id: grantSchema.options[4].shape.id,
+    upstream: grantSchema.options[4].shape.upstream,
+    header: grantSchema.options[4].shape.header,
+    secret: z.discriminatedUnion('kind', [
+      z.object({ kind: z.literal('typed'), value: z.string().min(1).max(MAX_SECRET_LENGTH) }).strict(),
+      secretSourceSchema.options[0],
+    ]),
+  }).strict(),
 ]);
 // The model access a creation may carry: the grant dialog's kinds without the opened domain,
 // which the network choice already covers, one per provider.
@@ -115,6 +128,7 @@ const creationGrantsSchema = z.array(z.discriminatedUnion('kind', [
   grantRequestSchema.options[0],
   grantRequestSchema.options[2],
   grantRequestSchema.options[3],
+  grantRequestSchema.options[4],
 ])).max(MAX_CREATION_GRANTS);
 // The header the window sets for a provider: what its API reads a key from. Only providers
 // named here are taken: one that reads its key another way or signs its requests, Azure,
@@ -572,7 +586,8 @@ export function createSpaceJourney({
           try {
             await giveGrant(entry.id, asked);
           } catch (error) {
-            failures.push({ provider: asked.provider, ...failureOf(error) });
+            // An MCP secret names a server instead of a provider: the row says which one failed.
+            failures.push({ provider: asked.provider ?? asked.id, ...failureOf(error) });
           }
         }
         if (failures.length > 0) creationAccessFailures.set(entry.id, failures);
@@ -638,7 +653,9 @@ export function createSpaceJourney({
   const describeGrant = (grant) => ({ ...grant, url: spaceWindowUrl(grant.id) });
 
   /** Whether a grant has an entry in OpenCode's configuration inside: a key, a login or a custom provider. */
-  const configuresProvider = (grant) => grant.kind === 'model' || grant.kind === 'login' || grant.kind === 'custom';
+  // The grants OpenCode inside has to be told about: a provider's address and key, a login's row,
+  // or an MCP server whose calls go through the window instead of straight out.
+  const configuresProvider = (grant) => grant.kind === 'model' || grant.kind === 'login' || grant.kind === 'custom' || grant.kind === 'mcp';
 
   /**
    * The window grant a custom provider's definition makes, or null for one the window cannot
@@ -684,9 +701,11 @@ export function createSpaceJourney({
   const deliverGrant = async (spaceId, grant, login = null, repository = null) => {
     let secret = null;
     let upstream = grant.kind === 'login' || grant.kind === 'custom' ? null : grant.upstream;
-    let header = grant.kind === 'model' ? grant.header : null;
+    let header = grant.kind === 'model' || grant.kind === 'mcp' ? grant.header : null;
     let headers;
-    if (grant.kind === 'model') {
+    // A typed secret is in the gatekeeper's memory and nowhere else, so only one that names a host
+    // variable can be said again: the same rule as a model key.
+    if (grant.kind === 'model' || grant.kind === 'mcp') {
       if (grant.source.kind === 'typed') return false;
       secret = readHostSecret(grant.source.name);
       if (typeof secret !== 'string' || secret === '') return false;
@@ -1390,6 +1409,14 @@ export function createSpaceJourney({
       if (!window) throw new SpaceError('login_not_supported', `The ${asked.provider} login on this computer was made in a way the network filter does not know (${login.methodID}).`);
       if (loginEnded(asked.provider, login, now().getTime())) throw new SpaceError('login_expired', `The ${asked.provider} login on this computer has run out and could not be renewed. Sign in to ${asked.provider} again, then grant.`);
       grant = { kind: 'login', id: asked.provider, provider: asked.provider, method: login.methodID };
+    } else if (asked.kind === 'mcp') {
+      const source = asked.secret.kind === 'typed' ? { kind: 'typed' } : { kind: 'env', name: asked.secret.name };
+      const secret = asked.secret.kind === 'typed' ? asked.secret.value : readHostSecret(asked.secret.name);
+      if (typeof secret !== 'string' || secret === '') {
+        throw new SpaceError('secret_source_missing', `The environment variable ${asked.secret.name} is not set for OpenChamber, so there is no key to give.`);
+      }
+      grant = { kind: 'mcp', id: asked.id, upstream: asked.upstream, header: asked.header, source };
+      window = { upstream: grant.upstream, header: grant.header, secret };
     } else {
       grant = { kind: 'domain', id: `open-${crypto.randomBytes(6).toString('hex')}`, upstream: asked.upstream };
       window = { upstream: grant.upstream, header: null, secret: null };
@@ -1422,7 +1449,7 @@ export function createSpaceJourney({
     const space = await requireListed(spaceId);
     if (space.state !== 'running') throw new SpaceError('space_not_running', 'A grant goes to the gatekeeper of a running space. Start the space, then grant.');
     const grant = await giveGrant(spaceId, parsed.data);
-    const failures = (creationAccessFailures.get(spaceId) ?? []).filter((failure) => failure.provider !== grant.provider);
+    const failures = (creationAccessFailures.get(spaceId) ?? []).filter((failure) => failure.provider !== (grant.provider ?? grant.id));
     if (failures.length > 0) creationAccessFailures.set(spaceId, failures);
     else creationAccessFailures.delete(spaceId);
     return { grant: describeGrant(grant) };

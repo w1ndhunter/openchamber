@@ -340,18 +340,41 @@ const readSourceConfig = (files, configRoot, omitted) => {
   return value;
 };
 
-/** An MCP entry with nothing that could carry a credential: headers, environment and OAuth stay behind. */
-// Zod drops every key it does not name, which is the point: what is not listed here stays behind.
+/**
+ * An MCP entry with nothing that could carry a credential: headers, OAuth and a remote server's
+ * environment stay behind. Zod drops every key it does not name, which is the point.
+ *
+ * A local server's environment is the one exception, because a local server runs inside the space
+ * and reads nothing else: each value must name a variable of the host's, `{env:NAME}`, which the
+ * host resolves when it writes the space's configuration. Those values are readable by the agent,
+ * so the dialog says so before the server is ticked.
+ */
+const HOST_VARIABLE = /^\{env:([A-Za-z_][A-Za-z0-9_]{0,255})\}$/;
+const hostVariableNames = (environment) => (environment ? Object.values(environment).map((value) => HOST_VARIABLE.exec(value)?.[1]).filter(Boolean) : []);
 const mcpCommon = { enabled: z.boolean().optional(), timeout: z.number().int().positive().optional() };
 const mcpServerSchema = z.discriminatedUnion('type', [
-  z.object({ type: z.literal('local'), command: z.array(z.string()).min(1), ...mcpCommon }),
+  z.object({
+    type: z.literal('local'),
+    command: z.array(z.string()).min(1),
+    environment: z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]{0,255}$/), z.string()).optional(),
+    ...mcpCommon,
+  }),
   z.object({ type: z.literal('remote'), url: z.string().regex(/^https?:\/\//i), ...mcpCommon }),
 ]);
 
 const sanitizeMcpServer = (value) => {
   const parsed = mcpServerSchema.safeParse(value);
-  if (!parsed.success || containsSubstitution(parsed.data)) return null;
-  return parsed.data;
+  if (!parsed.success) return null;
+  // The environment is written as `{env:NAME}` on purpose: the host resolves it when it writes the
+  // space's configuration. A literal value there is a secret committed to a repository, and any
+  // other substitution anywhere names something the source cannot have, so both stay behind.
+  const { environment, ...rest } = parsed.data;
+  if (containsSubstitution(rest)) return null;
+  const hostEnvironment = {};
+  for (const [key, text] of Object.entries(environment ?? {})) {
+    if (HOST_VARIABLE.test(text)) hostEnvironment[key] = text;
+  }
+  return Object.keys(hostEnvironment).length > 0 ? { ...rest, environment: hostEnvironment } : rest;
 };
 
 /**
@@ -365,7 +388,7 @@ const selectAssets = (files, manifest, optIns) => {
   const omitted = [];
   const chosen = new Map();
   const offers = { agents: [], mcp: [], plugins: [], commands: [], skills: [], formatter: false, skillSources: [] };
-  const assets = { agents: [], commands: [], skills: [], instructions: [], references: 0, plugins: [], mcp: [], agentsFile: false, preferences: [] };
+  const assets = { agents: [], commands: [], skills: [], instructions: [], references: 0, plugins: [], mcp: [], mcpEnv: {}, agentsFile: false, preferences: [] };
   const choose = (file) => chosen.set(file.path, file);
   const skillRoots = new Set();
   const pluginRoots = new Set();
@@ -494,6 +517,9 @@ const selectAssets = (files, manifest, optIns) => {
           config.mcp ??= { servers: {} };
           config.mcp.servers[name] = sanitized;
           assets.mcp.push(name);
+          // The variables a local server will read from the host, so the dialog can say so.
+          const names = hostVariableNames(sanitized.environment);
+          if (names.length > 0) assets.mcpEnv[name] = names;
         }
         continue;
       }
@@ -595,6 +621,9 @@ export const describePlan = (plan) => ({
   commit: plan.commit ?? null,
   assets: plan.assets.assets,
   offers: plan.assets.offers,
+  // Per local MCP server, the host variables its environment will read: the dialog warns that
+  // the agent inside can read them too.
+  mcpEnv: plan.assets.mcpEnv ?? {},
   omitted: plan.assets.omitted,
   memory: {
     declared: plan.manifest.memory !== null,
