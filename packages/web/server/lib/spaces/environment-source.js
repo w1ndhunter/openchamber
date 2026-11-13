@@ -121,9 +121,16 @@ export const environmentSourceSchema = z.object({
   }
 });
 
+// The source's top level: its own AGENTS.md, commands/ and skills/ are the assets, as a team's
+// config repository already lays them out.
+const SOURCE_ROOT = '.';
+// What selection may take from a config root. A memory path inside one of them would let a memory
+// publish rewrite an asset.
+const ASSET_NAMES = Object.freeze(['AGENTS.md', 'agents', 'commands', 'skills', 'plugins', 'instructions', 'references', 'opencode.jsonc', 'opencode.json']);
+
 const manifestSchema = z.object({
   version: z.literal(1),
-  configRoot: z.string().trim().min(1).max(512).default('config'),
+  configRoot: z.string().trim().min(1).max(512).default(SOURCE_ROOT),
   instructions: z.array(z.string().trim().min(1).max(512)).max(200).default([]),
   memory: z.object({
     path: z.string().trim().min(1).max(512).default('memory'),
@@ -143,6 +150,15 @@ const requireRelativePath = (value, label) => {
 };
 
 const isInside = (root, relative) => relative === root || relative.startsWith(`${root}/`);
+
+/** The config root: the source's top level (`.`) or a relative folder inside it. */
+const configRootOf = (manifest) => {
+  const value = posix(manifest.configRoot);
+  return value === '' || value === SOURCE_ROOT ? SOURCE_ROOT : requireRelativePath(value, 'The config root');
+};
+
+/** What a file path inside the config root starts with: nothing for the top level. */
+const prefixOf = (configRoot) => (configRoot === SOURCE_ROOT ? '' : `${configRoot}/`);
 
 /** The source's declared memory path; asking for memory without one is a refusal, not a default. */
 const memoryPathOf = (manifest) => {
@@ -258,14 +274,19 @@ const readManifest = (files) => {
   const parsed = manifestSchema.safeParse(raw);
   if (!parsed.success) throw new SpaceError('invalid_environment_source', 'The environment manifest is not a version this OpenChamber knows, or it names something a manifest cannot.');
   const manifest = parsed.data;
-  const configRoot = requireRelativePath(manifest.configRoot, 'The config root');
+  const configRoot = configRootOf(manifest);
   if (isInside('.openchamber', configRoot)) throw new SpaceError('invalid_environment_source', 'The config root cannot be inside .openchamber.');
   if (manifest.memory) {
     const memoryPath = requireRelativePath(manifest.memory.path, 'The memory path');
     // Shared memory is written back to the source. A path that overlaps the assets would let a
-    // hostile manifest turn a memory publish into a rewrite of the instructions beside it.
-    if (isInside(configRoot, memoryPath) || isInside(memoryPath, configRoot) || isInside('.openchamber', memoryPath)) {
-      throw new SpaceError('invalid_environment_source', 'The shared memory path must stay apart from the config root and .openchamber.');
+    // hostile manifest turn a memory publish into a rewrite of the instructions beside it. At the
+    // top level every path is inside the config root, so it is the assets it must stay out of.
+    const assets = ASSET_NAMES.map((name) => `${prefixOf(configRoot)}${name}`);
+    const overlaps = configRoot === SOURCE_ROOT
+      ? assets.some((asset) => isInside(asset, memoryPath))
+      : isInside(configRoot, memoryPath) || isInside(memoryPath, configRoot);
+    if (overlaps || isInside('.openchamber', memoryPath)) {
+      throw new SpaceError('invalid_environment_source', 'The shared memory path must stay apart from the assets and .openchamber.');
     }
   }
   return manifest;
@@ -327,14 +348,14 @@ const isPassiveFile = (file) => !SCRIPT_EXTENSION.test(file.path) && (file.mode 
 const containsSubstitution = (value) => JSON.stringify(value ?? null).match(SUBSTITUTION) !== null;
 
 /** The source's `opencode.jsonc`, parsed without comments, or null for none. */
-const readSourceConfig = (files, configRoot, omitted) => {
-  const file = files.find((candidate) => candidate.path === `${configRoot}/opencode.jsonc`)
-    ?? files.find((candidate) => candidate.path === `${configRoot}/opencode.json`);
+const readSourceConfig = (files, prefix, omitted) => {
+  const file = files.find((candidate) => candidate.path === `${prefix}opencode.jsonc`)
+    ?? files.find((candidate) => candidate.path === `${prefix}opencode.json`);
   if (!file) return null;
   const errors = [];
   const value = parseJsonc(file.data.toString('utf8'), errors, { allowTrailingComma: true });
   if (errors.length > 0 || !isRecord(value)) {
-    omitted.push({ path: file.path.slice(configRoot.length + 1), reason: 'config_unreadable' });
+    omitted.push({ path: file.path.slice(prefix.length), reason: 'config_unreadable' });
     return null;
   }
   return value;
@@ -383,8 +404,8 @@ const sanitizeMcpServer = (value) => {
  * names is an offer, and only the user's tick in `optIns` takes it.
  */
 const selectAssets = (files, manifest, optIns) => {
-  const configRoot = requireRelativePath(manifest.configRoot, 'The config root');
-  const prefix = `${configRoot}/`;
+  const configRoot = configRootOf(manifest);
+  const prefix = prefixOf(configRoot);
   const omitted = [];
   const chosen = new Map();
   const offers = { agents: [], mcp: [], plugins: [], commands: [], skills: [], formatter: false, skillSources: [] };
@@ -488,7 +509,7 @@ const selectAssets = (files, manifest, optIns) => {
 
   // The source's own config: preferences on the allowlist, ticked items, and nothing else.
   const config = {};
-  const sourceConfig = readSourceConfig(files, configRoot, omitted);
+  const sourceConfig = readSourceConfig(files, prefix, omitted);
   if (sourceConfig) {
     for (const [key, value] of Object.entries(sourceConfig)) {
       if (key === '$schema') continue;
@@ -815,7 +836,7 @@ export const applyEnvironmentSource = async ({ spaceId, source, plan, exec, seed
     mountRoot: ENVIRONMENT_MOUNT_PATH,
     configRoot,
     names: LINKED_NAMES,
-    links: LINKED_NAMES.filter((name) => plan.assets.files.some((file) => isInside(`${configRoot}/${name}`, file.path))),
+    links: LINKED_NAMES.filter((name) => plan.assets.files.some((file) => isInside(`${prefixOf(configRoot)}${name}`, file.path))),
     memory: source.memory === 'off' && !seedMemory ? { mode: 'off', seed: false } : {
       mode: source.memory,
       seed: seedMemory,
@@ -846,7 +867,7 @@ export const applyEnvironmentSource = async ({ spaceId, source, plan, exec, seed
     included: plan.assets.files.length,
     omitted,
     assets: plan.assets.assets,
-    instructions: plan.assets.instructions.map((relative) => `${paths.environmentRoot}/${configRoot}/${relative}`),
+    instructions: plan.assets.instructions.map((relative) => path.posix.join(paths.environmentRoot, configRoot, relative)),
     config: plan.assets.config,
     mcpServers: mcpServersOfPlan(plan),
     appliedAt: now().toISOString(),

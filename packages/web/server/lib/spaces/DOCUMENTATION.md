@@ -1013,14 +1013,29 @@ write.
 The source layout:
 
 ```
-.openchamber/environment.json   { version: 1, configRoot, instructions[], memory: { path, format } | null }
-config/AGENTS.md, opencode.jsonc, agents/, commands/, skills/, plugins/, instructions/, references/
+.openchamber/environment.json   { version: 1, configRoot?, instructions[], memory: { path, format } | null }
+AGENTS.md, opencode.jsonc, agents/, commands/, skills/, plugins/, instructions/, references/
 memory/entries/<id>.json, memory/tombstones/<id>.json   (version 2; memory/memory.json is version 1)
 ```
 
+Since 2026-11-13 the config root is the source's top level (`.`) unless the
+manifest names a folder, so a team repository with `AGENTS.md`, `commands/` and
+`skills/` at the top is a source as it is laid out. Everything else at the top,
+scripts and other folders included, stays behind because selection names what
+it takes, not because it sits outside a folder.
+
 The manifest is strict: an unknown key, another version, a config root inside
-`.openchamber`, a memory path that overlaps the config root or `.openchamber`,
-or a path that leaves the source is a refusal.
+`.openchamber`, a memory path that overlaps `.openchamber` or the assets (the
+config root, or at the top level one of the folders and files selection
+takes), or a path that leaves the source is a refusal.
+
+### Why the top level and not a config folder
+
+A config folder was the first layout, and it made a team move its repository
+under one more folder to use it. Selection already decides by name, so the
+folder kept nothing out that the names did not. What the folder did protect is
+shared memory, which is written back to the source; at the top level the memory
+path is checked against each asset name instead.
 
 **Probe of the pinned OpenCode (2.2.5, 2026-11-06).** In the pinned image with
 the pinned tools volume: `~/.config/opencode/{AGENTS.md,agents,commands,skills}`

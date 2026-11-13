@@ -202,7 +202,7 @@ describe('environment source: selection', () => {
 
   test('keeps a local server\'s host variables as names, and a literal value out', async () => {
     const root = await temporary();
-    await write(root, 'config/opencode.jsonc', `{ "mcp": { "servers": {
+    await write(root, 'opencode.jsonc', `{ "mcp": { "servers": {
       "keyed": { "type": "local", "command": ["bunx", "tool"], "environment": { "TOKEN": "{env:TOOL_TOKEN}", "OTHER": "literal-secret" } },
       "literal": { "type": "local", "command": ["bunx", "other"], "environment": { "TOKEN": "sk-live" } },
       "remote": { "type": "remote", "url": "https://mcp.example.com", "environment": { "TOKEN": "{env:X}" } }
@@ -289,7 +289,7 @@ describe('environment source: selection', () => {
 
   test('refuses a source larger than the bound', async () => {
     const root = await temporary();
-    await write(root, 'config/references/big.md', Buffer.alloc(9 * 1024 * 1024, 'a'));
+    await write(root, 'references/big.md', Buffer.alloc(9 * 1024 * 1024, 'a'));
     await expect(inspect(source(root))).rejects.toMatchObject({ code: 'environment_source_too_large' });
   });
 
@@ -331,6 +331,45 @@ describe('environment source: delivery', () => {
     expect(await read(path.join(spaces.work(SPACE), '.shared', 'memory'), 'entries/mem_one.json')).toContain('Shared fact');
     // The source itself was only read.
     expect(await read(root, 'config/AGENTS.md')).toBe('Shared instructions.\n');
+  });
+
+  test('takes a team repository as it is laid out, with its assets at the top level', async () => {
+    const spaces = await fakeSpaces();
+    const root = await temporary();
+    await write(root, '.openchamber/environment.json', JSON.stringify({ version: 1, instructions: ['rules/team.md'], memory: { path: 'memory' } }));
+    await write(root, 'AGENTS.md', 'Team rules.\n');
+    await write(root, 'commands/review.md', 'Review the change.\n');
+    await write(root, 'commands/helper.py', 'print(1)\n');
+    await write(root, 'skills/writing/SKILL.md', 'Writes.\n');
+    await write(root, 'rules/team.md', 'A rule nothing selects.\n');
+    await write(root, 'driver/tool.md', 'Not an asset.\n');
+    await write(root, 'memory/entries/mem_one.json', JSON.stringify({ version: 2, id: 'mem_one', title: 'Shared fact', body: 'Body', revision: 1, createdAt: 1, updatedAt: 1 }));
+    const value = source(root, { memory: 'write' });
+    const plan = await inspect(value);
+    expect(plan.assets.configRoot).toBe('.');
+    expect(plan.assets.files.map((file) => file.path).sort()).toEqual(['AGENTS.md', 'commands/review.md', 'skills/writing/SKILL.md']);
+    // A declared instruction outside the folders selection takes is not taken because it was named.
+    expect(plan.assets.omitted).toContainEqual({ path: 'rules/team.md', reason: 'instruction_missing' });
+
+    const status = await apply(spaces, SPACE, value);
+    const environmentRoot = path.join(spaces.work(SPACE), '.shared', 'environment');
+    const configHome = path.join(spaces.home(SPACE), '.config', 'opencode');
+    for (const name of ['AGENTS.md', 'commands', 'skills']) {
+      expect(await fsPromises.readlink(path.join(configHome, name))).toBe(path.join(environmentRoot, name));
+    }
+    expect(await exists(path.join(environmentRoot, 'driver'))).toBe(false);
+    expect(await exists(path.join(environmentRoot, 'memory'))).toBe(false);
+    expect(status.instructions).toEqual([]);
+    expect(await read(path.join(spaces.work(SPACE), '.shared', 'memory'), 'entries/mem_one.json')).toContain('Shared fact');
+  });
+
+  test('keeps a top-level source\'s memory out of its assets', async () => {
+    for (const memory of ['skills/memory', 'AGENTS.md', 'commands', 'opencode.jsonc', '.openchamber/memory']) {
+      const root = await temporary();
+      await write(root, '.openchamber/environment.json', JSON.stringify({ version: 1, memory: { path: memory } }));
+      await write(root, 'AGENTS.md', 'x');
+      await expect(inspect(source(root)), memory).rejects.toMatchObject({ code: 'invalid_environment_source' });
+    }
   });
 
   test('leaves a file the space made itself in OpenCode\'s folder alone', async () => {
