@@ -347,9 +347,9 @@ describe('environment source: delivery', () => {
     const value = source(root, { memory: 'write' });
     const plan = await inspect(value);
     expect(plan.assets.configRoot).toBe('.');
-    expect(plan.assets.files.map((file) => file.path).sort()).toEqual(['AGENTS.md', 'commands/review.md', 'skills/writing/SKILL.md']);
-    // A declared instruction outside the folders selection takes is not taken because it was named.
-    expect(plan.assets.omitted).toContainEqual({ path: 'rules/team.md', reason: 'instruction_missing' });
+    expect(plan.assets.files.map((file) => file.path).sort()).toEqual(['AGENTS.md', 'commands/review.md', 'rules/team.md', 'skills/writing/SKILL.md']);
+    // A declared instruction is an explicit selection even outside the conventional folders.
+    expect(plan.assets.omitted).not.toContainEqual({ path: 'rules/team.md', reason: 'instruction_missing' });
 
     const status = await apply(spaces, SPACE, value);
     const environmentRoot = path.join(spaces.work(SPACE), '.shared', 'environment');
@@ -359,8 +359,121 @@ describe('environment source: delivery', () => {
     }
     expect(await exists(path.join(environmentRoot, 'driver'))).toBe(false);
     expect(await exists(path.join(environmentRoot, 'memory'))).toBe(false);
-    expect(status.instructions).toEqual([]);
+    expect(status.instructions).toEqual([`/spaces/${SPACE}/.shared/environment/rules/team.md`]);
     expect(await read(path.join(spaces.work(SPACE), '.shared', 'memory'), 'entries/mem_one.json')).toContain('Shared fact');
+  });
+
+  test('keeps imported instructions and on-demand references together and preserves scoped rules', async () => {
+    const spaces = await fakeSpaces();
+    const root = await temporary();
+    await write(root, '.openchamber/environment.json', JSON.stringify({
+      version: 1, references: ['practices'], rules: ['rules'],
+    }));
+    await write(root, 'AGENTS.md', 'Team instructions.\n@practices/INDEX.md\n');
+    await write(root, 'practices/INDEX.md', 'Before Terraform: `practices/terraform.md`.\n');
+    await write(root, 'practices/terraform.md', 'Apply once.\n');
+    await write(root, 'rules/general.md', '---\ndescription: General\n---\nAlways review.\n');
+    await write(root, 'rules/python.md', '---\npaths:\n  - "**/*.py"\n---\nUse isolated environments.\n');
+    await write(root, 'commands/atlassian-token', 'not-delivered');
+    const plan = await inspect(source(root));
+    const paths = plan.assets.files.map((file) => file.path).sort();
+    expect(paths).toEqual([
+      '.openchamber/scoped-rules.md', 'AGENTS.md', 'practices/INDEX.md', 'practices/terraform.md',
+      'rules/general.md', 'rules/python.md',
+    ]);
+    expect(plan.assets.files.find((file) => file.path === 'AGENTS.md').data.toString()).toBe('Team instructions.\nBefore Terraform: `practices/terraform.md`.\n\n');
+    expect(plan.assets.instructions).toEqual(['rules/general.md', '.openchamber/scoped-rules.md']);
+    expect(plan.assets.assets.references).toBe(3);
+    const status = await apply(spaces, SPACE, source(root));
+    const environmentRoot = path.join(spaces.work(SPACE), '.shared', 'environment');
+    expect(await read(environmentRoot, '.openchamber/scoped-rules.md')).toContain('Before reading or editing files matching `**/*.py`');
+    expect(await read(environmentRoot, 'rules/general.md')).toBe('Always review.\n');
+    expect(status.instructions).toEqual([
+      `/spaces/${SPACE}/.shared/environment/rules/general.md`,
+      `/spaces/${SPACE}/.shared/environment/.openchamber/scoped-rules.md`,
+    ]);
+    expect(await exists(path.join(environmentRoot, 'commands/atlassian-token'))).toBe(false);
+  });
+
+  test('refuses broken instruction imports and memory-backed declared assets', async () => {
+    for (const [pathList, memory] of [
+      [{ instructions: ['memory'] }, { path: 'memory' }],
+      [{ references: ['practices'] }, { path: 'practices/remembered' }],
+      [{ rules: ['rules'] }, { path: 'rules/remembered' }],
+      [{ references: ['memory/fact.md'] }, { path: 'memory' }],
+    ]) {
+      const root = await temporary();
+      await write(root, '.openchamber/environment.json', JSON.stringify({ version: 1, ...pathList, memory }));
+      await expect(inspect(source(root)), JSON.stringify(pathList)).rejects.toMatchObject({ code: 'invalid_environment_source' });
+    }
+    for (const imported of ['missing.md', '../outside.md']) {
+      const root = await temporary();
+      await write(root, 'AGENTS.md', `@${imported}\n`);
+      await expect(inspect(source(root))).rejects.toMatchObject({ code: 'invalid_environment_source' });
+    }
+    const fromMemory = await temporary();
+    await write(fromMemory, '.openchamber/environment.json', JSON.stringify({ version: 1, memory: { path: 'memory' } }));
+    await write(fromMemory, 'AGENTS.md', '@memory/fact.md\n');
+    await write(fromMemory, 'memory/fact.md', 'Memory must not become an instruction.\n');
+    await expect(inspect(source(fromMemory))).rejects.toMatchObject({ code: 'invalid_environment_source' });
+    const cyclic = await temporary();
+    await write(cyclic, 'AGENTS.md', '@cycle.md\n');
+    await write(cyclic, 'cycle.md', '@AGENTS.md\n');
+    await expect(inspect(source(cyclic))).rejects.toMatchObject({ code: 'invalid_environment_source' });
+  });
+
+  test('reads unindented and scalar rule scopes, and refuses a scope it cannot read', async () => {
+    for (const paths of ['paths:\n- "**/*.py"\n', 'paths: "**/*.py"\n', 'paths: ["**/*.py"]\n']) {
+      const root = await temporary();
+      await write(root, '.openchamber/environment.json', JSON.stringify({ version: 1, rules: ['rules'] }));
+      await write(root, 'rules/python.md', `---\n${paths}---\nPython only.\n`);
+      const plan = await inspect(source(root));
+      expect(plan.assets.instructions).toEqual(['.openchamber/scoped-rules.md']);
+      expect(plan.assets.files.find((file) => file.path === '.openchamber/scoped-rules.md').data.toString()).toContain('**/*.py');
+    }
+    const root = await temporary();
+    await write(root, '.openchamber/environment.json', JSON.stringify({ version: 1, rules: ['rules'] }));
+    await write(root, 'rules/python.md', '---\npaths: >\n  "**/*.py"\n---\nPython only.\n');
+    await expect(inspect(source(root))).rejects.toMatchObject({ code: 'invalid_environment_source' });
+  });
+
+  test('cannot bypass opt-ins by declaring discovered assets as passive paths', async () => {
+    for (const declaration of [
+      { references: ['commands'] },
+      { instructions: ['skills'] },
+      { references: ['plugins'] },
+      { references: ['AGENTS.md'] },
+    ]) {
+      const root = await temporary();
+      await write(root, 'commands/shell.md', 'Run: !`touch /tmp/x`\n');
+      await write(root, 'skills/scripted/SKILL.md', 'Run the script.\n');
+      await write(root, 'skills/scripted/run.sh', '#!/bin/sh\n');
+      await write(root, 'plugins/notify.ts', 'export default async () => ({})\n');
+      await write(root, 'plugins/readme.md', 'Plugin documentation.\n');
+      await write(root, 'AGENTS.md', 'Instructions.\n');
+      await write(root, '.openchamber/environment.json', JSON.stringify({ version: 1, ...declaration }));
+      await expect(inspect(source(root)), JSON.stringify(declaration)).rejects.toMatchObject({ code: 'invalid_environment_source' });
+    }
+  });
+
+  test('mounted delivery materialises transformed files and links only unchanged source files', async () => {
+    const root = await temporary();
+    await write(root, '.openchamber/environment.json', JSON.stringify({ version: 1, references: ['practices'], rules: ['rules'] }));
+    await write(root, 'AGENTS.md', '@practices/INDEX.md\n');
+    await write(root, 'practices/INDEX.md', 'Read on demand.\n');
+    await write(root, 'rules/general.md', '---\ndescription: General\n---\nAlways.\n');
+    await write(root, 'rules/python.md', '---\npaths: "**/*.py"\n---\nPython only.\n');
+    let payload;
+    const exec = async (_spaceId, _argv, { stdin }) => {
+      payload = JSON.parse(stdin);
+      return { code: 0, stdout: '{"kept":[]}', stderr: '' };
+    };
+    const value = source(root, { delivery: 'mount' });
+    await applyEnvironmentSource({ spaceId: SPACE, source: value, plan: await inspect(value), exec, seedMemory: true });
+    expect(payload.files.map((file) => file.path)).toEqual(['AGENTS.md', 'rules/general.md', '.openchamber/scoped-rules.md']);
+    expect(Buffer.from(payload.files[0].data, 'base64').toString()).toBe('Read on demand.\n\n');
+    expect(payload.view.map((file) => file.path)).toEqual(['practices/INDEX.md', 'rules/python.md']);
+    expect(payload.view.every((file) => file.target.startsWith('/openchamber-environment/'))).toBe(true);
   });
 
   test('keeps a top-level source\'s memory out of its assets', async () => {

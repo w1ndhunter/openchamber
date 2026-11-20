@@ -128,10 +128,14 @@ const SOURCE_ROOT = '.';
 // publish rewrite an asset.
 const ASSET_NAMES = Object.freeze(['AGENTS.md', 'agents', 'commands', 'skills', 'plugins', 'instructions', 'references', 'opencode.jsonc', 'opencode.json']);
 
+const declaredPaths = z.array(z.string().trim().min(1).max(512)).max(200).default([]);
+
 const manifestSchema = z.object({
   version: z.literal(1),
   configRoot: z.string().trim().min(1).max(512).default(SOURCE_ROOT),
-  instructions: z.array(z.string().trim().min(1).max(512)).max(200).default([]),
+  instructions: declaredPaths,
+  references: declaredPaths,
+  rules: declaredPaths,
   memory: z.object({
     path: z.string().trim().min(1).max(512).default('memory'),
     format: z.enum(['openchamber-memory-v1', 'openchamber-memory-v2']).default('openchamber-memory-v2'),
@@ -282,10 +286,13 @@ const readManifest = (files) => {
     // hostile manifest turn a memory publish into a rewrite of the instructions beside it. At the
     // top level every path is inside the config root, so it is the assets it must stay out of.
     const assets = ASSET_NAMES.map((name) => `${prefixOf(configRoot)}${name}`);
+    const declared = [...manifest.instructions, ...manifest.references, ...manifest.rules]
+      .map((entry) => `${prefixOf(configRoot)}${requireRelativePath(entry, 'A declared asset')}`);
     const overlaps = configRoot === SOURCE_ROOT
-      ? assets.some((asset) => isInside(asset, memoryPath))
+      ? [...assets, ...declared].some((asset) => isInside(asset, memoryPath))
       : isInside(configRoot, memoryPath) || isInside(memoryPath, configRoot);
-    if (overlaps || isInside('.openchamber', memoryPath)) {
+    // A declared file below the memory root could also be replaced by a memory publish.
+    if (overlaps || declared.some((asset) => isInside(memoryPath, asset)) || isInside('.openchamber', memoryPath)) {
       throw new SpaceError('invalid_environment_source', 'The shared memory path must stay apart from the assets and .openchamber.');
     }
   }
@@ -361,6 +368,52 @@ const readSourceConfig = (files, prefix, omitted) => {
   return value;
 };
 
+const SCOPED_RULE_GUIDE = '.openchamber/scoped-rules.md';
+const DISCOVERED_ASSET_NAMES = new Set(['AGENTS.md', 'agents', 'commands', 'skills', 'plugins', '.openchamber', 'opencode.jsonc', 'opencode.json']);
+
+/** Expand the `@topic.md` lines used by instruction files that OpenCode itself does not import. */
+const withInstructionImports = (file, byPath, prefix, memoryPath) => {
+  const expand = (current, seen) => {
+    if (seen.size > MAX_DEPTH) throw new SpaceError('environment_source_too_large', `The instruction imports are deeper than ${MAX_DEPTH} files.`);
+    const text = current.data.toString('utf8').replace(/^@([^\s@]+\.md)[\t ]*$/gm, (_match, importPath) => {
+      const relative = current.path.slice(prefix.length);
+      const imported = path.posix.normalize(path.posix.join(path.posix.dirname(relative), importPath));
+      const target = byPath.get(`${prefix}${imported}`);
+      if (imported === '..' || imported.startsWith('../') || !target || !isPassiveFile(target)
+        || (memoryPath !== null && isInside(memoryPath, target.path))) {
+        throw new SpaceError('invalid_environment_source', `The instruction import cannot be delivered: ${current.path} -> ${importPath}`);
+      }
+      if (seen.has(target.path)) throw new SpaceError('invalid_environment_source', `The instruction imports form a cycle at ${target.path}.`);
+      return expand(target, new Set([...seen, target.path]));
+    });
+    if (Buffer.byteLength(text) > MAX_ASSET_BYTES) throw new SpaceError('environment_source_too_large', 'The expanded instructions are too large.');
+    return text;
+  };
+  const original = file.data.toString('utf8');
+  const expanded = expand(file, new Set([file.path]));
+  return expanded === original ? file : { ...file, data: Buffer.from(expanded) };
+};
+
+/** The `paths` globs of a rule, or null for one that is always active. */
+const rulePathsOf = (text) => {
+  const frontmatter = frontmatterOf(text);
+  const block = /^paths:[\t ]*\r?\n((?:[\t ]*-[\t ]+.*(?:\r?\n|$))+)/m.exec(frontmatter);
+  const inline = /^paths:[\t ]*\[([^\]\r\n]*)\]/m.exec(frontmatter);
+  const value = block?.[1] ?? inline?.[1] ?? /^paths:[\t ]+([^\r\n]+)[\t ]*$/m.exec(frontmatter)?.[1];
+  if (!block && !inline && (value?.trim().startsWith('>') || value?.trim().startsWith('|') || value?.trim().startsWith('{'))) {
+    throw new SpaceError('invalid_environment_source', 'A rule has a paths scope this source cannot read.');
+  }
+  if (value !== undefined) {
+    const globs = (block ? value.match(/[\t ]*-[\t ]+(.*)/g) ?? [] : inline ? value.split(',') : [value])
+      .map((entry) => entry.replace(/^[\t ]*-[\t ]+/, '').trim().replace(/^(?:"(.*)"|'(.*)')$/, '$1$2'))
+      .filter(Boolean);
+    if (globs.length > 0) return globs;
+  }
+  const declared = /^paths[\t ]*:/m.test(frontmatter);
+  if (declared && value !== undefined) throw new SpaceError('invalid_environment_source', 'A rule has a paths scope this source cannot read.');
+  return null;
+};
+
 /**
  * An MCP entry with nothing that could carry a credential: headers, OAuth and a remote server's
  * environment stay behind. Zod drops every key it does not name, which is the point.
@@ -408,6 +461,8 @@ const selectAssets = (files, manifest, optIns) => {
   const prefix = prefixOf(configRoot);
   const omitted = [];
   const chosen = new Map();
+  const byPath = new Map(files.map((file) => [file.path, file]));
+  const memoryPath = manifest.memory ? `${prefix}${memoryPathOf(manifest)}` : null;
   const offers = { agents: [], mcp: [], plugins: [], commands: [], skills: [], formatter: false, skillSources: [] };
   const assets = { agents: [], commands: [], skills: [], instructions: [], references: 0, plugins: [], mcp: [], mcpEnv: {}, mcpServers: [], agentsFile: false, preferences: [] };
   const choose = (file) => chosen.set(file.path, file);
@@ -419,7 +474,7 @@ const selectAssets = (files, manifest, optIns) => {
     const parts = relative.split('/');
     const [top] = parts;
     if (relative === 'AGENTS.md') {
-      choose(file);
+      choose(withInstructionImports(file, byPath, prefix, memoryPath));
       assets.agentsFile = true;
     } else if (top === 'instructions' || top === 'references') {
       if (isPassiveFile(file)) {
@@ -492,18 +547,55 @@ const selectAssets = (files, manifest, optIns) => {
     assets.plugins.push(name);
   }
 
+  const pathOf = (file) => file.path.slice(prefix.length);
+  // Declared paths can live beside the conventional asset folders. Only passive files travel.
+  const declaredFiles = (kind, suffixes = null) => {
+    const matches = [];
+    for (const entry of manifest[kind]) {
+      const declared = requireRelativePath(entry, `A declared ${kind} path`);
+      const selected = files.filter((file) => file.path.startsWith(prefix) && isInside(declared, pathOf(file))
+        && isPassiveFile(file) && (suffixes === null || suffixes.some((suffix) => file.path.endsWith(suffix))));
+      // Declarations are references and instructions. Putting them under a discovery-linked filename
+      // would smuggle an unticked shell command, powerful agent, plugin or script skill back in.
+      if (selected.some((file) => DISCOVERED_ASSET_NAMES.has(pathOf(file).split('/')[0]))) {
+        throw new SpaceError('invalid_environment_source', `Declared ${kind} paths must stay outside the standard command, agent, skill, plugin and config assets.`);
+      }
+      if (selected.length === 0) omitted.push({ path: declared, reason: kind === 'instructions' ? 'instruction_missing' : `${kind}_missing` });
+      for (const file of selected) if (!matches.includes(file)) matches.push(file);
+    }
+    return matches;
+  };
+  for (const file of declaredFiles('references')) {
+    if (!chosen.has(file.path)) assets.references += 1;
+    choose(file);
+  }
+  const instructions = [];
+  for (const file of declaredFiles('instructions', ['.md'])) {
+    choose(withInstructionImports(file, byPath, prefix, memoryPath));
+    instructions.push(pathOf(file));
+  }
+  const scopedRules = [];
+  for (const file of declaredFiles('rules', ['.md'])) {
+    const text = file.data.toString('utf8');
+    const globs = rulePathsOf(text);
+    if (globs === null) {
+      choose({ ...file, data: Buffer.from(text.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, '')) });
+      instructions.push(pathOf(file));
+    } else {
+      if (!chosen.has(file.path)) assets.references += 1;
+      choose(file);
+      scopedRules.push({ path: pathOf(file), globs });
+    }
+  }
+  if (scopedRules.length > 0) {
+    if (byPath.has(`${prefix}${SCOPED_RULE_GUIDE}`)) throw new SpaceError('invalid_environment_source', `The source cannot replace the generated rule guide: ${SCOPED_RULE_GUIDE}`);
+    const pointers = scopedRules.map((rule) => `- Before reading or editing files matching \`${rule.globs.join('`, `')}\`: read \`${rule.path}\` relative to the folder above \`.openchamber\`.\n`);
+    choose({ path: `${prefix}${SCOPED_RULE_GUIDE}`, mode: 0o644, data: Buffer.from(`# Path-scoped rules\n\n${pointers.join('')}`) });
+    instructions.push(SCOPED_RULE_GUIDE);
+  }
   const chosenFiles = [...chosen.values()];
   if (chosenFiles.length > MAX_ASSET_FILES || chosenFiles.reduce((sum, file) => sum + file.data.length, 0) > MAX_ASSET_BYTES) {
     throw new SpaceError('environment_source_too_large', `The selected assets are more than ${MAX_ASSET_FILES} files or ${MAX_ASSET_BYTES} bytes.`);
-  }
-  const pathOf = (file) => file.path.slice(prefix.length);
-  // Only the instructions the manifest declares become instructions; the folder alone is a set of files.
-  const instructions = [];
-  for (const entry of manifest.instructions) {
-    const declared = requireRelativePath(entry, 'A declared instruction');
-    const matches = chosenFiles.filter((file) => (pathOf(file) === declared || pathOf(file).startsWith(`${declared}/`)) && file.path.endsWith('.md'));
-    if (matches.length === 0) omitted.push({ path: declared, reason: 'instruction_missing' });
-    for (const file of matches) if (!instructions.includes(pathOf(file))) instructions.push(pathOf(file));
   }
   assets.instructions = instructions;
 
@@ -581,7 +673,16 @@ const selectAssets = (files, manifest, optIns) => {
     const missing = optIns[kind].filter((name) => !offers[kind].includes(name));
     if (missing.length > 0) throw new SpaceError('invalid_environment_source', `The source does not offer ${kind} ${missing.join(', ')}.`);
   }
-  return { configRoot, files: chosenFiles, instructions, config, omitted, offers, assets };
+  return {
+    configRoot,
+    files: chosenFiles,
+    unchangedFiles: chosenFiles.filter((file) => files.includes(file)),
+    instructions,
+    config,
+    omitted,
+    offers,
+    assets,
+  };
 };
 
 const sourceKey = (source) => `${source.kind}\0${source.location}\0${source.ref}`;
@@ -830,9 +931,12 @@ export const applyEnvironmentSource = async ({ spaceId, source, plan, exec, seed
   const paths = environmentPaths(spaceId);
   const { configRoot } = plan.assets;
   const mounted = source.delivery === 'mount';
+  const unchanged = mounted ? new Set(plan.assets.unchangedFiles) : new Set();
+  const fileToSend = (file) => ({ path: file.path, data: file.data.toString('base64'), mode: file.mode });
   const payload = {
-    files: mounted ? [] : plan.assets.files.map((file) => ({ path: file.path, data: file.data.toString('base64'), mode: file.mode })),
-    view: mounted ? plan.assets.files.map((file) => ({ path: file.path, target: `${ENVIRONMENT_MOUNT_PATH}/${file.path}` })) : [],
+    // Expanded instructions, frontmatter-free rules and the generated guide are data, not source files.
+    files: plan.assets.files.filter((file) => !unchanged.has(file)).map(fileToSend),
+    view: mounted ? plan.assets.unchangedFiles.map((file) => ({ path: file.path, target: `${ENVIRONMENT_MOUNT_PATH}/${file.path}` })) : [],
     mountRoot: ENVIRONMENT_MOUNT_PATH,
     configRoot,
     names: LINKED_NAMES,

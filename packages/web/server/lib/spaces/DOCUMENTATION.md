@@ -1013,7 +1013,7 @@ write.
 The source layout:
 
 ```
-.openchamber/environment.json   { version: 1, configRoot?, instructions[], memory: { path, format } | null }
+.openchamber/environment.json   { version: 1, configRoot?, instructions[], references[], rules[], memory: { path, format } | null }
 AGENTS.md, opencode.jsonc, agents/, commands/, skills/, plugins/, instructions/, references/
 memory/entries/<id>.json, memory/tombstones/<id>.json   (version 2; memory/memory.json is version 1)
 ```
@@ -1024,10 +1024,16 @@ manifest names a folder, so a team repository with `AGENTS.md`, `commands/` and
 scripts and other folders included, stays behind because selection names what
 it takes, not because it sits outside a folder.
 
+Declared `references` are passive files the agent can read on demand; declared `rules`
+become instructions unless their frontmatter scopes them to `paths`. The scoped rules
+also get a generated guide with their globs and paths, because OpenCode has no native
+rule discovery. `@topic.md` lines in `AGENTS.md` and declared instructions are expanded
+from within the config root so they work where OpenCode has no imports.
+
 The manifest is strict: an unknown key, another version, a config root inside
 `.openchamber`, a memory path that overlaps `.openchamber` or the assets (the
 config root, or at the top level one of the folders and files selection
-takes), or a path that leaves the source is a refusal.
+takes, including declared paths), or a path that leaves the source is a refusal.
 
 ### Why the top level and not a config folder
 
@@ -1056,7 +1062,15 @@ without `` !` `` shell blocks, skills whose whole tree has no script extension
 and no executable bit, `instructions/` and `references/` text files, and from
 `opencode.jsonc` only `model`, `default_agent`, `username`, `snapshots`,
 `compaction`, `watcher`, `tool_output` and `media`, and only when no value holds
-`{env:` or `{file:`. Only the instructions the manifest declares become
+`{env:` or `{file:`. Declared passive references and rule files also travel;
+instructions load declared instructions and always-on rules, while scoped rules
+stay behind their generated pointer guide. Instruction imports are inline Markdown
+reads only, with cycles, missing files and paths outside the config root or into shared memory refused.
+Declared paths cannot place files under discovery-linked command, agent, skill,
+plugin or config names, which would bypass the item's tick. An unrecognized nonempty
+rule `paths` declaration is refused; it never degrades to an always-on rule.
+Only the instructions the manifest declares, always-on rules and generated scoped-rule
+pointers become
 `instructions`. Everything else is reported in `omitted` with its reason. MCP
 servers, plugins, shell-block commands, script skills, `formatter` and HTTPS
 skill catalogs are offers: each travels only when the user ticked that item in
@@ -1104,8 +1118,11 @@ outside the volumes, with private propagation. The host canonicalises the path
 with it (`openchamber.space.environment-mount`). The checker accepts exactly one
 bind there, of that path, `RW` false, and refuses one without the label, one at
 another path, and the label without the mount. The snapshot folder is then a
-view of links to the selected files only, so an unselected file in the folder
-is never discovered. Only the local place mounts: on another machine the path
+view of links to the selected, unchanged source files; expanded instructions,
+frontmatter-free rules and the generated guide are written as local files instead.
+An unselected file in the folder is never discovered by OpenCode. The mounted folder itself remains readable by
+path, including unselected and ignored files; use a sanitized folder for a mount,
+or a snapshot when it can contain a credential. Only the local place mounts: on another machine the path
 would name a folder there that this host never inspected, so Docker over SSH
 answers `environment_mount_unavailable` and offers the snapshot, which travels
 over the exec channel the same way on both places.
